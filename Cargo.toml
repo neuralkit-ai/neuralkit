@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/neuralkit-ai/neuralkit"
 readme = "README.md"
 keywords = ["QML"]
-categories = ["science::neuroscience","machine-learning"]
+categories = ["science::neuroscience"]
 authors = ["R. <r@neuralkit.ai>"]
 
 [dependencies]
