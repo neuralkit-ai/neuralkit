@@ -6,7 +6,7 @@ description = "A simple neural network toolkit / building blocks for neural netw
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/neuralkit-ai/neuralkit"
 readme = "README.md"
-keywords = ["neural-network", "machine-learning", "ml"]
+keywords = ["QML"]
 categories = ["machine-learning", "science"]
 authors = ["R. <r@neuralkit.ai>"]
 
