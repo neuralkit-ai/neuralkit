@@ -473,13 +473,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(33);
 
+    // --synthetic pacing: emit raw samples at the real device rate (SAMPLE_RATE,
+    // 512 Hz) by catching up to the wall clock, so synthetic behaves like the
+    // hardware serial stream regardless of TUI render speed. (The old fixed
+    // 16-samples-per-loop burst had no explicit rate — it ran ~9x real-time.)
+    let synth_start = Instant::now();
+    let mut synth_samples: u64 = 0;
+
     loop {
         if !parser.is_paused {
             if parser.synthetic {
-                for _ in 0..16 {
+                // Generate up to the sample count that SHOULD exist by now at
+                // SAMPLE_RATE — self-correcting to the wall clock (real-hardware
+                // timing), independent of how long a render/loop iteration takes.
+                let target = (synth_start.elapsed().as_secs_f64()
+                    * signal_processing::SAMPLE_RATE as f64) as u64;
+                while synth_samples < target {
                     parser.generate_synthetic_data();
+                    synth_samples += 1;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             } else if args.sub {
                 // In subscriber mode: wait for packet, input, or tick timeout
                 tokio::select! {
@@ -556,7 +569,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if last_tick.elapsed() >= tick_rate {
-            if args.sub {
+            // Gate the smoothing-drain on !is_paused (the receive stage already is),
+            // so P freezes the raw wave + attention/meditation immediately — same as
+            // the bands. The smoothing itself is untouched: it only stops WHILE
+            // paused. terminal.draw stays outside, so the frozen frame still renders
+            // and the TUI stays responsive.
+            if args.sub && !parser.is_paused {
                 let samples_to_pop = (signal_processing::SAMPLE_RATE as f32 * last_tick.elapsed().as_secs_f32()) as usize;
                 let mut popped = 0;
                 while popped < samples_to_pop && !parser.raw_buffer.is_empty() {
