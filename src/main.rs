@@ -409,6 +409,32 @@ impl BrainWaveParser {
     }
 }
 
+/// Poll + drain the terminal event queue once (up to `timeout`), applying the
+/// `q`/`p`/`d` controls and resizes. Returns `true` when the user asked to quit.
+///
+/// Called at two points per loop — right after the subscriber `select!` (so a
+/// keypress isn't stuck behind a packet wait) and at the loop tail — so the
+/// body lives here once instead of being copied verbatim at both sites.
+fn handle_input(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    parser: &mut BrainWaveParser,
+    timeout: Duration,
+) -> io::Result<bool> {
+    if event::poll(timeout)? {
+        match event::read()? {
+            Event::Key(key) => match key.code {
+                KeyCode::Char('q') => return Ok(true),
+                KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
+                KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
+                _ => {}
+            },
+            Event::Resize(_, _) => terminal.autoresize()?,
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Redirect tracing logs to a sink to prevent TUI corruption from background libraries
@@ -505,21 +531,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ = tokio::time::sleep(tick_rate) => {}
                 }
                 
-                // CRITICAL: We must pump the TUI event queue immediately after select.
-                // If we don't, crossterm events pile up and block the OS thread or freeze the UI.
-                if event::poll(Duration::from_millis(0))? {
-                    match event::read()? {
-                        Event::Key(key) => match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
-                            KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
-                            _ => {}
-                        },
-                        Event::Resize(_, _) => {
-                            terminal.autoresize()?;
-                        }
-                        _ => {}
-                    }
+                // Pump the event queue immediately after the select! so a
+                // keypress isn't stuck behind the packet wait (0ms = non-blocking).
+                if handle_input(&mut terminal, &mut parser, Duration::from_millis(0))? {
+                    break;
                 }
             } else if let Some(ref mut p) = port {
                 // Serial reading is sync, but we use a short timeout.
@@ -612,19 +627,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_tick = Instant::now();
         }
 
-        if event::poll(Duration::from_millis(1))? {
-            match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
-                    KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
-                    _ => {}
-                },
-                Event::Resize(_, _) => {
-                    terminal.autoresize()?;
-                }
-                _ => {}
-            }
+        if handle_input(&mut terminal, &mut parser, Duration::from_millis(1))? {
+            break;
         }
     }
 
