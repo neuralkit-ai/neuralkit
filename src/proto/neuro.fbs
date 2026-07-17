@@ -1,0 +1,18 @@
+// The eeg-track encoding — MUST byte-match neuralkit-web's already-shipped browser
+// reader (src/transport/flat_schema/eeg/neuro-frame.ts), which is what the compiled
+// `frame().seq()` / `.rawDataArray()` / `.poorSignal()` accessors actually read.
+// Field ORDER is load-bearing: FlatBuffers assigns vtable slots sequentially per
+// field (4, 6, 8, ...), so seq/raw_data/poor_signal MUST stay in this exact order —
+// reordering silently breaks the browser's already-compiled offset reads. This is
+// NOT the protobuf NeuroPacket's shape (that's a different, richer schema used only
+// for the internal MoQ track "0" today); the eeg track carries only what the
+// zero-copy waveform consumer needs.
+namespace neuralkit.fb;
+
+table NeuroFrame {
+  seq: uint;          // slot 4 — readUint32
+  raw_data: [int];    // slot 6 — the zero-copy Int32Array vector (the whole point)
+  poor_signal: ubyte; // slot 8 — readUint8
+}
+
+root_type NeuroFrame;

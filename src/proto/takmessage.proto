@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package atakmap.commoncommo.protobuf.v1;
+
+import "cotevent.proto";
+
+message TakMessage {
+    CotEvent cotEvent = 1;
+}

@@ -1,0 +1,318 @@
+use crate::{BrainWaveParser, signal_processing::WINDOW_SIZE};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Margin},
+    style::{Color, Style},
+    symbols,
+    text::Line,
+    widgets::{
+        Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType, Paragraph,
+    },
+};
+
+pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
+    let mut constraints = vec![
+        Constraint::Length(3),  // Info
+        Constraint::Length(8),  // Raw EEG Wave
+        Constraint::Min(10),    // Attention & Meditation
+        Constraint::Length(10), // Bands Oscilloscope
+        Constraint::Length(10), // EEG Bands (Bar Chart)
+    ];
+
+    if parser.show_debug {
+        constraints.push(Constraint::Length(10)); // MoQ Debug
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(f.area());
+
+    // Header / Info Block
+    let status = if parser.is_paused {
+        "PAUSED"
+    } else if parser.last_poor_signal == 0 {
+        "Connected (Good Signal)"
+    } else if parser.last_poor_signal == 200 {
+        "Poor Signal (Off-head)"
+    } else {
+        "Connecting..."
+    };
+
+    let info_block = Block::default().borders(Borders::ALL).title("");
+    let info_area = chunks[0];
+    f.render_widget(info_block, info_area);
+
+    let info_inner = info_area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let info_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(30)])
+        .split(info_inner);
+
+    let moq_status = parser.moq_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    
+    // Check if the client is running in subscriber mode based on the status string
+    let is_subscriber = moq_status.contains("Subscrib");
+    let latency_text = if is_subscriber {
+        let net_lat = parser.net_latency_ms.load(std::sync::atomic::Ordering::Relaxed);
+        format!(" | EEG-LAT: {:>3}ms | NET-LAT: {:>3}ms", parser.last_latency_ms, net_lat)
+    } else {
+        "".to_string()
+    };
+
+    let status_text = Paragraph::new(format!(
+        " Neuralkit v0.0.1 | Status: {} | Signal Loss: {} | MoQ: {}{}",
+        status, parser.last_poor_signal, moq_status, latency_text
+    ));
+    f.render_widget(status_text, info_layout[0]);
+
+    let help_text = Paragraph::new("[Q] Quit  [P] Pause  [D] MoQ Debug")
+        .alignment(ratatui::layout::Alignment::Right)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(help_text, info_layout[1]);
+
+
+    // Raw EEG Wave
+    let raw_points: Vec<(f64, f64)> = parser
+        .raw_history
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, v as f64))
+        .collect();
+
+    let raw_dataset = Dataset::default()
+        .name("Raw EEG")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::White))
+        .data(&raw_points);
+
+    let raw_chart = Chart::new(vec![raw_dataset])
+        .block(
+            Block::default()
+                .title("Raw EEG Wave (512Hz)")
+                .borders(Borders::ALL),
+        )
+        .x_axis(Axis::default().bounds([0.0, WINDOW_SIZE as f64]))
+        .y_axis(Axis::default().bounds([-2048.0, 2047.0]).labels(vec![
+            Line::from("-2048"),
+            Line::from("0"),
+            Line::from("2047"),
+        ]));
+    f.render_widget(raw_chart, chunks[1]);
+
+    // Bands Oscilloscope
+    let colors = [
+        Color::Red,
+        Color::Yellow,
+        Color::Green,
+        Color::Blue,
+        Color::Magenta,
+    ];
+    let label_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"];
+
+    // Pre-collect points for each band to avoid lifetime issues
+    let mut bands_points: Vec<Vec<(f64, f64)>> = vec![Vec::new(); 5];
+    for (i, b) in parser.bands_history.iter().enumerate() {
+        bands_points[0].push((i as f64, b.delta as f64));
+        bands_points[1].push((i as f64, b.theta as f64));
+        bands_points[2].push((i as f64, b.alpha as f64));
+        bands_points[3].push((i as f64, b.beta as f64));
+        bands_points[4].push((i as f64, b.gamma as f64));
+    }
+
+    let band_datasets: Vec<Dataset> = (0..5)
+        .map(|i| {
+            Dataset::default()
+                .name(label_names[i])
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(colors[i]))
+                .data(&bands_points[i])
+        })
+        .collect();
+
+    let bands_chart = Chart::new(band_datasets)
+        .block(
+            Block::default()
+                .title("Bands Oscilloscope (%)")
+                .borders(Borders::ALL),
+        )
+        .x_axis(Axis::default().bounds([0.0, 100.0]))
+        .y_axis(Axis::default().bounds([0.0, 1.0]).labels(vec![
+            Line::from("0%"),
+            Line::from("50%"),
+            Line::from("100%"),
+        ]));
+    f.render_widget(bands_chart, chunks[3]);
+
+    // Main Graphs (Attention & Meditation)
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(chunks[2]);
+
+    let current_attention = parser.attention_history.back().cloned().unwrap_or(0);
+    let attention_points: Vec<(f64, f64)> = parser
+        .attention_history
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, v as f64))
+        .collect();
+
+    let attention_dataset = Dataset::default()
+        .name(" Attention ")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Yellow))
+        .data(&attention_points);
+
+    let attention_chart = Chart::new(vec![attention_dataset])
+        .block(
+            Block::default()
+                .title(format!("Attention: {} (eSense)", current_attention))
+                .borders(Borders::ALL),
+        )
+        .x_axis(Axis::default().bounds([0.0, 100.0]))
+        .y_axis(Axis::default().bounds([0.0, 100.0]).labels(vec![
+            Line::from("0"),
+            Line::from("50"),
+            Line::from("100"),
+        ]));
+    f.render_widget(attention_chart, body_chunks[0]);
+
+    let current_meditation = parser.meditation_history.back().cloned().unwrap_or(0);
+    let meditation_points: Vec<(f64, f64)> = parser
+        .meditation_history
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, v as f64))
+        .collect();
+
+    let meditation_dataset = Dataset::default()
+        .name(" Meditation ")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&meditation_points);
+
+    let meditation_chart = Chart::new(vec![meditation_dataset])
+        .block(
+            Block::default()
+                .title(format!("Meditation: {} (eSense)", current_meditation))
+                .borders(Borders::ALL),
+        )
+        .x_axis(Axis::default().bounds([0.0, 100.0]))
+        .y_axis(Axis::default().bounds([0.0, 100.0]).labels(vec![
+            Line::from("0"),
+            Line::from("50"),
+            Line::from("100"),
+        ]));
+    f.render_widget(meditation_chart, body_chunks[1]);
+
+    // EEG Bands
+    if let Some(bands) = &parser.last_band_data {
+        let eeg_block = Block::default()
+            .title("EEG Power Bands (%)")
+            .borders(Borders::ALL);
+        let eeg_area = chunks[4];
+        f.render_widget(eeg_block, eeg_area);
+
+        let eeg_inner = eeg_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let eeg_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),    // Bars
+                Constraint::Length(2), // Labels + Values
+            ])
+            .split(eeg_inner);
+
+        let colors = [
+            Color::Red,
+            Color::Yellow,
+            Color::Green,
+            Color::Blue,
+            Color::Magenta,
+        ];
+        let label_names = ["Delta", "Theta", "Alpha", "Beta", "Gamma"];
+        let raw_values = [
+            bands.delta,
+            bands.theta,
+            bands.alpha,
+            bands.beta,
+            bands.gamma,
+        ];
+
+        let mut bars = Vec::new();
+        for i in 0..5 {
+            bars.push(
+                Bar::default()
+                    .value((raw_values[i] * 100.0) as u64)
+                    .style(Style::default().fg(colors[i]))
+                    .text_value("".to_string()),
+            );
+        }
+
+        let num_bars = bars.len() as u16;
+        let bar_width = (eeg_inner.width / num_bars).saturating_sub(1);
+
+        let bar_chart = BarChart::default()
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(bar_width)
+            .bar_gap(1)
+            .max(100);
+        f.render_widget(bar_chart, eeg_layout[0]);
+
+        // Stacked Labels and Values alignment
+        let label_constraints: Vec<Constraint> = (0..num_bars)
+            .flat_map(|_| vec![Constraint::Length(bar_width), Constraint::Length(1)])
+            .collect();
+
+        let label_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(label_constraints)
+            .split(eeg_layout[1]);
+
+        for i in 0..5 {
+            let label_para = Paragraph::new(vec![
+                Line::from(label_names[i]).centered(),
+                Line::from(format!("{:.1}%", raw_values[i] * 100.0))
+                    .centered()
+                    .style(Style::default().fg(colors[i])),
+            ]);
+            f.render_widget(label_para, label_chunks[i * 2]);
+        }
+    } else {
+        let empty = Paragraph::new("Waiting for EEG band data...").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("EEG Power Bands (%)"),
+        );
+        f.render_widget(empty, chunks[4]);
+    }
+
+    // MoQ Debug Section (Bottom)
+    if parser.show_debug {
+        let debug_block = Block::default()
+            .title(" MoQ Protocol Debug ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        
+        let debug_lines: Vec<Line> = {
+            let d = parser.moq_debug.lock().unwrap();
+            d.iter().map(|s| Line::from(s.clone())).collect()
+        };
+
+        let debug_para = Paragraph::new(debug_lines)
+            .block(debug_block)
+            .style(Style::default().bg(Color::Black));
+        
+        f.render_widget(debug_para, chunks[5]);
+    }
+}
