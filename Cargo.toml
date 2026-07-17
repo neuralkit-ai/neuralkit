@@ -18,10 +18,8 @@ clap = { version = "4.4", features = ["derive"] }
 realfft = "3.3"
 # TUI — crossterm's `event-stream` feature DROPPED vs neurosky-rs: only the
 # synchronous event::poll / event::read are used, never the async EventStream.
-# crossterm pinned to 0.29 to MATCH ratatui 0.30's own crossterm (via
-# ratatui-crossterm ^0.29) so exactly ONE crossterm compiles — no duplicate.
-ratatui = "0.30.2"
-crossterm = "0.29"
+ratatui = "0.30.0"
+crossterm = "0.28.1"
 # Async runtime — trimmed from `full` to the features actually used
 # (#[tokio::main], spawn, select, sync::mpsc, time::{sleep,timeout},
 # net::TcpStream). Drops fs/process/signal/io-std/… from the build.
