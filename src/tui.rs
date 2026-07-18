@@ -1,4 +1,5 @@
 use crate::BrainWaveParser;
+use std::sync::atomic::Ordering;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -357,7 +358,7 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     .iter()
                     .enumerate()
                     .map(|(i, p)| {
-                        let a = if i == parser.protocol_selected { "●" } else { " " };
+                        let a = if i == parser.sel.protocol.load(Ordering::Relaxed) { "●" } else { " " };
                         format!(" {a} {p}")
                     })
                     .collect(),
@@ -368,7 +369,7 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     .iter()
                     .enumerate()
                     .map(|(i, (name, url))| {
-                        let a = if i == parser.relay_selected { "●" } else { " " };
+                        let a = if i == parser.sel.relay.load(Ordering::Relaxed) { "●" } else { " " };
                         let host = url
                             .trim_start_matches("https://")
                             .trim_start_matches("http://");

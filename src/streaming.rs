@@ -8,7 +8,9 @@ use moq_net::{Broadcast, Origin, Path, Track};
 use tokio::sync::mpsc;
 use url::Url;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/neuralkit.rs"));
@@ -32,13 +34,48 @@ pub use fb::neuralkit::fb::{NeuroFrame, NeuroFrameArgs, root_as_neuro_frame};
 const TRACK_NAME: &str = "0";
 const EEG_TRACK_NAME: &str = "eeg";
 
-/// Build a moq-native client dialing `url`, with cert verification disabled for
-/// the self-signed local relay (matches clock.rs's `--client-tls-disable-verify`).
-fn moq_client(url: &Url) -> Result<moq_native::Client> {
+/// Live-selectable relay + protocol, shared between the dashboard (which mutates
+/// it from the `M` menu) and the connection task (which reads it each dial). A
+/// change + `reconfigure.notify_one()` makes the task drop its client and
+/// re-dial with the new URL/ALPN — the picker is live.
+#[derive(Clone)]
+pub struct Selection {
+    pub relay: Arc<AtomicUsize>,
+    pub protocol: Arc<AtomicUsize>,
+    pub reconfigure: Arc<Notify>,
+}
+
+impl Selection {
+    pub fn new(relay: usize) -> Self {
+        Self {
+            relay: Arc::new(AtomicUsize::new(relay)),
+            protocol: Arc::new(AtomicUsize::new(0)),
+            reconfigure: Arc::new(Notify::new()),
+        }
+    }
+    /// The currently-selected relay URL (from the RELAYS table).
+    fn url(&self) -> Result<Url> {
+        let i = self.relay.load(Ordering::Relaxed).min(crate::RELAYS.len() - 1);
+        Url::parse(crate::RELAYS[i].1).context("invalid relay URL")
+    }
+    fn protocol_idx(&self) -> usize {
+        self.protocol.load(Ordering::Relaxed)
+    }
+}
+
+/// Build a moq-native client dialing `url`, cert verification disabled for the
+/// self-signed local relay. `protocol_idx` (0 = Auto) forces a single ALPN.
+fn moq_client(url: &Url, protocol_idx: usize) -> Result<moq_native::Client> {
     let mut config = moq_native::ClientConfig::default();
     config.connect = Some(url.clone());
     if matches!(url.host_str(), Some("localhost") | Some("127.0.0.1")) {
         config.tls.disable_verify = Some(true);
+    }
+    // Force one protocol when the picker isn't on "Auto" (offer-all).
+    if protocol_idx > 0 {
+        if let Some(v) = crate::PROTOCOLS.get(protocol_idx).and_then(|n| n.parse().ok()) {
+            config.version = vec![v];
+        }
     }
     config.init().context("moq client init failed")
 }
@@ -48,6 +85,7 @@ pub struct StreamingClient {
     pub path: String,
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
+    pub sel: Selection,
 }
 
 impl StreamingClient {
@@ -58,6 +96,7 @@ impl StreamingClient {
             path: path.to_string(),
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
+            sel: Selection::new(0),
         })
     }
 
@@ -77,73 +116,90 @@ impl StreamingClient {
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<NeuroPacket>) -> Result<()> {
-        self.set_status("Configuring Network...");
-        let client = moq_client(&self.url)?;
-
-        let path_clean = self.path.trim_start_matches('/').trim_end_matches('/');
+        let path_clean = self
+            .path
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
         if path_clean.is_empty() {
             anyhow::bail!("Stream path cannot be empty");
         }
-
-        // clock.rs order: create the track FIRST, publish the broadcast into the
-        // origin AFTER, then hand the origin to client.publish (avoids the serve race).
-        let origin = Origin::random().produce();
-        let mut broadcast = Broadcast::new().produce();
-        let mut track = broadcast
-            .create_track(Track::new(TRACK_NAME))
-            .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
-        // Additive second track on the SAME broadcast — track "0" (protobuf,
-        // above) is untouched. "eeg" carries the browser-native FlatBuffer
-        // encoding the transport: moq fence's out: Flat<NeuroFrame> expects.
-        let mut eeg_track = broadcast
-            .create_track(Track::new(EEG_TRACK_NAME))
-            .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
-
-        origin.publish_broadcast(path_clean, broadcast.consume());
-
-        self.set_status(&format!("Publishing to: {}...", path_clean));
-        let reconnect = client
-            .publish(origin.consume())
-            .context("no connect URL configured")?;
-
-        self.set_status("Online (Publishing)");
-
         let mut eeg_seq: u32 = 0;
-        loop {
-            tokio::select! {
-                res = reconnect.closed() => {
-                    let err = format!("Session closed: {:?}", res);
-                    self.set_status(&format!("Offline: {}", err));
-                    return Err(anyhow::anyhow!(err));
-                }
-                Some(packet) = rx.recv() => {
-                    let mut buf = Vec::new();
-                    packet.encode(&mut buf)?;
-                    // One single-frame group per packet (chat.rs's track.write_frame
-                    // helper) — each NeuroPacket is independently deliverable.
-                    track.write_frame(buf).map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
 
-                    // Same packet, additionally FB-encoded onto "eeg" — a genuine
-                    // sequence counter (NeuroPacket has no seq field of its own;
-                    // timestamp_ms would work but drops the "did I miss a frame"
-                    // signal a monotonic counter gives for free).
-                    let mut fbb = flatbuffers::FlatBufferBuilder::new();
-                    let raw_data = fbb.create_vector(&packet.raw_data);
-                    let frame = NeuroFrame::create(&mut fbb, &NeuroFrameArgs {
-                        seq: eeg_seq,
-                        raw_data: Some(raw_data),
-                        poor_signal: packet.poor_signal as u8,
-                    });
-                    fbb.finish(frame, None);
-                    eeg_seq = eeg_seq.wrapping_add(1);
-                    eeg_track.write_frame(fbb.finished_data().to_vec())
-                        .map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
+        // Reconfigure loop: (re)dial whenever the relay/protocol selection changes
+        // (M-menu) or the session drops, so the picker is live.
+        loop {
+            let url = self.sel.url()?;
+            let proto = self.sel.protocol_idx();
+            self.set_status(&format!(
+                "Connecting to {}...",
+                url.host_str().unwrap_or("relay")
+            ));
+            let client = match moq_client(&url, proto) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.set_status(&format!("Client init failed: {}", e));
+                    tokio::select! {
+                        _ = self.sel.reconfigure.notified() => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    continue;
                 }
-                else => break,
+            };
+
+            // clock.rs order: create the track FIRST, publish the broadcast into
+            // the origin AFTER, then hand the origin to client.publish.
+            let origin = Origin::random().produce();
+            let mut broadcast = Broadcast::new().produce();
+            let mut track = broadcast
+                .create_track(Track::new(TRACK_NAME))
+                .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
+            // "eeg" = browser-native FlatBuffer twin of track "0" (protobuf).
+            let mut eeg_track = broadcast
+                .create_track(Track::new(EEG_TRACK_NAME))
+                .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
+            origin.publish_broadcast(&path_clean, broadcast.consume());
+
+            let reconnect = client
+                .publish(origin.consume())
+                .context("no connect URL configured")?;
+            self.set_status(&format!("Online (Publishing {})", path_clean));
+
+            loop {
+                tokio::select! {
+                    _ = self.sel.reconfigure.notified() => {
+                        self.set_status("Switching relay/protocol...");
+                        break;
+                    }
+                    res = reconnect.closed() => {
+                        self.set_status(&format!("Offline: {:?}; retrying", res));
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        break;
+                    }
+                    Some(packet) = rx.recv() => {
+                        let mut buf = Vec::new();
+                        packet.encode(&mut buf)?;
+                        // One single-frame group per packet — each NeuroPacket is
+                        // independently deliverable (chat.rs's write_frame helper).
+                        track.write_frame(buf).map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
+
+                        // Same packet, FB-encoded onto "eeg" with a monotonic seq.
+                        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+                        let raw_data = fbb.create_vector(&packet.raw_data);
+                        let frame = NeuroFrame::create(&mut fbb, &NeuroFrameArgs {
+                            seq: eeg_seq,
+                            raw_data: Some(raw_data),
+                            poor_signal: packet.poor_signal as u8,
+                        });
+                        fbb.finish(frame, None);
+                        eeg_seq = eeg_seq.wrapping_add(1);
+                        eeg_track.write_frame(fbb.finished_data().to_vec())
+                            .map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
+                    }
+                    else => return Ok(()),
+                }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -153,6 +209,7 @@ pub struct SubscriberClient {
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
     pub net_latency_ms: Arc<std::sync::atomic::AtomicU64>,
+    pub sel: Selection,
 }
 
 impl SubscriberClient {
@@ -164,6 +221,7 @@ impl SubscriberClient {
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             net_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sel: Selection::new(0),
         })
     }
 
@@ -182,8 +240,9 @@ impl SubscriberClient {
     }
 
     pub async fn run(self, tx: mpsc::Sender<NeuroPacket>) -> Result<()> {
-        let host_name = self.url.host_str().unwrap_or("relay").to_string();
-        let port = self.url.port().unwrap_or(443);
+        let url = self.sel.url()?;
+        let host_name = url.host_str().unwrap_or("relay").to_string();
+        let port = url.port().unwrap_or(443);
         let net_lat = self.net_latency_ms.clone();
 
         // Background task to ping the host every 2 seconds
@@ -202,7 +261,7 @@ impl SubscriberClient {
         });
 
         self.set_status("Configuring Network...");
-        let client = moq_client(&self.url)?;
+        let client = moq_client(&url, self.sel.protocol_idx())?;
 
         let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
 

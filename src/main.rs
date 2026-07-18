@@ -8,6 +8,7 @@ mod streaming;
 mod tui;
 
 use signal_processing::{BandData, SLIDING_WINDOW_STEP, WINDOW_SIZE};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use streaming::{NeuroPacket, StreamingClient};
 
@@ -123,10 +124,10 @@ pub struct BrainWaveParser {
     pub menu: Menu,
     /// Highlighted row in the current menu level.
     pub menu_cursor: usize,
-    /// Applied protocol (index into PROTOCOLS; 0 = Auto).
-    pub protocol_selected: usize,
-    /// Applied relay (index into RELAYS; 0 = Cloudflare).
-    pub relay_selected: usize,
+    /// Live-shared relay + protocol selection. The menu writes it and pings
+    /// `reconfigure`; the connection task reads it and re-dials. Applied indices
+    /// (0 = Auto / Cloudflare) live in here.
+    pub sel: streaming::Selection,
     pub is_paused: bool,
     pub show_debug: bool,
     /// How many trailing raw samples the EEG wave widget plots — the horizontal
@@ -172,8 +173,7 @@ impl BrainWaveParser {
             band_amp: [0.7; 5],
             menu: Menu::Closed,
             menu_cursor: 0,
-            protocol_selected: 0,
-            relay_selected: 0,
+            sel: streaming::Selection::new(0),
             is_paused: false,
             show_debug: false,
             raw_window: 256,
@@ -517,21 +517,23 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                 Main => match parser.menu_cursor {
                     0 => {
                         parser.menu = Protocol;
-                        parser.menu_cursor = parser.protocol_selected;
+                        parser.menu_cursor = parser.sel.protocol.load(Ordering::Relaxed);
                     }
                     1 => {
                         parser.menu = Relay;
-                        parser.menu_cursor = parser.relay_selected;
+                        parser.menu_cursor = parser.sel.relay.load(Ordering::Relaxed);
                     }
                     _ => {}
                 },
                 Protocol => {
-                    parser.protocol_selected = parser.menu_cursor;
+                    parser.sel.protocol.store(parser.menu_cursor, Ordering::Relaxed);
+                    parser.sel.reconfigure.notify_one(); // re-dial with the new ALPN
                     parser.menu = Main;
                     parser.menu_cursor = 0;
                 }
                 Relay => {
-                    parser.relay_selected = parser.menu_cursor;
+                    parser.sel.relay.store(parser.menu_cursor, Ordering::Relaxed);
+                    parser.sel.reconfigure.notify_one(); // re-dial the new relay
                     parser.menu = Main;
                     parser.menu_cursor = 1;
                 }
@@ -582,6 +584,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
 
+    // Live relay/protocol selection, shared by the dashboard (M-menu) and the
+    // connection task. Seed the relay index from --stream-url so the picker
+    // matches the dialed relay (Local when loopback, else Cloudflare).
+    let initial_relay =
+        if args.stream_url.contains("127.0.0.1") || args.stream_url.contains("localhost") {
+            1
+        } else {
+            0
+        };
+    let sel = streaming::Selection::new(initial_relay);
+    parser.sel = sel.clone();
+
     // 2. Setup Streaming (Publisher or Subscriber)
     let (tx, mut rx_packets) = mpsc::channel::<NeuroPacket>(100);
 
@@ -591,6 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
         client.net_latency_ms = parser.net_latency_ms.clone();
+        client.sel = sel.clone();
         tokio::spawn(async move {
             if let Err(e) = client.run(tx).await {
                 tracing::error!("Subscriber error: {:?}", e);
@@ -601,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = StreamingClient::new(&args.stream_url, &args.stream_path)?;
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
+        client.sel = sel.clone();
         let (tx_moq, rx_moq) = mpsc::channel(100);
         parser.stream_tx = Some(tx_moq);
         tokio::spawn(async move {
