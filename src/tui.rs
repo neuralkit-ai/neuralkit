@@ -327,8 +327,15 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
 
     // MoQ Debug Section (Bottom)
     if parser.show_debug {
+        // Live bottom-left frame label: negotiated protocol version + relay RTT,
+        // refreshed every second by the streaming client's ticks.
+        let version = parser.moq_version.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let net_lat = parser.net_latency_ms.load(Ordering::Relaxed);
+        let proto = if version.is_empty() { "—".to_string() } else { version };
+        let label = format!(" {proto} · relay {net_lat}ms ");
         let debug_block = Block::default()
             .title(" MoQ Protocol Debug ")
+            .title_bottom(Line::from(label).left_aligned())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow));
         

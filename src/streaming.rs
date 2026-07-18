@@ -8,7 +8,7 @@ use moq_net::{Broadcast, Origin, Path, Track};
 use tokio::sync::mpsc;
 use url::Url;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -80,11 +80,36 @@ fn moq_client(url: &Url, protocol_idx: usize) -> Result<moq_native::Client> {
     config.init().context("moq client init failed")
 }
 
+/// Spawn the relay round-trip-latency probe: the SubscriberClient's original
+/// mechanic, unchanged — store the RTT (ms) in `net_lat` only on a successful TCP
+/// connect, sampled every 2s. Extracted verbatim so the publisher can reuse it.
+fn spawn_latency_ping(host: String, port: u16, net_lat: Arc<AtomicU64>) {
+    tokio::spawn(async move {
+        loop {
+            let start = std::time::Instant::now();
+            if let Ok(Ok(_)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            {
+                let rtt = start.elapsed().as_millis() as u64;
+                net_lat.store(rtt, Ordering::Relaxed);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
 pub struct StreamingClient {
     pub url: Url,
     pub path: String,
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
+    /// Negotiated MoQ wire version of the live session (empty while disconnected).
+    pub version: Arc<Mutex<String>>,
+    /// Round-trip latency to the relay, ms (fed by [`spawn_latency_ping`]).
+    pub net_latency_ms: Arc<AtomicU64>,
     pub sel: Selection,
 }
 
@@ -96,14 +121,17 @@ impl StreamingClient {
             path: path.to_string(),
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
+            version: Arc::new(Mutex::new(String::new())),
+            net_latency_ms: Arc::new(AtomicU64::new(0)),
             sel: Selection::new(0),
         })
     }
 
     fn add_debug(&self, msg: &str) {
         if let Ok(mut d) = self.debug.lock() {
-            let msg = if msg.len() > 100 { format!("{}...", &msg[..97]) } else { msg.to_string() };
-            d.push_back(msg);
+            // Store the full message; the debug panel clips at its own width, so
+            // no manual "…" truncation is wanted.
+            d.push_back(msg.to_string());
             if d.len() > 100 { d.pop_front(); }
         }
     }
@@ -126,13 +154,22 @@ impl StreamingClient {
         }
         let mut eeg_seq: u32 = 0;
 
+        // Measure RTT to the relay for the debug-panel label.
+        if let Ok(url) = self.sel.url() {
+            spawn_latency_ping(
+                url.host_str().unwrap_or("relay").to_string(),
+                url.port().unwrap_or(443),
+                self.net_latency_ms.clone(),
+            );
+        }
+
         // Reconfigure loop: (re)dial whenever the relay/protocol selection changes
         // (M-menu) or the session drops, so the picker is live.
         loop {
             let url = self.sel.url()?;
             let proto = self.sel.protocol_idx();
             self.set_status(&format!(
-                "Connecting to {}...",
+                "Connecting to {}",
                 url.host_str().unwrap_or("relay")
             ));
             let client = match moq_client(&url, proto) {
@@ -165,10 +202,17 @@ impl StreamingClient {
                 .context("no connect URL configured")?;
             self.set_status(&format!("Online (Publishing {})", path_clean));
 
+            // Publish the negotiated wire version to the TUI once a second (it
+            // resolves shortly after connect, and clears on disconnect).
+            let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
+                    _ = ver_tick.tick() => {
+                        let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
+                        if let Ok(mut s) = self.version.lock() { *s = v; }
+                    }
                     _ = self.sel.reconfigure.notified() => {
-                        self.set_status("Switching relay/protocol...");
+                        self.set_status("Switching relay/protocol");
                         break;
                     }
                     res = reconnect.closed() => {
@@ -208,7 +252,9 @@ pub struct SubscriberClient {
     pub path: String,
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
-    pub net_latency_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Negotiated MoQ wire version of the live session (empty while disconnected).
+    pub version: Arc<Mutex<String>>,
+    pub net_latency_ms: Arc<AtomicU64>,
     pub sel: Selection,
 }
 
@@ -220,7 +266,8 @@ impl SubscriberClient {
             path: path.to_string(),
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
-            net_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            version: Arc::new(Mutex::new(String::new())),
+            net_latency_ms: Arc::new(AtomicU64::new(0)),
             sel: Selection::new(0),
         })
     }
@@ -243,24 +290,11 @@ impl SubscriberClient {
         let url = self.sel.url()?;
         let host_name = url.host_str().unwrap_or("relay").to_string();
         let port = url.port().unwrap_or(443);
-        let net_lat = self.net_latency_ms.clone();
 
-        // Background task to ping the host every 2 seconds
-        tokio::spawn(async move {
-            loop {
-                let start = std::time::Instant::now();
-                if let Ok(Ok(_)) = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    tokio::net::TcpStream::connect((host_name.as_str(), port)),
-                ).await {
-                    let rtt = start.elapsed().as_millis() as u64;
-                    net_lat.store(rtt, std::sync::atomic::Ordering::Relaxed);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
+        // Measure RTT to the relay for the debug-panel label.
+        spawn_latency_ping(host_name, port, self.net_latency_ms.clone());
 
-        self.set_status("Configuring Network...");
+        self.set_status("Configuring Network");
         let client = moq_client(&url, self.sel.protocol_idx())?;
 
         let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
@@ -279,10 +313,16 @@ impl SubscriberClient {
             .context("not allowed to consume broadcast")?
             .consume();
 
-        self.set_status(&format!("Subscribing to: {}...", path_clean));
+        self.set_status(&format!("Subscribing to: {}", path_clean));
 
+        // Publish the negotiated wire version to the TUI once a second.
+        let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
+                _ = ver_tick.tick() => {
+                    let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
+                    if let Ok(mut s) = self.version.lock() { *s = v; }
+                }
                 res = reconnect.closed() => {
                     let err = format!("Session closed: {:?}", res);
                     self.set_status(&format!("Offline: {}", err));

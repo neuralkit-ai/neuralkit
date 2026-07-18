@@ -137,6 +137,7 @@ pub struct BrainWaveParser {
     pub stream_tx: Option<mpsc::Sender<NeuroPacket>>,
     pub moq_status: Arc<Mutex<String>>,
     pub moq_debug: Arc<Mutex<VecDeque<String>>>,
+    pub moq_version: Arc<Mutex<String>>,
     pub last_latency_ms: u64,
     pub net_latency_ms: Arc<std::sync::atomic::AtomicU64>,
     pub latest_attention: u64,
@@ -180,6 +181,7 @@ impl BrainWaveParser {
             stream_tx: None,
             moq_status: Arc::new(Mutex::new("Offline".to_string())),
             moq_debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
+            moq_version: Arc::new(Mutex::new(String::new())),
             last_latency_ms: 0,
             net_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             latest_attention: 0,
@@ -512,7 +514,7 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
             KeyCode::Down | KeyCode::Char('j') => {
                 parser.menu_cursor = (parser.menu_cursor + 1).min(len.saturating_sub(1));
             }
-            // Enter / → drills in (Main) or applies (submenu, then back to Main).
+            // Enter / → drills in (Main) or applies the item and closes (submenu).
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match parser.menu {
                 Main => match parser.menu_cursor {
                     0 => {
@@ -528,14 +530,12 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                 Protocol => {
                     parser.sel.protocol.store(parser.menu_cursor, Ordering::Relaxed);
                     parser.sel.reconfigure.notify_one(); // re-dial with the new ALPN
-                    parser.menu = Main;
-                    parser.menu_cursor = 0;
+                    parser.menu = Closed; // selection made — close the popup
                 }
                 Relay => {
                     parser.sel.relay.store(parser.menu_cursor, Ordering::Relaxed);
                     parser.sel.reconfigure.notify_one(); // re-dial the new relay
-                    parser.menu = Main;
-                    parser.menu_cursor = 1;
+                    parser.menu = Closed; // selection made — close the popup
                 }
                 Closed => {}
             },
@@ -604,6 +604,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             crate::streaming::SubscriberClient::new(&args.stream_url, &args.stream_path)?;
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
+        client.version = parser.moq_version.clone();
         client.net_latency_ms = parser.net_latency_ms.clone();
         client.sel = sel.clone();
         tokio::spawn(async move {
@@ -616,6 +617,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = StreamingClient::new(&args.stream_url, &args.stream_path)?;
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
+        client.version = parser.moq_version.clone();
+        client.net_latency_ms = parser.net_latency_ms.clone();
         client.sel = sel.clone();
         let (tx_moq, rx_moq) = mpsc::channel(100);
         parser.stream_tx = Some(tx_moq);
