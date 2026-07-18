@@ -28,6 +28,40 @@ const MEDITATION: u8 = 0x05;
 const RAW_VALUE: u8 = 0x80;
 const ASIC_EEG_POWER: u8 = 0x83;
 
+/// Selectable MoQ protocols for the picker popup. "Auto" = offer all ALPNs and
+/// let the relay choose (today's default); the rest force a single version on
+/// the client (maps to `moq_net::Version`).
+const PROTOCOLS: &[&str] = &[
+    "Auto",
+    "moq-lite-04",
+    "moq-lite-03",
+    "moq-transport-19",
+    "moq-transport-18",
+    "moq-transport-17",
+    "moq-transport-16",
+    "moq-transport-15",
+    "moq-transport-14",
+];
+
+/// Top-level menu entries — each drills into a submenu.
+const MAIN_MENU: &[&str] = &["Protocol", "Relay"];
+
+/// Selectable relays (name, URL). Local carries the phaze-relay `--local`
+/// address so the ip:port is visible in the picker.
+const RELAYS: &[(&str, &str)] = &[
+    ("Cloudflare", "https://relay.cloudflare.mediaoverquic.com"),
+    ("Local", "https://127.0.0.1:4443"),
+];
+
+/// Drill-down settings menu state (opened with `M`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Menu {
+    Closed,
+    Main,
+    Protocol,
+    Relay,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -43,7 +77,7 @@ struct Args {
     #[arg(
         short = 'u',
         long,
-        default_value = "https://interop-relay.cloudflare.mediaoverquic.com"
+        default_value = "https://relay.cloudflare.mediaoverquic.com"
     )]
     stream_url: String,
 
@@ -69,12 +103,36 @@ pub struct BrainWaveParser {
     pub bands_history: VecDeque<BandData>,
     pub last_poor_signal: u8,
     pub last_band_data: Option<BandData>,
+    /// Displayed band heights, eased toward `last_band_data` each rendered frame
+    /// so the bars glide smoothly between the synced 4 Hz FFT updates. Display
+    /// only — the data/sync path never reads this.
+    pub shown_bands: BandData,
     pub processing_counter: usize,
     pub use_custom_processing: bool,
     pub synthetic: bool,
     pub synthetic_time: f32,
+    /// Last whole-second at which synthetic eSense (attention/meditation) updated,
+    /// so it ticks at ~1 Hz like the real headset's big packet.
+    pub last_esense_sec: u32,
+    /// xorshift PRNG state for synthetic randomness (organic noise on the signal).
+    pub rng: u32,
+    /// Per-band amplitude multipliers [delta,theta,alpha,beta,gamma] that
+    /// random-walk over time, so synthetic band powers drift erratically.
+    pub band_amp: [f32; 5],
+    /// Drill-down settings menu (`M`): Closed → Main → {Protocol, Relay}.
+    pub menu: Menu,
+    /// Highlighted row in the current menu level.
+    pub menu_cursor: usize,
+    /// Applied protocol (index into PROTOCOLS; 0 = Auto).
+    pub protocol_selected: usize,
+    /// Applied relay (index into RELAYS; 0 = Cloudflare).
+    pub relay_selected: usize,
     pub is_paused: bool,
     pub show_debug: bool,
+    /// How many trailing raw samples the EEG wave widget plots — the horizontal
+    /// zoom. Fewer = more zoomed-in (each cycle spreads wider). `-`/`+` adjust it,
+    /// clamped to 64..=WINDOW_SIZE. Display only.
+    pub raw_window: usize,
     pub stream_tx: Option<mpsc::Sender<NeuroPacket>>,
     pub moq_status: Arc<Mutex<String>>,
     pub moq_debug: Arc<Mutex<VecDeque<String>>>,
@@ -104,12 +162,21 @@ impl BrainWaveParser {
             bands_history: VecDeque::new(),
             last_poor_signal: 200,
             last_band_data: None,
+            shown_bands: BandData::default(),
             processing_counter: 0,
             use_custom_processing: true,
             synthetic: false,
             synthetic_time: 0.0,
+            last_esense_sec: u32::MAX,
+            rng: 0x2545F491,
+            band_amp: [0.7; 5],
+            menu: Menu::Closed,
+            menu_cursor: 0,
+            protocol_selected: 0,
+            relay_selected: 0,
             is_paused: false,
             show_debug: false,
+            raw_window: 256,
             stream_tx: None,
             moq_status: Arc::new(Mutex::new("Offline".to_string())),
             moq_debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
@@ -302,24 +369,39 @@ impl BrainWaveParser {
         }
     }
 
+    /// Cheap xorshift PRNG → f32 in [-1.0, 1.0]. Adds organic randomness to the
+    /// synthetic signal without pulling in a rand dependency.
+    fn next_noise(&mut self) -> f32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
     pub fn generate_synthetic_data(&mut self) {
         self.last_poor_signal = 0;
         self.synthetic_time += 1.0 / 512.0;
         let t = self.synthetic_time;
 
-        let delta_mod = (t * 0.1).sin() * 0.3 + 0.7;
-        let theta_mod = (t * 0.2).cos() * 0.4 + 0.6;
-        let alpha_mod = (t * 0.5).sin() * 0.2 + 0.8;
-        let beta_mod = (t * 0.7).cos() * 0.3 + 0.7;
-        let gamma_mod = (t * 1.1).sin() * 0.5 + 0.5;
+        // Random-walk each band's amplitude so the relative band powers drift
+        // erratically over time (erratic bands + oscilloscope), instead of the
+        // old smooth deterministic modulation.
+        for i in 0..5 {
+            let step = self.next_noise() * 0.03;
+            self.band_amp[i] = (self.band_amp[i] + step).clamp(0.1, 1.3);
+        }
 
-        let delta = (t * 2.0 * 2.0 * std::f32::consts::PI).sin() * 600.0 * delta_mod;
-        let theta = (t * 6.0 * 2.0 * std::f32::consts::PI).sin() * 300.0 * theta_mod;
-        let alpha = (t * 10.0 * 2.0 * std::f32::consts::PI).sin() * 450.0 * alpha_mod;
-        let beta = (t * 22.0 * 2.0 * std::f32::consts::PI).sin() * 200.0 * beta_mod;
-        let gamma = (t * 40.0 * 2.0 * std::f32::consts::PI).sin() * 100.0 * gamma_mod;
+        let delta = (t * 2.0 * 2.0 * std::f32::consts::PI).sin() * 600.0 * self.band_amp[0];
+        let theta = (t * 6.0 * 2.0 * std::f32::consts::PI).sin() * 300.0 * self.band_amp[1];
+        let alpha = (t * 10.0 * 2.0 * std::f32::consts::PI).sin() * 450.0 * self.band_amp[2];
+        let beta = (t * 22.0 * 2.0 * std::f32::consts::PI).sin() * 200.0 * self.band_amp[3];
+        let gamma = (t * 40.0 * 2.0 * std::f32::consts::PI).sin() * 100.0 * self.band_amp[4];
 
-        let noise = (((t * 1000.0).sin() * 40.0) + ((t * 2345.0).cos() * 20.0)) as f32;
+        // Deterministic hum + a random component for organic, EEG-like texture.
+        let rnd = self.next_noise() * 150.0;
+        let noise = ((t * 1000.0).sin() * 40.0) + ((t * 2345.0).cos() * 20.0) + rnd;
 
         let raw = (delta + theta + alpha + beta + gamma + noise) as i16;
 
@@ -328,30 +410,32 @@ impl BrainWaveParser {
             self.raw_history.pop_front();
         }
 
-        self.processing_counter += 1;
-
-        if self.processing_counter >= SLIDING_WINDOW_STEP {
-            let mut last_att = self.attention_history.back().cloned().unwrap_or(50) as i32;
-            let mut last_med = self.meditation_history.back().cloned().unwrap_or(50) as i32;
-
-            let drift_att = (t * 0.3).sin() * 2.0;
-            let drift_med = (t * 0.2).cos() * 2.0;
-
-            last_att = (last_att + drift_att as i32).clamp(20, 90);
-            last_med = (last_med + drift_med as i32).clamp(20, 90);
-
-            self.attention_history.push_back(last_att as u64);
+        // Attention/Meditation — gated to ~1 Hz to mirror the real headset's
+        // once-per-second big packet (previously updated at the 4 Hz FFT cadence,
+        // faster than any real device). `has_*_update` then correctly marks the
+        // 1 Hz event on the packet that carries it.
+        let cur_sec = t as u32;
+        if cur_sec != self.last_esense_sec {
+            self.last_esense_sec = cur_sec;
+            let last_att = self.attention_history.back().cloned().unwrap_or(50) as i32;
+            let last_med = self.meditation_history.back().cloned().unwrap_or(50) as i32;
+            let att = (last_att + (self.next_noise() * 15.0) as i32).clamp(20, 90) as u64;
+            let med = (last_med + (self.next_noise() * 15.0) as i32).clamp(20, 90) as u64;
+            self.attention_history.push_back(att);
             self.attention_update_pending = true;
-            self.meditation_history.push_back(last_med as u64);
+            self.meditation_history.push_back(med);
             self.meditation_update_pending = true;
-
             if self.attention_history.len() > 100 {
                 self.attention_history.pop_front();
             }
             if self.meditation_history.len() > 100 {
                 self.meditation_history.pop_front();
             }
+        }
 
+        // Bands — FFT at the 4 Hz sliding-window cadence (unchanged).
+        self.processing_counter += 1;
+        if self.processing_counter >= SLIDING_WINDOW_STEP {
             if self.raw_history.len() >= WINDOW_SIZE {
                 let raw_slice: Vec<i16> = self.raw_history.iter().cloned().collect();
                 if let Some(custom_bands) = signal_processing::process_brain_waves(&raw_slice) {
@@ -407,6 +491,83 @@ impl BrainWaveParser {
             }
         }
     }
+}
+
+/// Handle one key press; returns true if the user asked to quit. One place for
+/// both event-poll sites, and for the protocol popup so its navigation isn't
+/// duplicated. When the popup is open it captures the keys.
+fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
+    use Menu::*;
+    if parser.menu != Closed {
+        let len = match parser.menu {
+            Main => MAIN_MENU.len(),
+            Protocol => PROTOCOLS.len(),
+            Relay => RELAYS.len(),
+            Closed => 0,
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                parser.menu_cursor = parser.menu_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                parser.menu_cursor = (parser.menu_cursor + 1).min(len.saturating_sub(1));
+            }
+            // Enter / → drills in (Main) or applies (submenu, then back to Main).
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match parser.menu {
+                Main => match parser.menu_cursor {
+                    0 => {
+                        parser.menu = Protocol;
+                        parser.menu_cursor = parser.protocol_selected;
+                    }
+                    1 => {
+                        parser.menu = Relay;
+                        parser.menu_cursor = parser.relay_selected;
+                    }
+                    _ => {}
+                },
+                Protocol => {
+                    parser.protocol_selected = parser.menu_cursor;
+                    parser.menu = Main;
+                    parser.menu_cursor = 0;
+                }
+                Relay => {
+                    parser.relay_selected = parser.menu_cursor;
+                    parser.menu = Main;
+                    parser.menu_cursor = 1;
+                }
+                Closed => {}
+            },
+            // Esc / ← backs up a level (or closes from Main).
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => match parser.menu {
+                Main => parser.menu = Closed,
+                Protocol | Relay => {
+                    parser.menu = Main;
+                    parser.menu_cursor = 0;
+                }
+                Closed => {}
+            },
+            KeyCode::Char('m') | KeyCode::Char('q') => parser.menu = Closed,
+            _ => {}
+        }
+        return false;
+    }
+    match code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
+        KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
+        KeyCode::Char('m') => {
+            parser.menu = Menu::Main;
+            parser.menu_cursor = 0;
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            parser.raw_window = parser.raw_window.saturating_sub(32).max(64);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            parser.raw_window = (parser.raw_window + 32).min(WINDOW_SIZE);
+        }
+        _ => {}
+    }
+    false
 }
 
 #[tokio::main]
@@ -509,12 +670,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // If we don't, crossterm events pile up and block the OS thread or freeze the UI.
                 if event::poll(Duration::from_millis(0))? {
                     match event::read()? {
-                        Event::Key(key) => match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
-                            KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
-                            _ => {}
-                        },
+                        Event::Key(key) => {
+                            if handle_key(&mut parser, key.code) {
+                                break;
+                            }
+                        }
                         Event::Resize(_, _) => {
                             terminal.autoresize()?;
                         }
@@ -608,18 +768,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Ease the displayed band heights toward the real (synced 4 Hz) values
+            // every frame (~30 fps) so the bars glide instead of stepping. Display
+            // only — the raw wave, the FFT data, and the pub/sub sync are untouched.
+            // Frozen on pause so P freezes the bars exactly.
+            if !parser.is_paused {
+                if let Some(t) = parser.last_band_data.clone() {
+                    const S: f32 = 0.3;
+                    let s = &mut parser.shown_bands;
+                    s.delta += (t.delta - s.delta) * S;
+                    s.theta += (t.theta - s.theta) * S;
+                    s.alpha += (t.alpha - s.alpha) * S;
+                    s.beta += (t.beta - s.beta) * S;
+                    s.gamma += (t.gamma - s.gamma) * S;
+                }
+            }
+
             terminal.draw(|f| tui::render_dashboard(f, &parser))?;
             last_tick = Instant::now();
         }
 
         if event::poll(Duration::from_millis(1))? {
             match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('p') => parser.is_paused = !parser.is_paused,
-                    KeyCode::Char('d') => parser.show_debug = !parser.show_debug,
-                    _ => {}
-                },
+                Event::Key(key) => {
+                    if handle_key(&mut parser, key.code) {
+                        break;
+                    }
+                }
                 Event::Resize(_, _) => {
                     terminal.autoresize()?;
                 }

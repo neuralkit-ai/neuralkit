@@ -1,12 +1,13 @@
-use crate::{BrainWaveParser, signal_processing::WINDOW_SIZE};
+use crate::BrainWaveParser;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
     symbols,
     text::Line,
     widgets::{
-        Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType, Paragraph,
+        Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Clear, Dataset, GraphType, List,
+        ListItem, ListState, Paragraph,
     },
 };
 
@@ -69,19 +70,38 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     ));
     f.render_widget(status_text, info_layout[0]);
 
-    let help_text = Paragraph::new("[Q] Quit  [P] Pause  [D] MoQ Debug")
+    let help_text = Paragraph::new("[Q] Quit  [P] Pause  [D] Debug  [-/+] Zoom  [M] Protocol")
         .alignment(ratatui::layout::Alignment::Right)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help_text, info_layout[1]);
 
 
-    // Raw EEG Wave
+    // Raw EEG Wave — plot only the last `raw_window` samples (horizontal zoom),
+    // re-indexed from 0 so they fill the widget width.
+    let raw_skip = parser.raw_history.len().saturating_sub(parser.raw_window);
     let raw_points: Vec<(f64, f64)> = parser
         .raw_history
         .iter()
+        .skip(raw_skip)
         .enumerate()
         .map(|(i, &v)| (i as f64, v as f64))
         .collect();
+
+    // Auto-scale the Y axis to the displayed samples so the wave fills the widget
+    // vertically instead of sitting flat inside the fixed ±2048 ADC range (real
+    // EEG amplitude is a small fraction of that).
+    let (mut y_lo, mut y_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(_, y) in &raw_points {
+        y_lo = y_lo.min(y);
+        y_hi = y_hi.max(y);
+    }
+    if !y_lo.is_finite() || !y_hi.is_finite() {
+        y_lo = -2048.0;
+        y_hi = 2047.0;
+    }
+    let y_pad = ((y_hi - y_lo) * 0.15).max(16.0);
+    let (y_lo, y_hi) = (y_lo - y_pad, y_hi + y_pad);
+    let y_mid = (y_lo + y_hi) / 2.0;
 
     let raw_dataset = Dataset::default()
         .name("Raw EEG")
@@ -93,14 +113,18 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     let raw_chart = Chart::new(vec![raw_dataset])
         .block(
             Block::default()
-                .title("Raw EEG Wave (512Hz)")
+                .title(format!(
+                    "Raw EEG Wave (512Hz)  ·  zoom: {} samples ({}ms)  [-/+]",
+                    parser.raw_window,
+                    parser.raw_window * 1000 / 512
+                ))
                 .borders(Borders::ALL),
         )
-        .x_axis(Axis::default().bounds([0.0, WINDOW_SIZE as f64]))
-        .y_axis(Axis::default().bounds([-2048.0, 2047.0]).labels(vec![
-            Line::from("-2048"),
-            Line::from("0"),
-            Line::from("2047"),
+        .x_axis(Axis::default().bounds([0.0, parser.raw_window as f64]))
+        .y_axis(Axis::default().bounds([y_lo, y_hi]).labels(vec![
+            Line::from(format!("{:.0}", y_lo)),
+            Line::from(format!("{:.0}", y_mid)),
+            Line::from(format!("{:.0}", y_hi)),
         ]));
     f.render_widget(raw_chart, chunks[1]);
 
@@ -214,7 +238,10 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     f.render_widget(meditation_chart, body_chunks[1]);
 
     // EEG Bands
-    if let Some(bands) = &parser.last_band_data {
+    if parser.last_band_data.is_some() {
+        // Draw the eased/smoothed heights (updated in the render loop); the gate
+        // still keys off real data having arrived.
+        let bands = &parser.shown_bands;
         let eeg_block = Block::default()
             .title("EEG Power Bands (%)")
             .borders(Borders::ALL);
@@ -314,5 +341,69 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
             .style(Style::default().bg(Color::Black));
         
         f.render_widget(debug_para, chunks[5]);
+    }
+
+    // Drill-down settings menu — overlays everything when open (`M`).
+    if parser.menu != crate::Menu::Closed {
+        // Build the current level's rows as strings (so we can size the popup).
+        let (title, rows): (&str, Vec<String>) = match parser.menu {
+            crate::Menu::Main => (
+                " Settings  [↑↓ · →/Enter · Esc] ",
+                crate::MAIN_MENU.iter().map(|m| format!("  {m}  ▸")).collect(),
+            ),
+            crate::Menu::Protocol => (
+                " Protocol  [Enter apply · Esc back] ",
+                crate::PROTOCOLS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let a = if i == parser.protocol_selected { "●" } else { " " };
+                        format!(" {a} {p}")
+                    })
+                    .collect(),
+            ),
+            crate::Menu::Relay => (
+                " Relay  [Enter apply · Esc back] ",
+                crate::RELAYS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, url))| {
+                        let a = if i == parser.relay_selected { "●" } else { " " };
+                        let host = url
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://");
+                        format!(" {a} {name} — {host}")
+                    })
+                    .collect(),
+            ),
+            crate::Menu::Closed => (" ", Vec::new()),
+        };
+
+        let full = f.area();
+        let content_w = rows.iter().map(|r| r.chars().count()).max().unwrap_or(10) as u16;
+        let w = (content_w.max(title.chars().count() as u16) + 4).min(full.width);
+        let h = (rows.len() as u16 + 2).min(full.height);
+        let popup = Rect {
+            x: full.x + full.width.saturating_sub(w) / 2,
+            y: full.y + full.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, popup);
+
+        let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+            .highlight_symbol("▸");
+
+        let mut state = ListState::default();
+        state.select(Some(parser.menu_cursor));
+        f.render_stateful_widget(list, popup, &mut state);
     }
 }
