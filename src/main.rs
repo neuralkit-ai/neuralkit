@@ -74,11 +74,12 @@ struct Args {
     #[arg(short, long)]
     synthetic: bool,
 
-    /// MoQ Relay URL (e.g. moqt://relay.quic.video)
+    /// MoQ Relay URL (defaults to the local phaze-relay; pass a public relay
+    /// like https://relay.cloudflare.mediaoverquic.com to go remote)
     #[arg(
         short = 'u',
         long,
-        default_value = "https://relay.cloudflare.mediaoverquic.com"
+        default_value = "https://127.0.0.1:4443"
     )]
     stream_url: String,
 
@@ -825,6 +826,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Graceful quit: tell the streaming task to close its relay session, then give
+    // quinn a moment to transmit the CONNECTION_CLOSE before the process exits — so
+    // phaze-relay reaps the session at once instead of waiting the QUIC idle timeout.
+    sel.shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     Ok(())
 }

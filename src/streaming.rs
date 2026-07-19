@@ -43,6 +43,10 @@ pub struct Selection {
     pub relay: Arc<AtomicUsize>,
     pub protocol: Arc<AtomicUsize>,
     pub reconfigure: Arc<Notify>,
+    /// Signalled on quit so the streaming task drops its connection and lets the
+    /// relay reap the session immediately (graceful CONNECTION_CLOSE) instead of
+    /// waiting out the QUIC idle timeout.
+    pub shutdown: Arc<Notify>,
 }
 
 impl Selection {
@@ -51,6 +55,7 @@ impl Selection {
             relay: Arc::new(AtomicUsize::new(relay)),
             protocol: Arc::new(AtomicUsize::new(0)),
             reconfigure: Arc::new(Notify::new()),
+            shutdown: Arc::new(Notify::new()),
         }
     }
     /// The currently-selected relay URL (from the RELAYS table).
@@ -205,8 +210,13 @@ impl StreamingClient {
             // Publish the negotiated wire version to the TUI once a second (it
             // resolves shortly after connect, and clears on disconnect).
             let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut quitting = false;
             loop {
                 tokio::select! {
+                    _ = self.sel.shutdown.notified() => {
+                        quitting = true;
+                        break;
+                    }
                     _ = ver_tick.tick() => {
                         let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
                         if let Ok(mut s) = self.version.lock() { *s = v; }
@@ -242,6 +252,15 @@ impl StreamingClient {
                     }
                     else => return Ok(()),
                 }
+            }
+            if quitting {
+                // Drop the connection so the session's Drop sends a
+                // CONNECTION_CLOSE, then keep the endpoint (still owned by
+                // `client`) alive long enough for quinn to transmit it — the relay
+                // reaps us at once instead of on the idle timeout.
+                drop(reconnect);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                return Ok(());
             }
         }
     }
@@ -317,8 +336,13 @@ impl SubscriberClient {
 
         // Publish the negotiated wire version to the TUI once a second.
         let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut quitting = false;
         loop {
             tokio::select! {
+                _ = self.sel.shutdown.notified() => {
+                    quitting = true;
+                    break;
+                }
                 _ = ver_tick.tick() => {
                     let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
                     if let Ok(mut s) = self.version.lock() { *s = v; }
@@ -382,5 +406,13 @@ impl SubscriberClient {
                 },
             }
         }
+        if quitting {
+            // Graceful quit: drop the connection so its Drop sends a
+            // CONNECTION_CLOSE, then hold the endpoint (owned by `client`) open
+            // briefly so quinn transmits it — the relay reaps us immediately.
+            drop(reconnect);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        Ok(())
     }
 }
