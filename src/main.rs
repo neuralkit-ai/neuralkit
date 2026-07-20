@@ -29,26 +29,17 @@ const MEDITATION: u8 = 0x05;
 const RAW_VALUE: u8 = 0x80;
 const ASIC_EEG_POWER: u8 = 0x83;
 
-/// Selectable MoQ protocols for the picker popup. "Auto" = offer all ALPNs and
-/// let the relay choose (today's default); the rest force a single version on
-/// the client (maps to `moq_net::Version`).
-const PROTOCOLS: &[&str] = &[
-    "Auto",
-    "moq-lite-04",
-    "moq-lite-03",
-    "moq-transport-19",
-    "moq-transport-18",
-    "moq-transport-17",
-    "moq-transport-16",
-    "moq-transport-15",
-    "moq-transport-14",
-];
-
-/// Top-level menu entries — each drills into a submenu.
-const MAIN_MENU: &[&str] = &["Protocol", "Relay"];
+/// Top-level menu entries — each drills into a submenu. Protocol is gone:
+/// phaze-moq (Cloudflare's own moq-transport) speaks exactly one wire, so
+/// there's nothing left to pick between.
+const MAIN_MENU: &[&str] = &["Relay"];
 
 /// Selectable relays (name, URL). Local carries the phaze-relay `--local`
-/// address so the ip:port is visible in the picker.
+/// address so the ip:port is visible in the picker. Cloudflare now points at
+/// PRODUCTION (not the interop/test relay) — phaze-moq's direct
+/// subscribe-by-name is exactly the mechanism prod requires, so this just
+/// works, unlike the old moq-net-based client which needed announce
+/// forwarding prod never provides.
 const RELAYS: &[(&str, &str)] = &[
     ("Cloudflare", "https://relay.cloudflare.mediaoverquic.com"),
     ("Local", "https://127.0.0.1:4443"),
@@ -59,7 +50,6 @@ const RELAYS: &[(&str, &str)] = &[
 pub enum Menu {
     Closed,
     Main,
-    Protocol,
     Relay,
 }
 
@@ -510,7 +500,6 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
     if parser.menu != Closed {
         let len = match parser.menu {
             Main => MAIN_MENU.len(),
-            Protocol => PROTOCOLS.len(),
             Relay => RELAYS.len(),
             Closed => 0,
         };
@@ -525,23 +514,11 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match parser.menu {
                 Main => match parser.menu_cursor {
                     0 => {
-                        parser.menu = Protocol;
-                        parser.menu_cursor = parser.sel.protocol.load(Ordering::Relaxed);
-                    }
-                    1 => {
                         parser.menu = Relay;
                         parser.menu_cursor = parser.sel.relay.load(Ordering::Relaxed);
                     }
                     _ => {}
                 },
-                Protocol => {
-                    parser
-                        .sel
-                        .protocol
-                        .store(parser.menu_cursor, Ordering::Relaxed);
-                    parser.sel.reconfigure.notify_one(); // re-dial with the new ALPN
-                    parser.menu = Closed; // selection made — close the popup
-                }
                 Relay => {
                     parser
                         .sel
@@ -555,7 +532,7 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
             // Esc / ← backs up a level (or closes from Main).
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => match parser.menu {
                 Main => parser.menu = Closed,
-                Protocol | Relay => {
+                Relay => {
                     parser.menu = Main;
                     parser.menu_cursor = 0;
                 }

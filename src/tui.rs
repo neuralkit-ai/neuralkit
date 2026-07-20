@@ -382,21 +382,6 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     .map(|m| format!("  {m}  ▸"))
                     .collect(),
             ),
-            crate::Menu::Protocol => (
-                " Protocol  [Enter apply · Esc back] ",
-                crate::PROTOCOLS
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| {
-                        let a = if i == parser.sel.protocol.load(Ordering::Relaxed) {
-                            "●"
-                        } else {
-                            " "
-                        };
-                        format!(" {a} {p}")
-                    })
-                    .collect(),
-            ),
             crate::Menu::Relay => (
                 " Relay  [Enter apply · Esc back] ",
                 crate::RELAYS

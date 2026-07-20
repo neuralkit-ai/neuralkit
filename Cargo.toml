@@ -24,9 +24,12 @@ crossterm = "0.28.1"
 # (#[tokio::main], spawn, select, sync::mpsc, time::{sleep,timeout},
 # net::TcpStream). Drops fs/process/signal/io-std/… from the build.
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-# MoQ pub/sub over QUIC (streaming.rs).
-moq-net = "0.1.17"
-moq-native = "0.18.0"
+# MoQ pub/sub over QUIC (streaming.rs) — our own client on Cloudflare's own
+# moq-transport/moq-native-ietf (../phaze/crates/phaze-moq, a sibling repo).
+# Direct subscribe-by-name only, matching what Cloudflare's production relay
+# actually speaks (it has no announce/discovery at all).
+phaze-moq = { path = "../phaze/crates/phaze-moq" }
+bytes = "1"
 anyhow = "1.0"
 url = "2.5"
 # Logging → neuralkit_debug.log (the TUI owns the terminal).

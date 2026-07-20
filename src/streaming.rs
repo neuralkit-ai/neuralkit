@@ -1,16 +1,17 @@
-// MoQ streaming on the moq-dev lineage (moq-net + moq-native), modeled EXACTLY
-// on moq-native's examples/clock.rs (the validated pattern: clock pub/sub runs
-// green against the local relay). Ported from the IETF moq-transport crates
-// 2026-07-13 so browser subscribers (@moq/net, moq-lite) can consume the same
-// broadcast — moq-net negotiates moq-lite with the relay.
-use anyhow::{Context, Result};
-use moq_net::{Broadcast, Origin, Path, Track};
+// MoQ streaming on Cloudflare's own moq-transport/moq-native-ietf (via
+// phaze-moq), not Luke Curley's moq-net. Cloudflare's production relay
+// (draft-ietf-moq-transport-07) has no announce/discovery at all — confirmed
+// straight from their own producer.rs: "there's no announce/discovery
+// forwarding. The producer passively responds to subscription requests." A
+// subscriber must know the exact namespace/track name and SUBSCRIBE directly.
+// phaze-moq's Subscriber does exactly that natively — no announce step
+// anywhere in this file, on either the publish or subscribe side.
+use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
-use url::Url;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/neuralkit.rs"));
@@ -37,18 +38,20 @@ pub use fb::neuralkit::fb::{NeuroFrame, NeuroFrameArgs, root_as_neuro_frame};
 const TRACK_NAME: &str = "0";
 const EEG_TRACK_NAME: &str = "eeg";
 
-/// Live-selectable relay + protocol, shared between the dashboard (which mutates
-/// it from the `M` menu) and the connection task (which reads it each dial). A
-/// change + `reconfigure.notify_one()` makes the task drop its client and
-/// re-dial with the new URL/ALPN — the picker is live.
+/// Live-selectable relay, shared between the dashboard (which mutates it from
+/// the `M` menu) and the connection task (which reads it each dial). A change
+/// + `reconfigure.notify_one()` makes the task drop its connection and re-dial
+/// with the new URL — the picker is live.
+///
+/// No protocol picker anymore — phaze-moq speaks exactly one wire
+/// (Cloudflare's moq-transport), so there is nothing to select between.
 #[derive(Clone)]
 pub struct Selection {
     pub relay: Arc<AtomicUsize>,
-    pub protocol: Arc<AtomicUsize>,
     pub reconfigure: Arc<Notify>,
-    /// Signalled on quit so the streaming task drops its connection and lets the
-    /// relay reap the session immediately (graceful CONNECTION_CLOSE) instead of
-    /// waiting out the QUIC idle timeout.
+    /// Signalled on quit so the streaming task drops its connection and lets
+    /// the relay reap the session immediately (graceful CONNECTION_CLOSE)
+    /// instead of waiting out the QUIC idle timeout.
     pub shutdown: Arc<Notify>,
 }
 
@@ -56,47 +59,20 @@ impl Selection {
     pub fn new(relay: usize) -> Self {
         Self {
             relay: Arc::new(AtomicUsize::new(relay)),
-            protocol: Arc::new(AtomicUsize::new(0)),
             reconfigure: Arc::new(Notify::new()),
             shutdown: Arc::new(Notify::new()),
         }
     }
     /// The currently-selected relay URL (from the RELAYS table).
-    fn url(&self) -> Result<Url> {
-        let i = self
-            .relay
-            .load(Ordering::Relaxed)
-            .min(crate::RELAYS.len() - 1);
-        Url::parse(crate::RELAYS[i].1).context("invalid relay URL")
-    }
-    fn protocol_idx(&self) -> usize {
-        self.protocol.load(Ordering::Relaxed)
+    fn url(&self) -> String {
+        let i = self.relay.load(Ordering::Relaxed).min(crate::RELAYS.len() - 1);
+        crate::RELAYS[i].1.to_string()
     }
 }
 
-/// Build a moq-native client dialing `url`, cert verification disabled for the
-/// self-signed local relay. `protocol_idx` (0 = Auto) forces a single ALPN.
-fn moq_client(url: &Url, protocol_idx: usize) -> Result<moq_native::Client> {
-    let mut config = moq_native::ClientConfig::default();
-    config.connect = Some(url.clone());
-    if matches!(url.host_str(), Some("localhost") | Some("127.0.0.1")) {
-        config.tls.disable_verify = Some(true);
-    }
-    // Force one protocol when the picker isn't on "Auto" (offer-all).
-    if protocol_idx > 0 {
-        if let Some(v) = crate::PROTOCOLS
-            .get(protocol_idx)
-            .and_then(|n| n.parse().ok())
-        {
-            config.version = vec![v];
-        }
-    }
-    config.init().context("moq client init failed")
-}
-
-/// Spawn the relay round-trip-latency probe: the SubscriberClient's original
-/// mechanic, unchanged — store the RTT (ms) in `net_lat` only on a successful TCP
-/// connect, sampled every 2s. Extracted verbatim so the publisher can reuse it.
+/// Spawn the relay round-trip-latency probe: store the RTT (ms) in `net_lat`
+/// only on a successful TCP connect, sampled every 2s. Unchanged mechanic
+/// from the moq-net version, extracted so publisher and subscriber share it.
 fn spawn_latency_ping(host: String, port: u16, net_lat: Arc<AtomicU64>) {
     tokio::spawn(async move {
         loop {
@@ -115,23 +91,44 @@ fn spawn_latency_ping(host: String, port: u16, net_lat: Arc<AtomicU64>) {
     });
 }
 
+/// Pull `(host, port)` out of a relay URL string for the latency probe.
+/// `phaze_moq` takes the URL as a bare `&str`, so this is the one place we
+/// still parse it — display/diagnostics only, never the connect path itself.
+fn host_port(url: &str) -> (String, u16) {
+    url::Url::parse(url)
+        .ok()
+        .map(|u| (u.host_str().unwrap_or("relay").to_string(), u.port().unwrap_or(443)))
+        .unwrap_or_else(|| ("relay".to_string(), 443))
+}
+
+/// `insecure`: skip TLS verification. On for loopback (phaze-relay's
+/// self-signed `--local` dev cert) and for `*.mediaoverquic.com` (Cloudflare's
+/// interop relay currently serves an expired cert — production's is real, but
+/// bypassing verification for the whole domain is harmless and one less thing
+/// to keep in sync if that ever changes).
+fn is_insecure(url: &str) -> bool {
+    matches!(url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).as_deref(),
+        Some("localhost") | Some("127.0.0.1")) || url.contains("mediaoverquic.com")
+}
+
 pub struct StreamingClient {
-    pub url: Url,
+    pub url: String,
     pub path: String,
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
-    /// Negotiated MoQ wire version of the live session (empty while disconnected).
+    /// Display-only; moq-transport doesn't expose a negotiated-version
+    /// concept the way moq-net did (it speaks exactly one wire), so this is
+    /// just a fixed label once connected — kept so the dashboard's layout
+    /// doesn't need to change.
     pub version: Arc<Mutex<String>>,
-    /// Round-trip latency to the relay, ms (fed by [`spawn_latency_ping`]).
     pub net_latency_ms: Arc<AtomicU64>,
     pub sel: Selection,
 }
 
 impl StreamingClient {
     pub fn new(url: &str, path: &str) -> Result<Self> {
-        let url = Url::parse(url).context("Invalid MoQ relay URL")?;
         Ok(Self {
-            url,
+            url: url.to_string(),
             path: path.to_string(),
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
@@ -143,8 +140,6 @@ impl StreamingClient {
 
     fn add_debug(&self, msg: &str) {
         if let Ok(mut d) = self.debug.lock() {
-            // Store the full message; the debug panel clips at its own width, so
-            // no manual "…" truncation is wanted.
             d.push_back(msg.to_string());
             if d.len() > 100 {
                 d.pop_front();
@@ -160,36 +155,25 @@ impl StreamingClient {
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<NeuroPacket>) -> Result<()> {
-        let path_clean = self
-            .path
-            .trim_start_matches('/')
-            .trim_end_matches('/')
-            .to_string();
+        let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
         if path_clean.is_empty() {
             anyhow::bail!("Stream path cannot be empty");
         }
         let mut eeg_seq: u32 = 0;
 
-        // Measure RTT to the relay for the debug-panel label.
-        if let Ok(url) = self.sel.url() {
-            spawn_latency_ping(
-                url.host_str().unwrap_or("relay").to_string(),
-                url.port().unwrap_or(443),
-                self.net_latency_ms.clone(),
-            );
+        if let Ok(url) = url::Url::parse(&self.sel.url()) {
+            let (host, port) = host_port(url.as_str());
+            spawn_latency_ping(host, port, self.net_latency_ms.clone());
         }
 
-        // Reconfigure loop: (re)dial whenever the relay/protocol selection changes
-        // (M-menu) or the session drops, so the picker is live.
+        // Reconfigure loop: (re)dial whenever the relay selection changes (M
+        // menu) or the session drops, so the picker is live.
         loop {
-            let url = self.sel.url()?;
-            let proto = self.sel.protocol_idx();
-            self.set_status(&format!(
-                "Connecting to {}",
-                url.host_str().unwrap_or("relay")
-            ));
-            let client = match moq_client(&url, proto) {
-                Ok(c) => c,
+            let url = self.sel.url();
+            self.set_status(&format!("Connecting to {}", host_port(&url).0));
+
+            let mut publisher = match phaze_moq::Publisher::connect(&url, is_insecure(&url)).await {
+                Ok(p) => p,
                 Err(e) => {
                     self.set_status(&format!("Client init failed: {}", e));
                     tokio::select! {
@@ -200,27 +184,42 @@ impl StreamingClient {
                 }
             };
 
-            // clock.rs order: create the track FIRST, publish the broadcast into
-            // the origin AFTER, then hand the origin to client.publish.
-            let origin = Origin::random().produce();
-            let mut broadcast = Broadcast::new().produce();
-            let mut track = broadcast
-                .create_track(Track::new(TRACK_NAME))
-                .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
+            // One announce for the namespace; both tracks come off the SAME
+            // broadcast handle — creating two independent announces (one per
+            // track) means a subscriber looking up the "0" announce for the
+            // "eeg" track (or vice versa) gets "not found", even though both
+            // were genuinely announced moments apart.
+            let mut broadcast = match publisher.announce(&path_clean).await {
+                Ok(b) => b,
+                Err(e) => {
+                    self.set_status(&format!("Announce failed: {}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let mut track = match broadcast.create_track(TRACK_NAME) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status(&format!("Track create failed: {}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
             // "eeg" = browser-native FlatBuffer twin of track "0" (protobuf).
-            let mut eeg_track = broadcast
-                .create_track(Track::new(EEG_TRACK_NAME))
-                .map_err(|e| anyhow::anyhow!("Track create failed: {:?}", e))?;
-            origin.publish_broadcast(&path_clean, broadcast.consume());
+            let mut eeg_track = match broadcast.create_track(EEG_TRACK_NAME) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status(&format!("Track create failed: {}", e));
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
-            let reconnect = client
-                .publish(origin.consume())
-                .context("no connect URL configured")?;
             self.set_status(&format!("Online (Publishing {})", path_clean));
+            if let Ok(mut v) = self.version.lock() {
+                *v = "moq-transport".to_string();
+            }
 
-            // Publish the negotiated wire version to the TUI once a second (it
-            // resolves shortly after connect, and clears on disconnect).
-            let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut quitting = false;
             loop {
                 tokio::select! {
@@ -228,25 +227,25 @@ impl StreamingClient {
                         quitting = true;
                         break;
                     }
-                    _ = ver_tick.tick() => {
-                        let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
-                        if let Ok(mut s) = self.version.lock() { *s = v; }
-                    }
                     _ = self.sel.reconfigure.notified() => {
-                        self.set_status("Switching relay/protocol");
+                        self.set_status("Switching relay");
                         break;
                     }
-                    res = reconnect.closed() => {
-                        self.set_status(&format!("Offline: {:?}; retrying", res));
+                    _ = publisher.closed() => {
+                        self.set_status("Offline; retrying");
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         break;
                     }
                     Some(packet) = rx.recv() => {
                         let mut buf = Vec::new();
                         packet.encode(&mut buf)?;
-                        // One single-frame group per packet — each NeuroPacket is
-                        // independently deliverable (chat.rs's write_frame helper).
-                        track.write_frame(buf).map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
+                        // One frame (its own group) per packet — each NeuroPacket
+                        // is independently deliverable.
+                        if let Err(e) = track.write_frame(buf.into()) {
+                            self.set_status(&format!("Offline: {:?}; retrying", e));
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            break;
+                        }
 
                         // Same packet, FB-encoded onto "eeg" with a monotonic seq.
                         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -258,18 +257,20 @@ impl StreamingClient {
                         });
                         fbb.finish(frame, None);
                         eeg_seq = eeg_seq.wrapping_add(1);
-                        eeg_track.write_frame(fbb.finished_data().to_vec())
-                            .map_err(|e| anyhow::anyhow!("Write error: {:?}", e))?;
+                        if let Err(e) = eeg_track.write_frame(bytes::Bytes::copy_from_slice(fbb.finished_data())) {
+                            self.set_status(&format!("Offline: {:?}; retrying", e));
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            break;
+                        }
                     }
                     else => return Ok(()),
                 }
             }
             if quitting {
-                // Drop the connection so the session's Drop sends a
-                // CONNECTION_CLOSE, then keep the endpoint (still owned by
-                // `client`) alive long enough for quinn to transmit it — the relay
-                // reaps us at once instead of on the idle timeout.
-                drop(reconnect);
+                // Dropping `publisher` closes its session (CONNECTION_CLOSE);
+                // give quinn a moment to actually transmit it before exit, so
+                // the relay reaps us at once instead of on the idle timeout.
+                drop(publisher);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 return Ok(());
             }
@@ -278,11 +279,10 @@ impl StreamingClient {
 }
 
 pub struct SubscriberClient {
-    pub url: Url,
+    pub url: String,
     pub path: String,
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
-    /// Negotiated MoQ wire version of the live session (empty while disconnected).
     pub version: Arc<Mutex<String>>,
     pub net_latency_ms: Arc<AtomicU64>,
     pub sel: Selection,
@@ -290,9 +290,8 @@ pub struct SubscriberClient {
 
 impl SubscriberClient {
     pub fn new(url: &str, path: &str) -> Result<Self> {
-        let url = Url::parse(url).context("Invalid MoQ relay URL")?;
         Ok(Self {
-            url,
+            url: url.to_string(),
             path: path.to_string(),
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
@@ -319,33 +318,21 @@ impl SubscriberClient {
     }
 
     pub async fn run(self, tx: mpsc::Sender<NeuroPacket>) -> Result<()> {
-        let path_clean = self
-            .path
-            .trim_start_matches('/')
-            .trim_end_matches('/')
-            .to_string();
+        let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
 
-        // Measure RTT to the relay for the debug-panel label.
-        if let Ok(u) = self.sel.url() {
-            spawn_latency_ping(
-                u.host_str().unwrap_or("relay").to_string(),
-                u.port().unwrap_or(443),
-                self.net_latency_ms.clone(),
-            );
+        if let Ok(url) = url::Url::parse(&self.sel.url()) {
+            let (host, port) = host_port(url.as_str());
+            spawn_latency_ping(host, port, self.net_latency_ms.clone());
         }
 
-        // Reconfigure loop: (re)dial whenever the relay/protocol selection changes
-        // (M-menu) or the session drops, so the picker is live on --sub too. Without
-        // it the subscriber stayed on its startup relay, so switching to Cloudflare
-        // left the view empty.
+        // Reconfigure loop: (re)dial whenever the relay selection changes (M
+        // menu) or the session drops, so the picker is live on --sub too.
         loop {
-            let url = self.sel.url()?;
-            self.set_status(&format!(
-                "Connecting to {}",
-                url.host_str().unwrap_or("relay")
-            ));
-            let client = match moq_client(&url, self.sel.protocol_idx()) {
-                Ok(c) => c,
+            let url = self.sel.url();
+            self.set_status(&format!("Connecting to {}", host_port(&url).0));
+
+            let mut subscriber = match phaze_moq::Subscriber::connect(&url, is_insecure(&url)).await {
+                Ok(s) => s,
                 Err(e) => {
                     self.set_status(&format!("Client init failed: {}", e));
                     tokio::select! {
@@ -356,107 +343,80 @@ impl SubscriberClient {
                 }
             };
 
-            // clock.rs subscribe pattern: hand the origin PRODUCER to client.consume so
-            // the relay fills it with announces; scope a consumer to the broadcast path;
-            // loop on announced() and subscribe_track on the online broadcast.
-            let origin = Origin::random().produce();
-            let reconnect = client
-                .consume(origin.clone())
-                .context("no connect URL configured")?;
-
-            let path: Path = path_clean.as_str().into();
-            let mut origin = origin
-                .scope(&[path])
-                .context("not allowed to consume broadcast")?
-                .consume();
-
             self.set_status(&format!("Subscribing to: {}", path_clean));
 
-            // Publish the negotiated wire version to the TUI once a second.
-            let mut ver_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut quitting = false;
-            loop {
-                tokio::select! {
-                    _ = self.sel.shutdown.notified() => {
-                        quitting = true;
-                        break;
-                    }
-                    _ = self.sel.reconfigure.notified() => {
-                        self.set_status("Switching relay/protocol");
-                        break;
-                    }
-                    _ = ver_tick.tick() => {
-                        let v = reconnect.version().map(|v| v.to_string()).unwrap_or_default();
-                        if let Ok(mut s) = self.version.lock() { *s = v; }
-                    }
-                    res = reconnect.closed() => {
-                        self.set_status(&format!("Offline: {:?}; retrying", res));
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        break;
-                    }
-                    Some(announce) = origin.announced() => match announce {
-                        (p, Some(broadcast)) => {
-                            self.set_status(&format!("Online (Subscribing {})", p));
-                            let mut track = broadcast
-                                .subscribe_track(&Track::new(TRACK_NAME))
-                                .map_err(|e| anyhow::anyhow!("Subscribe error: {:?}", e))?;
-                            let tx = tx.clone();
-                            // Drain groups on a task so a new announce doesn't block the loop.
-                            tokio::spawn(async move {
-                                while let Ok(Some(mut group)) = track.recv_group().await {
-                                    while let Ok(Some(frame)) = group.read_frame().await {
-                                        if let Ok(packet) = NeuroPacket::decode(frame) {
-                                            // Headless visibility: the TUI owns the terminal, so
-                                            // the received-packet count goes to the tracing log.
-                                            static PKT_COUNT: std::sync::atomic::AtomicU64 =
-                                                std::sync::atomic::AtomicU64::new(0);
-                                            let n = PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                            if n == 1 || n % 100 == 0 {
-                                                tracing::info!(n, "subscriber packets received");
-                                            }
-                                            let _ = tx.send(packet).await;
-                                        }
-                                    }
-                                }
-                            });
+            // Direct subscribe by name — no announce, no discovery. Resolves
+            // once the relay/publisher acknowledges (SUBSCRIBE_OK); if the
+            // broadcast isn't live yet this fails fast and the outer loop
+            // retries, same as a dropped connection.
+            let mut track = match subscriber.subscribe(&path_clean, TRACK_NAME).await {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status(&format!("Broadcast offline: {} ({})", path_clean, e));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let mut eeg_track = match subscriber.subscribe(&path_clean, EEG_TRACK_NAME).await {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_status(&format!("Broadcast offline: {} ({})", path_clean, e));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
 
-                            // Same broadcast, the eeg FlatBuffer track — independent
-                            // subscribe + counter, verifying the producer side of the
-                            // Neuralkit.eeg fence without touching the TUI's own data path.
-                            let mut eeg_track = broadcast
-                                .subscribe_track(&Track::new(EEG_TRACK_NAME))
-                                .map_err(|e| anyhow::anyhow!("Subscribe error: {:?}", e))?;
-                            tokio::spawn(async move {
-                                while let Ok(Some(mut group)) = eeg_track.recv_group().await {
-                                    while let Ok(Some(frame)) = group.read_frame().await {
-                                        if let Ok(nf) = root_as_neuro_frame(&frame) {
-                                            static EEG_COUNT: std::sync::atomic::AtomicU64 =
-                                                std::sync::atomic::AtomicU64::new(0);
-                                            let n = EEG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                            if n == 1 || n % 100 == 0 {
-                                                let raw_len = nf.raw_data().map(|v| v.len()).unwrap_or(0);
-                                                tracing::info!(n, seq = nf.seq(), poor_signal = nf.poor_signal(), raw_len, "eeg subscriber frames received");
-                                            }
-                                        }
-                                    }
-                                }
-                            });
+            self.set_status(&format!("Online (Subscribing {})", path_clean));
+            if let Ok(mut v) = self.version.lock() {
+                *v = "moq-transport".to_string();
+            }
+
+            {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    static PKT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    while let Ok(Some(frame)) = track.read_frame().await {
+                        if let Ok(packet) = NeuroPacket::decode(frame) {
+                            let n = PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if n == 1 || n % 100 == 0 {
+                                tracing::info!(n, "subscriber packets received");
+                            }
+                            let _ = tx.send(packet).await;
                         }
-                        (p, None) => {
-                            self.set_status(&format!("Broadcast offline: {}", p));
+                    }
+                });
+            }
+            // Same broadcast, the eeg FlatBuffer track — independent read +
+            // counter, verifying the producer side of the Neuralkit.eeg fence
+            // without touching the TUI's own data path.
+            tokio::spawn(async move {
+                static EEG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                while let Ok(Some(frame)) = eeg_track.read_frame().await {
+                    if let Ok(nf) = root_as_neuro_frame(&frame) {
+                        let n = EEG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 100 == 0 {
+                            let raw_len = nf.raw_data().map(|v| v.len()).unwrap_or(0);
+                            tracing::info!(n, seq = nf.seq(), poor_signal = nf.poor_signal(), raw_len, "eeg subscriber frames received");
                         }
-                    },
+                    }
+                }
+            });
+
+            let mut quitting = false;
+            tokio::select! {
+                _ = self.sel.shutdown.notified() => { quitting = true; }
+                _ = self.sel.reconfigure.notified() => { self.set_status("Switching relay"); }
+                _ = subscriber.closed() => {
+                    self.set_status("Offline; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
             if quitting {
-                // Graceful quit: drop the connection so its Drop sends a
-                // CONNECTION_CLOSE, then hold the runtime alive briefly so quinn
-                // transmits it — the relay reaps us immediately.
-                drop(reconnect);
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 return Ok(());
             }
-            // reconfigure or session drop → drop this connection and re-dial.
+            // reconfigure or a dead connection → loop, drop `subscriber` (its
+            // Drop closes the session), and re-dial.
         }
     }
 }
