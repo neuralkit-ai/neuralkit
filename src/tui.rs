@@ -1,5 +1,4 @@
 use crate::BrainWaveParser;
-use std::sync::atomic::Ordering;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -11,6 +10,7 @@ use ratatui::{
         ListItem, ListState, Paragraph,
     },
 };
+use std::sync::atomic::Ordering;
 
 pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     let mut constraints = vec![
@@ -54,13 +54,26 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         .constraints([Constraint::Min(0), Constraint::Length(30)])
         .split(info_inner);
 
-    let moq_status = parser.moq_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    
+    let moq_status = parser
+        .moq_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
     // Check if the client is running in subscriber mode based on the status string
     let is_subscriber = moq_status.contains("Subscrib");
     let latency_text = if is_subscriber {
-        let net_lat = parser.net_latency_ms.load(std::sync::atomic::Ordering::Relaxed);
-        format!(" | EEG-LAT: {:>3}ms | NET-LAT: {:>3}ms", parser.last_latency_ms, net_lat)
+        let net_lat = parser
+            .net_latency_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // How far behind the live signal the drawn wave is: network delivery
+        // latency + the smoothing buffer still waiting to be drawn.
+        let buf_ms = parser.raw_buffer.len() * 1000 / crate::signal_processing::SAMPLE_RATE;
+        let behind = parser.last_latency_ms as usize + buf_ms;
+        format!(
+            " | EEG-LAT: {:>3}ms | BEHIND: {:>4}ms | NET-LAT: {:>3}ms",
+            parser.last_latency_ms, behind, net_lat
+        )
     } else {
         "".to_string()
     };
@@ -75,7 +88,6 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         .alignment(ratatui::layout::Alignment::Right)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help_text, info_layout[1]);
-
 
     // Raw EEG Wave — plot only the last `raw_window` samples (horizontal zoom),
     // re-indexed from 0 so they fill the widget width.
@@ -329,16 +341,24 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     if parser.show_debug {
         // Live bottom-left frame label: negotiated protocol version + relay RTT,
         // refreshed every second by the streaming client's ticks.
-        let version = parser.moq_version.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let version = parser
+            .moq_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let net_lat = parser.net_latency_ms.load(Ordering::Relaxed);
-        let proto = if version.is_empty() { "—".to_string() } else { version };
+        let proto = if version.is_empty() {
+            "—".to_string()
+        } else {
+            version
+        };
         let label = format!(" {proto} · relay {net_lat}ms ");
         let debug_block = Block::default()
             .title(" MoQ Protocol Debug ")
             .title_bottom(Line::from(label).left_aligned())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow));
-        
+
         let debug_lines: Vec<Line> = {
             let d = parser.moq_debug.lock().unwrap();
             d.iter().map(|s| Line::from(s.clone())).collect()
@@ -347,7 +367,7 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         let debug_para = Paragraph::new(debug_lines)
             .block(debug_block)
             .style(Style::default().bg(Color::Black));
-        
+
         f.render_widget(debug_para, chunks[5]);
     }
 
@@ -357,7 +377,10 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         let (title, rows): (&str, Vec<String>) = match parser.menu {
             crate::Menu::Main => (
                 " Settings  [↑↓ · →/Enter · Esc] ",
-                crate::MAIN_MENU.iter().map(|m| format!("  {m}  ▸")).collect(),
+                crate::MAIN_MENU
+                    .iter()
+                    .map(|m| format!("  {m}  ▸"))
+                    .collect(),
             ),
             crate::Menu::Protocol => (
                 " Protocol  [Enter apply · Esc back] ",
@@ -365,7 +388,11 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     .iter()
                     .enumerate()
                     .map(|(i, p)| {
-                        let a = if i == parser.sel.protocol.load(Ordering::Relaxed) { "●" } else { " " };
+                        let a = if i == parser.sel.protocol.load(Ordering::Relaxed) {
+                            "●"
+                        } else {
+                            " "
+                        };
                         format!(" {a} {p}")
                     })
                     .collect(),
@@ -376,7 +403,11 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     .iter()
                     .enumerate()
                     .map(|(i, (name, url))| {
-                        let a = if i == parser.sel.relay.load(Ordering::Relaxed) { "●" } else { " " };
+                        let a = if i == parser.sel.relay.load(Ordering::Relaxed) {
+                            "●"
+                        } else {
+                            " "
+                        };
                         let host = url
                             .trim_start_matches("https://")
                             .trim_start_matches("http://");

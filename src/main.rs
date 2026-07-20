@@ -76,11 +76,7 @@ struct Args {
 
     /// MoQ Relay URL (defaults to the local phaze-relay; pass a public relay
     /// like https://relay.cloudflare.mediaoverquic.com to go remote)
-    #[arg(
-        short = 'u',
-        long,
-        default_value = "https://127.0.0.1:4443"
-    )]
+    #[arg(short = 'u', long, default_value = "https://127.0.0.1:4443")]
     stream_url: String,
 
     /// MoQ Broadcast Path (e.g. neuralkit)
@@ -132,8 +128,9 @@ pub struct BrainWaveParser {
     pub is_paused: bool,
     pub show_debug: bool,
     /// How many trailing raw samples the EEG wave widget plots — the horizontal
-    /// zoom. Fewer = more zoomed-in (each cycle spreads wider). `-`/`+` adjust it,
-    /// clamped to 64..=WINDOW_SIZE. Display only.
+    /// zoom. Fewer = more zoomed-in (each cycle spreads wider). `-`/`+` step it by
+    /// one sliding window (SLIDING_WINDOW_STEP = 128 = 250 ms), clamped to
+    /// SLIDING_WINDOW_STEP..=WINDOW_SIZE (250..1000 ms). Display only.
     pub raw_window: usize,
     pub stream_tx: Option<mpsc::Sender<NeuroPacket>>,
     pub moq_status: Arc<Mutex<String>>,
@@ -178,7 +175,7 @@ impl BrainWaveParser {
             sel: streaming::Selection::new(0),
             is_paused: false,
             show_debug: false,
-            raw_window: 256,
+            raw_window: signal_processing::SAMPLE_RATE, // 512 samples = 1000 ms at 512 Hz
             stream_tx: None,
             moq_status: Arc::new(Mutex::new("Offline".to_string())),
             moq_debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
@@ -484,11 +481,20 @@ impl BrainWaveParser {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         self.last_latency_ms = now_ms.saturating_sub(packet.timestamp_ms);
 
         if !packet.raw_data.is_empty() {
-            let new_points = packet.raw_data.iter().skip(packet.raw_data.len().saturating_sub(signal_processing::SLIDING_WINDOW_STEP)).map(|&x| x as i16);
+            let new_points = packet
+                .raw_data
+                .iter()
+                .skip(
+                    packet
+                        .raw_data
+                        .len()
+                        .saturating_sub(signal_processing::SLIDING_WINDOW_STEP),
+                )
+                .map(|&x| x as i16);
             for p in new_points {
                 self.raw_buffer.push_back(p);
             }
@@ -529,12 +535,18 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                     _ => {}
                 },
                 Protocol => {
-                    parser.sel.protocol.store(parser.menu_cursor, Ordering::Relaxed);
+                    parser
+                        .sel
+                        .protocol
+                        .store(parser.menu_cursor, Ordering::Relaxed);
                     parser.sel.reconfigure.notify_one(); // re-dial with the new ALPN
                     parser.menu = Closed; // selection made — close the popup
                 }
                 Relay => {
-                    parser.sel.relay.store(parser.menu_cursor, Ordering::Relaxed);
+                    parser
+                        .sel
+                        .relay
+                        .store(parser.menu_cursor, Ordering::Relaxed);
                     parser.sel.reconfigure.notify_one(); // re-dial the new relay
                     parser.menu = Closed; // selection made — close the popup
                 }
@@ -563,10 +575,13 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
             parser.menu_cursor = 0;
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
-            parser.raw_window = parser.raw_window.saturating_sub(32).max(64);
+            parser.raw_window = parser
+                .raw_window
+                .saturating_sub(SLIDING_WINDOW_STEP)
+                .max(SLIDING_WINDOW_STEP);
         }
         KeyCode::Char('-') | KeyCode::Char('_') => {
-            parser.raw_window = (parser.raw_window + 32).min(WINDOW_SIZE);
+            parser.raw_window = (parser.raw_window + SLIDING_WINDOW_STEP).min(WINDOW_SIZE);
         }
         _ => {}
     }
@@ -577,8 +592,15 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Redirect tracing logs to a sink to prevent TUI corruption from background libraries
     // TUI owns the terminal — tracing goes to the debug log file instead of stdout.
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open("neuralkit_debug.log").expect("open neuralkit_debug.log");
-    tracing_subscriber::fmt().with_writer(log_file).with_ansi(false).init();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("neuralkit_debug.log")
+        .expect("open neuralkit_debug.log");
+    tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .with_ansi(false)
+        .init();
 
     let args = Args::parse();
 
@@ -652,6 +674,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = [0u8; 1024];
     let mut stream_buffer = Vec::new();
     let mut last_tick = Instant::now();
+    // Fractional-sample carry: the subscriber drains SAMPLE_RATE*elapsed samples
+    // per frame, but truncating to usize each tick loses ~1 sample/frame, so the
+    // smoothing buffer (and thus the lag) creeps up over time. Carry the remainder
+    // so the drain matches the arrival rate exactly and the buffer stays shallow.
+    let mut drain_acc: f64 = 0.0;
     let tick_rate = Duration::from_millis(33);
 
     // --synthetic pacing: emit raw samples at the real device rate (SAMPLE_RATE,
@@ -675,7 +702,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             } else if args.sub {
-                // In subscriber mode: wait for packet, input, or tick timeout
+                // Apply any waiting packet, but don't block the frame on one: wake
+                // every ~8ms so the 33ms draw tick fires at a steady ~30fps. Waiting
+                // the full tick_rate here for a packet coupled the frame rate to the
+                // 4Hz packet arrival, dropping the whole dashboard to ~21fps.
                 tokio::select! {
                     Some(packet) = rx_packets.recv() => {
                         parser.apply_packet(packet);
@@ -683,9 +713,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             parser.apply_packet(packet);
                         }
                     }
-                    _ = tokio::time::sleep(tick_rate) => {}
+                    _ = tokio::time::sleep(tick_rate.saturating_sub(last_tick.elapsed())) => {}
                 }
-                
+
                 // CRITICAL: We must pump the TUI event queue immediately after select.
                 // If we don't, crossterm events pile up and block the OS thread or freeze the UI.
                 if event::poll(Duration::from_millis(0))? {
@@ -748,6 +778,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        // Pump input BEFORE the drain/draw so a keypress takes effect on the same
+        // frame. If P (pause) were only caught after the drain, the --sub wave
+        // would advance one extra frame before freezing ("plays a little").
+        if event::poll(Duration::from_millis(1))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key(&mut parser, key.code) {
+                        break;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    terminal.autoresize()?;
+                }
+                _ => {}
+            }
+        }
+
         if last_tick.elapsed() >= tick_rate {
             // Gate the smoothing-drain on !is_paused (the receive stage already is),
             // so P freezes the raw wave + attention/meditation immediately — same as
@@ -755,7 +802,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // paused. terminal.draw stays outside, so the frozen frame still renders
             // and the TUI stays responsive.
             if args.sub && !parser.is_paused {
-                let samples_to_pop = (signal_processing::SAMPLE_RATE as f32 * last_tick.elapsed().as_secs_f32()) as usize;
+                drain_acc +=
+                    signal_processing::SAMPLE_RATE as f64 * last_tick.elapsed().as_secs_f64();
+                let base = drain_acc as usize;
+                drain_acc -= base as f64;
+                // Gentle clock-recovery: also drain 10% of any excess beyond one
+                // packet each frame, so a small pub/sub rate drift can't let the lag
+                // creep up. Steers the buffer to ~1 packet (~250 ms) smoothly,
+                // without the periodic drop-stutter a hard cap would cause.
+                let target = signal_processing::SLIDING_WINDOW_STEP;
+                let steer = parser.raw_buffer.len().saturating_sub(target) / 6;
+                let samples_to_pop = base + steer;
                 let mut popped = 0;
                 while popped < samples_to_pop && !parser.raw_buffer.is_empty() {
                     if let Some(val) = parser.raw_buffer.pop_front() {
@@ -763,7 +820,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if parser.raw_history.len() > signal_processing::WINDOW_SIZE {
                             parser.raw_history.pop_front();
                         }
-                        
+
                         // Push attention/meditation ONLY when the publisher signaled an actual hardware update event occurred.
                         // We pop these from the queue so they appear at exactly the same "wave offset" as they did on the publisher.
                         if let Some(att) = parser.attention_queue.pop_front() {
@@ -781,10 +838,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     popped += 1;
                 }
-                
-                // Anti-pileup measure if network lags and then dumps huge batch of packets at once
-                if parser.raw_buffer.len() > 1024 {
-                    parser.raw_buffer.drain(0..(parser.raw_buffer.len() - signal_processing::WINDOW_SIZE));
+
+                // Keep the smoothing buffer SHALLOW (a couple of packets) so the
+                // subscriber tracks the publisher in near-real-time. This is what
+                // makes a pause match: when the publisher's playhead stops, the
+                // stream stops, and the subscriber drains this short buffer to the
+                // publisher's LAST sent frame within ~0.5s and freezes there — the
+                // two paused screens line up, instead of the subscriber replaying a
+                // multi-second backlog. A larger buffer only adds latency + drift.
+                const BUF_CAP: usize = 2 * signal_processing::SLIDING_WINDOW_STEP; // 256 ≈ 0.5s (ceiling)
+                const BUF_KEEP: usize = signal_processing::SLIDING_WINDOW_STEP; // 128 ≈ 0.25s (one packet: the 4 Hz smoothing floor)
+                if parser.raw_buffer.len() > BUF_CAP {
+                    let excess = parser.raw_buffer.len() - BUF_KEEP;
+                    parser.raw_buffer.drain(0..excess);
                 }
             }
 
@@ -804,22 +870,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            terminal.draw(|f| tui::render_dashboard(f, &parser))?;
+            // Reset the tick BEFORE drawing (the drain above already consumed the
+            // elapsed time). Resetting after the draw made the frame period
+            // tick_rate + draw_time (~48ms → ~21fps); measuring from draw-start
+            // gives a steady ~30fps as long as a draw fits inside tick_rate.
             last_tick = Instant::now();
-        }
-
-        if event::poll(Duration::from_millis(1))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if handle_key(&mut parser, key.code) {
-                        break;
-                    }
-                }
-                Event::Resize(_, _) => {
-                    terminal.autoresize()?;
-                }
-                _ => {}
-            }
+            terminal.draw(|f| tui::render_dashboard(f, &parser))?;
         }
     }
 
