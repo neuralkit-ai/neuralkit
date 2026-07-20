@@ -29,20 +29,33 @@ const MEDITATION: u8 = 0x05;
 const RAW_VALUE: u8 = 0x80;
 const ASIC_EEG_POWER: u8 = 0x83;
 
-/// Top-level menu entries — each drills into a submenu. Protocol is gone:
-/// phaze-moq (Cloudflare's own moq-transport) speaks exactly one wire, so
-/// there's nothing left to pick between.
-const MAIN_MENU: &[&str] = &["Relay"];
+/// Top-level menu entries — each drills into a submenu.
+const MAIN_MENU: &[&str] = &["Relay", "Transport"];
 
 /// Selectable relays (name, URL). Local carries the phaze-relay `--local`
-/// address so the ip:port is visible in the picker. Cloudflare now points at
-/// PRODUCTION (not the interop/test relay) — phaze-moq's direct
-/// subscribe-by-name is exactly the mechanism prod requires, so this just
-/// works, unlike the old moq-net-based client which needed announce
-/// forwarding prod never provides.
+/// address so the ip:port is visible in the picker. Cloudflare points at
+/// PRODUCTION — phaze-moq's direct subscribe-by-name is exactly the
+/// mechanism prod requires, so this just works, unlike the old moq-net-based
+/// client which needed announce forwarding prod never provides. Interop is
+/// Cloudflare's other public relay (the former "Cloudflare" entry, before
+/// prod was verified reachable) — same moqt-16 wire, expired TLS cert
+/// (`is_insecure` already matches any mediaoverquic.com host).
 const RELAYS: &[(&str, &str)] = &[
     ("Cloudflare", "https://relay.cloudflare.mediaoverquic.com"),
     ("Local", "https://127.0.0.1:4443"),
+    (
+        "Interop",
+        "https://interop-relay.cloudflare.mediaoverquic.com",
+    ),
+];
+
+/// Selectable wire transports. Both negotiate the identical moqt-16 codec —
+/// WebTransport wraps it over HTTP/3, RawQuic sends it directly over QUIC.
+/// Not a version list: moq-transport only ever speaks draft-16, so this is
+/// the one real choice moq-native-ietf's client has (see phaze-moq's `dial`).
+const TRANSPORTS: &[(&str, phaze_moq::Transport)] = &[
+    ("WebTransport", phaze_moq::Transport::WebTransport),
+    ("Raw QUIC", phaze_moq::Transport::RawQuic),
 ];
 
 /// Drill-down settings menu state (opened with `M`).
@@ -51,6 +64,7 @@ pub enum Menu {
     Closed,
     Main,
     Relay,
+    Transport,
 }
 
 #[derive(Parser, Debug)]
@@ -501,6 +515,7 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
         let len = match parser.menu {
             Main => MAIN_MENU.len(),
             Relay => RELAYS.len(),
+            Transport => TRANSPORTS.len(),
             Closed => 0,
         };
         match code {
@@ -517,6 +532,10 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                         parser.menu = Relay;
                         parser.menu_cursor = parser.sel.relay.load(Ordering::Relaxed);
                     }
+                    1 => {
+                        parser.menu = Transport;
+                        parser.menu_cursor = parser.sel.transport.load(Ordering::Relaxed);
+                    }
                     _ => {}
                 },
                 Relay => {
@@ -527,12 +546,20 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                     parser.sel.reconfigure.notify_one(); // re-dial the new relay
                     parser.menu = Closed; // selection made — close the popup
                 }
+                Transport => {
+                    parser
+                        .sel
+                        .transport
+                        .store(parser.menu_cursor, Ordering::Relaxed);
+                    parser.sel.reconfigure.notify_one(); // re-dial with the new transport
+                    parser.menu = Closed; // selection made — close the popup
+                }
                 Closed => {}
             },
             // Esc / ← backs up a level (or closes from Main).
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => match parser.menu {
                 Main => parser.menu = Closed,
-                Relay => {
+                Relay | Transport => {
                     parser.menu = Main;
                     parser.menu_cursor = 0;
                 }

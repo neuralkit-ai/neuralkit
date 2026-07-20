@@ -400,6 +400,21 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
                     })
                     .collect(),
             ),
+            crate::Menu::Transport => (
+                " Transport  [Enter apply · Esc back] ",
+                crate::TRANSPORTS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| {
+                        let a = if i == parser.sel.transport.load(Ordering::Relaxed) {
+                            "●"
+                        } else {
+                            " "
+                        };
+                        format!(" {a} {name}")
+                    })
+                    .collect(),
+            ),
             crate::Menu::Closed => (" ", Vec::new()),
         };
 

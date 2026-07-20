@@ -38,16 +38,18 @@ pub use fb::neuralkit::fb::{NeuroFrame, NeuroFrameArgs, root_as_neuro_frame};
 const TRACK_NAME: &str = "0";
 const EEG_TRACK_NAME: &str = "eeg";
 
-/// Live-selectable relay, shared between the dashboard (which mutates it from
-/// the `M` menu) and the connection task (which reads it each dial). A change
-/// + `reconfigure.notify_one()` makes the task drop its connection and re-dial
-/// with the new URL — the picker is live.
+/// Live-selectable relay + transport, shared between the dashboard (which
+/// mutates it from the `M` menu) and the connection task (which reads it each
+/// dial). A change + `reconfigure.notify_one()` makes the task drop its
+/// connection and re-dial with the new selection — both pickers are live.
 ///
-/// No protocol picker anymore — phaze-moq speaks exactly one wire
-/// (Cloudflare's moq-transport), so there is nothing to select between.
+/// No wire-protocol picker — phaze-moq speaks exactly one wire (Cloudflare's
+/// moq-transport, draft-16). `transport` only picks WebTransport vs raw QUIC,
+/// two real code paths moq-native-ietf already has for that one wire.
 #[derive(Clone)]
 pub struct Selection {
     pub relay: Arc<AtomicUsize>,
+    pub transport: Arc<AtomicUsize>,
     pub reconfigure: Arc<Notify>,
     /// Signalled on quit so the streaming task drops its connection and lets
     /// the relay reap the session immediately (graceful CONNECTION_CLOSE)
@@ -59,14 +61,26 @@ impl Selection {
     pub fn new(relay: usize) -> Self {
         Self {
             relay: Arc::new(AtomicUsize::new(relay)),
+            transport: Arc::new(AtomicUsize::new(0)),
             reconfigure: Arc::new(Notify::new()),
             shutdown: Arc::new(Notify::new()),
         }
     }
     /// The currently-selected relay URL (from the RELAYS table).
     fn url(&self) -> String {
-        let i = self.relay.load(Ordering::Relaxed).min(crate::RELAYS.len() - 1);
+        let i = self
+            .relay
+            .load(Ordering::Relaxed)
+            .min(crate::RELAYS.len() - 1);
         crate::RELAYS[i].1.to_string()
+    }
+    /// The currently-selected transport (from the TRANSPORTS table).
+    fn transport(&self) -> phaze_moq::Transport {
+        let i = self
+            .transport
+            .load(Ordering::Relaxed)
+            .min(crate::TRANSPORTS.len() - 1);
+        crate::TRANSPORTS[i].1
     }
 }
 
@@ -97,7 +111,12 @@ fn spawn_latency_ping(host: String, port: u16, net_lat: Arc<AtomicU64>) {
 fn host_port(url: &str) -> (String, u16) {
     url::Url::parse(url)
         .ok()
-        .map(|u| (u.host_str().unwrap_or("relay").to_string(), u.port().unwrap_or(443)))
+        .map(|u| {
+            (
+                u.host_str().unwrap_or("relay").to_string(),
+                u.port().unwrap_or(443),
+            )
+        })
         .unwrap_or_else(|| ("relay".to_string(), 443))
 }
 
@@ -107,8 +126,13 @@ fn host_port(url: &str) -> (String, u16) {
 /// bypassing verification for the whole domain is harmless and one less thing
 /// to keep in sync if that ever changes).
 fn is_insecure(url: &str) -> bool {
-    matches!(url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).as_deref(),
-        Some("localhost") | Some("127.0.0.1")) || url.contains("mediaoverquic.com")
+    matches!(
+        url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .as_deref(),
+        Some("localhost") | Some("127.0.0.1")
+    ) || url.contains("mediaoverquic.com")
 }
 
 pub struct StreamingClient {
@@ -155,7 +179,11 @@ impl StreamingClient {
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<NeuroPacket>) -> Result<()> {
-        let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
+        let path_clean = self
+            .path
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
         if path_clean.is_empty() {
             anyhow::bail!("Stream path cannot be empty");
         }
@@ -172,17 +200,20 @@ impl StreamingClient {
             let url = self.sel.url();
             self.set_status(&format!("Connecting to {}", host_port(&url).0));
 
-            let mut publisher = match phaze_moq::Publisher::connect(&url, is_insecure(&url)).await {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_status(&format!("Client init failed: {}", e));
-                    tokio::select! {
-                        _ = self.sel.reconfigure.notified() => {}
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            let mut publisher =
+                match phaze_moq::Publisher::connect(&url, is_insecure(&url), self.sel.transport())
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.set_status(&format!("Client init failed: {}", e));
+                        tokio::select! {
+                            _ = self.sel.reconfigure.notified() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             // One announce for the namespace; both tracks come off the SAME
             // broadcast handle — creating two independent announces (one per
@@ -318,7 +349,11 @@ impl SubscriberClient {
     }
 
     pub async fn run(self, tx: mpsc::Sender<NeuroPacket>) -> Result<()> {
-        let path_clean = self.path.trim_start_matches('/').trim_end_matches('/').to_string();
+        let path_clean = self
+            .path
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
 
         if let Ok(url) = url::Url::parse(&self.sel.url()) {
             let (host, port) = host_port(url.as_str());
@@ -331,17 +366,20 @@ impl SubscriberClient {
             let url = self.sel.url();
             self.set_status(&format!("Connecting to {}", host_port(&url).0));
 
-            let mut subscriber = match phaze_moq::Subscriber::connect(&url, is_insecure(&url)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    self.set_status(&format!("Client init failed: {}", e));
-                    tokio::select! {
-                        _ = self.sel.reconfigure.notified() => {}
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            let mut subscriber =
+                match phaze_moq::Subscriber::connect(&url, is_insecure(&url), self.sel.transport())
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.set_status(&format!("Client init failed: {}", e));
+                        tokio::select! {
+                            _ = self.sel.reconfigure.notified() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             self.set_status(&format!("Subscribing to: {}", path_clean));
 
@@ -374,10 +412,12 @@ impl SubscriberClient {
             {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    static PKT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static PKT_COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     while let Ok(Some(frame)) = track.read_frame().await {
                         if let Ok(packet) = NeuroPacket::decode(frame) {
-                            let n = PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let n =
+                                PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             if n == 1 || n % 100 == 0 {
                                 tracing::info!(n, "subscriber packets received");
                             }
@@ -390,13 +430,20 @@ impl SubscriberClient {
             // counter, verifying the producer side of the Neuralkit.eeg fence
             // without touching the TUI's own data path.
             tokio::spawn(async move {
-                static EEG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static EEG_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
                 while let Ok(Some(frame)) = eeg_track.read_frame().await {
                     if let Ok(nf) = root_as_neuro_frame(&frame) {
                         let n = EEG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if n == 1 || n % 100 == 0 {
                             let raw_len = nf.raw_data().map(|v| v.len()).unwrap_or(0);
-                            tracing::info!(n, seq = nf.seq(), poor_signal = nf.poor_signal(), raw_len, "eeg subscriber frames received");
+                            tracing::info!(
+                                n,
+                                seq = nf.seq(),
+                                poor_signal = nf.poor_signal(),
+                                raw_len,
+                                "eeg subscriber frames received"
+                            );
                         }
                     }
                 }
