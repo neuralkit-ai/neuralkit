@@ -66,13 +66,9 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         let net_lat = parser
             .net_latency_ms
             .load(std::sync::atomic::Ordering::Relaxed);
-        // How far behind the live signal the drawn wave is: network delivery
-        // latency + the smoothing buffer still waiting to be drawn.
-        let buf_ms = parser.raw_buffer.len() * 1000 / crate::signal_processing::SAMPLE_RATE;
-        let behind = parser.last_latency_ms as usize + buf_ms;
         format!(
-            " | EEG-LAT: {:>3}ms | BEHIND: {:>4}ms | NET-LAT: {:>3}ms",
-            parser.last_latency_ms, behind, net_lat
+            " | EEG-LAT: {:>3}ms | NET-LAT: {:>3}ms",
+            parser.last_latency_ms, net_lat
         )
     } else {
         "".to_string()
