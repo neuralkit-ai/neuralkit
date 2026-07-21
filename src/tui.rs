@@ -65,8 +65,8 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
             .connect_rtt_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         format!(
-            " | EEG-LAT: {:>3}ms | RTT: {:>3}ms",
-            parser.last_latency_ms, connect_rtt
+            " | EEG-LAT: {:>3}ms | JIT: {:>3}ms | RTT: {:>3}ms",
+            parser.last_latency_ms, parser.jitter_ms, connect_rtt
         )
     } else {
         "".to_string()

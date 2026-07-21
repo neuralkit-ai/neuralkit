@@ -144,7 +144,22 @@ pub struct BrainWaveParser {
     pub moq_status: Arc<Mutex<String>>,
     pub moq_debug: Arc<Mutex<VecDeque<String>>>,
     pub moq_version: Arc<Mutex<String>>,
-    pub last_latency_ms: u64,
+    /// now_ms - packet.timestamp_ms: publisher clock vs subscriber clock, so
+    /// this is polluted by whatever clock skew exists between the two
+    /// machines (same-machine testing has none). Signed so a skewed-behind
+    /// subscriber clock shows as a real negative number instead of silently
+    /// flooring to a misleading "perfect" 0 — `saturating_sub` used to eat
+    /// that case. `jitter_ms` (below) is the trustworthy companion: skew is
+    /// ~constant across one ~250ms packet interval, so it mostly cancels out
+    /// in the consecutive-reading diff (RFC 3550-style interarrival jitter).
+    pub last_latency_ms: i64,
+    /// |last_latency_ms - previous last_latency_ms|. Unlike the number above,
+    /// this isn't measuring "how old is this packet" — it's "how consistent
+    /// is delivery timing," which is what actually predicts a stuttering wave
+    /// (a relay delivering groups in bursts, seen before on CF prod). Needs
+    /// nothing but the previous reading — no rolling window, no assumed
+    /// cadence, no clock sync.
+    pub jitter_ms: u64,
     /// QUIC dial + MoQT SETUP handshake duration, refreshed on every
     /// (re)connect — not a continuous ping (see `streaming::StreamingClient::
     /// connect_rtt_ms`).
@@ -193,6 +208,7 @@ impl BrainWaveParser {
             moq_debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             moq_version: Arc::new(Mutex::new(String::new())),
             last_latency_ms: 0,
+            jitter_ms: 0,
             connect_rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             latest_attention: 0,
             latest_meditation: 0,
@@ -488,13 +504,14 @@ impl BrainWaveParser {
         self.last_band_data = Some(bands);
         self.last_poor_signal = packet.poor_signal as u8;
 
-        // Calculate network latency
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_millis() as i64;
 
-        self.last_latency_ms = now_ms.saturating_sub(packet.timestamp_ms);
+        let latency_ms = now_ms - packet.timestamp_ms as i64;
+        self.jitter_ms = latency_ms.abs_diff(self.last_latency_ms);
+        self.last_latency_ms = latency_ms;
 
         if !packet.raw_data.is_empty() {
             let new_points = packet
