@@ -112,6 +112,10 @@ pub struct BrainWaveParser {
     pub processing_counter: usize,
     pub use_custom_processing: bool,
     pub synthetic: bool,
+    /// Set once at startup from `--sub`. Gates the `R` reconnect key — force-
+    /// redialing is a subscriber concept (the publisher's outer loop already
+    /// redials on its own the moment a write fails).
+    pub is_subscriber: bool,
     pub synthetic_time: f32,
     /// Last whole-second at which synthetic eSense (attention/meditation) updated,
     /// so it ticks at ~1 Hz like the real headset's big packet.
@@ -170,6 +174,7 @@ impl BrainWaveParser {
             processing_counter: 0,
             use_custom_processing: true,
             synthetic: false,
+            is_subscriber: false,
             synthetic_time: 0.0,
             last_esense_sec: u32::MAX,
             rng: 0x2545F491,
@@ -578,6 +583,16 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
             parser.menu = Menu::Main;
             parser.menu_cursor = 0;
         }
+        // Force a fresh redial against the current relay/transport — the same
+        // path the M-menu picker already uses (Selection::reconfigure), just
+        // triggered without changing the selection. The reconfigure loop only
+        // ever redials on its own when the connection itself dies; if it's
+        // alive but simply not receiving (a stalled subscribe, an upstream
+        // that went quiet), nothing else forces a retry. Subscriber-only: the
+        // publisher's loop already redials the moment a write fails.
+        KeyCode::Char('r') if parser.is_subscriber => {
+            parser.sel.reconfigure.notify_one();
+        }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             parser.raw_window = parser
                 .raw_window
@@ -610,6 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
+    parser.is_subscriber = args.sub;
 
     // Live relay/protocol selection, shared by the dashboard (M-menu) and the
     // connection task. Seed the relay index from --stream-url so the picker

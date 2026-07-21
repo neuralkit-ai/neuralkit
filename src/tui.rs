@@ -60,9 +60,7 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    // Check if the client is running in subscriber mode based on the status string
-    let is_subscriber = moq_status.contains("Subscrib");
-    let latency_text = if is_subscriber {
+    let latency_text = if parser.is_subscriber {
         let net_lat = parser
             .net_latency_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -80,7 +78,12 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
     ));
     f.render_widget(status_text, info_layout[0]);
 
-    let help_text = Paragraph::new("[Q] Quit  [P] Pause  [D] Debug  [-/+] Zoom  [M] Protocol")
+    let help_line = if parser.is_subscriber {
+        "[Q] Quit  [P] Pause  [D] Debug  [-/+] Zoom  [M] Menu  [R] Reconnect"
+    } else {
+        "[Q] Quit  [P] Pause  [D] Debug  [-/+] Zoom  [M] Menu"
+    };
+    let help_text = Paragraph::new(help_line)
         .alignment(ratatui::layout::Alignment::Right)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help_text, info_layout[1]);
