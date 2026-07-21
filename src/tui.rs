@@ -61,12 +61,12 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         .clone();
 
     let latency_text = if parser.is_subscriber {
-        let net_lat = parser
-            .net_latency_ms
+        let connect_rtt = parser
+            .connect_rtt_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         format!(
-            " | EEG-LAT: {:>3}ms | NET-LAT: {:>3}ms",
-            parser.last_latency_ms, net_lat
+            " | EEG-LAT: {:>3}ms | RTT: {:>3}ms",
+            parser.last_latency_ms, connect_rtt
         )
     } else {
         "".to_string()
@@ -338,20 +338,20 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
 
     // MoQ Debug Section (Bottom)
     if parser.show_debug {
-        // Live bottom-left frame label: negotiated protocol version + relay RTT,
-        // refreshed every second by the streaming client's ticks.
+        // Live bottom-left frame label: negotiated protocol version + the
+        // last connect's RTT (refreshed on (re)connect, not a live ping).
         let version = parser
             .moq_version
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let net_lat = parser.net_latency_ms.load(Ordering::Relaxed);
+        let connect_rtt = parser.connect_rtt_ms.load(Ordering::Relaxed);
         let proto = if version.is_empty() {
             "—".to_string()
         } else {
             version
         };
-        let label = format!(" {proto} · relay {net_lat}ms ");
+        let label = format!(" {proto} · relay {connect_rtt}ms ");
         let debug_block = Block::default()
             .title(" MoQ Protocol Debug ")
             .title_bottom(Line::from(label).left_aligned())

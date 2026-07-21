@@ -84,30 +84,9 @@ impl Selection {
     }
 }
 
-/// Spawn the relay round-trip-latency probe: store the RTT (ms) in `net_lat`
-/// only on a successful TCP connect, sampled every 2s. Unchanged mechanic
-/// from the moq-net version, extracted so publisher and subscriber share it.
-fn spawn_latency_ping(host: String, port: u16, net_lat: Arc<AtomicU64>) {
-    tokio::spawn(async move {
-        loop {
-            let start = std::time::Instant::now();
-            if let Ok(Ok(_)) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                tokio::net::TcpStream::connect((host.as_str(), port)),
-            )
-            .await
-            {
-                let rtt = start.elapsed().as_millis() as u64;
-                net_lat.store(rtt, Ordering::Relaxed);
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    });
-}
-
-/// Pull `(host, port)` out of a relay URL string for the latency probe.
-/// `phaze_moq` takes the URL as a bare `&str`, so this is the one place we
-/// still parse it — display/diagnostics only, never the connect path itself.
+/// Pull `(host, port)` out of a relay URL string for the "Connecting to..."
+/// status line. `phaze_moq` takes the URL as a bare `&str`, so this is the
+/// one place we still parse it — display only, never the connect path itself.
 fn host_port(url: &str) -> (String, u16) {
     url::Url::parse(url)
         .ok()
@@ -145,7 +124,10 @@ pub struct StreamingClient {
     /// just a fixed label once connected — kept so the dashboard's layout
     /// doesn't need to change.
     pub version: Arc<Mutex<String>>,
-    pub net_latency_ms: Arc<AtomicU64>,
+    /// QUIC dial + MoQT SETUP handshake duration, refreshed on every
+    /// (re)connect. Not a live ping — see `phaze_moq::Publisher::connect_rtt`
+    /// for why a continuous one isn't achievable without forking.
+    pub connect_rtt_ms: Arc<AtomicU64>,
     pub sel: Selection,
 }
 
@@ -157,7 +139,7 @@ impl StreamingClient {
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             version: Arc::new(Mutex::new(String::new())),
-            net_latency_ms: Arc::new(AtomicU64::new(0)),
+            connect_rtt_ms: Arc::new(AtomicU64::new(0)),
             sel: Selection::new(0),
         })
     }
@@ -189,11 +171,6 @@ impl StreamingClient {
         }
         let mut eeg_seq: u32 = 0;
 
-        if let Ok(url) = url::Url::parse(&self.sel.url()) {
-            let (host, port) = host_port(url.as_str());
-            spawn_latency_ping(host, port, self.net_latency_ms.clone());
-        }
-
         // Reconfigure loop: (re)dial whenever the relay selection changes (M
         // menu) or the session drops, so the picker is live.
         loop {
@@ -214,6 +191,10 @@ impl StreamingClient {
                         continue;
                     }
                 };
+            self.connect_rtt_ms.store(
+                publisher.connect_rtt().as_millis() as u64,
+                Ordering::Relaxed,
+            );
 
             // One announce for the namespace; both tracks come off the SAME
             // broadcast handle — creating two independent announces (one per
@@ -315,7 +296,8 @@ pub struct SubscriberClient {
     pub status: Arc<Mutex<String>>,
     pub debug: Arc<Mutex<VecDeque<String>>>,
     pub version: Arc<Mutex<String>>,
-    pub net_latency_ms: Arc<AtomicU64>,
+    /// See `StreamingClient::connect_rtt_ms`.
+    pub connect_rtt_ms: Arc<AtomicU64>,
     pub sel: Selection,
 }
 
@@ -327,7 +309,7 @@ impl SubscriberClient {
             status: Arc::new(Mutex::new("Initializing".to_string())),
             debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             version: Arc::new(Mutex::new(String::new())),
-            net_latency_ms: Arc::new(AtomicU64::new(0)),
+            connect_rtt_ms: Arc::new(AtomicU64::new(0)),
             sel: Selection::new(0),
         })
     }
@@ -355,11 +337,6 @@ impl SubscriberClient {
             .trim_end_matches('/')
             .to_string();
 
-        if let Ok(url) = url::Url::parse(&self.sel.url()) {
-            let (host, port) = host_port(url.as_str());
-            spawn_latency_ping(host, port, self.net_latency_ms.clone());
-        }
-
         // Reconfigure loop: (re)dial whenever the relay selection changes (M
         // menu) or the session drops, so the picker is live on --sub too.
         loop {
@@ -380,6 +357,10 @@ impl SubscriberClient {
                         continue;
                     }
                 };
+            self.connect_rtt_ms.store(
+                subscriber.connect_rtt().as_millis() as u64,
+                Ordering::Relaxed,
+            );
 
             self.set_status(&format!("Subscribing to: {}", path_clean));
 

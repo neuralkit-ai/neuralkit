@@ -145,7 +145,10 @@ pub struct BrainWaveParser {
     pub moq_debug: Arc<Mutex<VecDeque<String>>>,
     pub moq_version: Arc<Mutex<String>>,
     pub last_latency_ms: u64,
-    pub net_latency_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// QUIC dial + MoQT SETUP handshake duration, refreshed on every
+    /// (re)connect — not a continuous ping (see `streaming::StreamingClient::
+    /// connect_rtt_ms`).
+    pub connect_rtt_ms: Arc<std::sync::atomic::AtomicU64>,
     pub latest_attention: u64,
     pub latest_meditation: u64,
     pub attention_update_pending: bool,
@@ -190,7 +193,7 @@ impl BrainWaveParser {
             moq_debug: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             moq_version: Arc::new(Mutex::new(String::new())),
             last_latency_ms: 0,
-            net_latency_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            connect_rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             latest_attention: 0,
             latest_meditation: 0,
             attention_update_pending: false,
@@ -648,7 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
         client.version = parser.moq_version.clone();
-        client.net_latency_ms = parser.net_latency_ms.clone();
+        client.connect_rtt_ms = parser.connect_rtt_ms.clone();
         client.sel = sel.clone();
         tokio::spawn(async move {
             if let Err(e) = client.run(tx).await {
@@ -661,7 +664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.status = parser.moq_status.clone();
         client.debug = parser.moq_debug.clone();
         client.version = parser.moq_version.clone();
-        client.net_latency_ms = parser.net_latency_ms.clone();
+        client.connect_rtt_ms = parser.connect_rtt_ms.clone();
         client.sel = sel.clone();
         let (tx_moq, rx_moq) = mpsc::channel(100);
         parser.stream_tx = Some(tx_moq);
