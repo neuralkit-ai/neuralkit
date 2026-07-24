@@ -2,44 +2,27 @@
 //!
 //! The CLI generates a SECRET `device_code`, holds the `CliAuth` SSE stream, and
 //! renders the returned `user_code` as a terminal QR. The phone scans it →
-//! `/cli/auth` → the existing passkey ceremony → `Cli.bindDevice` broadcasts a
+//! `/cli/auth` → the existing passkey ceremony → `Cli.loginFinish` broadcasts a
 //! fresh session token to `cli:<device_code>`, which this held connection alone
-//! receives. Frames are sealed (`sign: ed25519` + `encrypt: aes-gcm-256`) and
-//! decoded with the SAME public keys the browser uses — `PUBLIC_PHAZE_SIGN_KEY`
-//! (verify) + `PUBLIC_PHAZE_ENCRYPT_KEY` (the shared aes-gcm key), read from env.
+//! receives. The channel is plain over TLS (no per-frame seal) — the token is
+//! one-time + revocable, so a distributed `neuralkit login` needs nothing but
+//! the URL: no keys, no config.
 
-use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
-use aes_gcm::aead::rand_core::RngCore;
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures_util::StreamExt;
-use phaze_crypto::ed25519::{PublicKey, Signature};
 use serde_json::Value;
 use std::io::Write;
 
 pub async fn run(base_url: &str) -> Result<()> {
     let base_url = base_url.trim_end_matches('/');
 
-    // The same values `phaze:env/client` inlines for the browser consumer.
-    let sign_pk = PublicKey::from_hex(
-        std::env::var("PUBLIC_PHAZE_SIGN_KEY")
-            .context("set PUBLIC_PHAZE_SIGN_KEY (the app's ed25519 verify key)")?
-            .trim(),
-    )?;
-    let enc = hex_decode(
-        std::env::var("PUBLIC_PHAZE_ENCRYPT_KEY")
-            .context("set PUBLIC_PHAZE_ENCRYPT_KEY (the app's aes-gcm-256 key)")?
-            .trim(),
-    )?;
-    let aes = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc));
-
     // The CLI's secret device_code (32 random bytes → 64 hex) — only ever in this
     // connection URL. `cli:<device_code>` is the tag the token broadcasts to.
     let mut dc = [0u8; 32];
-    aes_gcm::aead::OsRng.fill_bytes(&mut dc);
+    getrandom::getrandom(&mut dc).map_err(|e| anyhow!("rng: {e}"))?;
     let device_code = to_hex(&dc);
 
-    // Self-signed cert on localhost (the dev app/relay); real cert in prod.
+    // Self-signed cert on localhost (the dev app/relay); real cert in prod/tunnel.
     let insecure = base_url.contains("127.0.0.1") || base_url.contains("localhost");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
@@ -58,8 +41,10 @@ pub async fn run(base_url: &str) -> Result<()> {
             let raw: Vec<u8> = buf.drain(..pos + 2).collect();
             for line in std::str::from_utf8(&raw)?.lines() {
                 let Some(data) = line.strip_prefix("data: ") else { continue };
-                let payload = open_frame(data, &aes, &sign_pk)?;
-                let v: Value = serde_json::from_str(&payload)?;
+                if data == "null" {
+                    continue; // rejected/kill frame — keep waiting
+                }
+                let v: Value = serde_json::from_str(data).context("frame is not JSON")?;
                 if let Some(code) = v.get("userCode").and_then(Value::as_str) {
                     if !qr_shown {
                         render_qr(base_url, code);
@@ -75,24 +60,6 @@ pub async fn run(base_url: &str) -> Result<()> {
         }
     }
     Err(anyhow!("the stream closed before sign-in completed"))
-}
-
-/// `{ e, iv }` (aes-gcm outer) → decrypt → `{ v, s }` (ed25519 inner) → verify → `v`.
-fn open_frame(data: &str, aes: &Aes256Gcm, pk: &PublicKey) -> Result<String> {
-    let env: Value = serde_json::from_str(data).context("frame is not JSON")?;
-    let ct = B64.decode(env.get("e").and_then(Value::as_str).context("no `e`")?)?;
-    let iv = B64.decode(env.get("iv").and_then(Value::as_str).context("no `iv`")?)?;
-    let signed = aes
-        .decrypt(Nonce::from_slice(&iv), ct.as_ref())
-        .map_err(|_| anyhow!("aes-gcm decrypt failed"))?;
-    let vs: Value = serde_json::from_str(std::str::from_utf8(&signed)?)?;
-    let v = vs.get("v").and_then(Value::as_str).context("no `v`")?;
-    let s = B64.decode(vs.get("s").and_then(Value::as_str).context("no `s`")?)?;
-    let s: [u8; 64] = s.as_slice().try_into().map_err(|_| anyhow!("signature must be 64 bytes"))?;
-    let sig = Signature::from_bytes(&s);
-    pk.verify(v.as_bytes(), &sig)
-        .map_err(|_| anyhow!("frame signature verification failed"))?;
-    Ok(v.to_string())
 }
 
 fn render_qr(base_url: &str, code: &str) {
@@ -127,14 +94,4 @@ fn save_credentials(origin: &str, token: &str, user: &str) -> Result<()> {
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return Err(anyhow!("odd hex length"));
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
-        .collect()
 }
