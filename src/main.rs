@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
+mod login;
 mod signal_processing;
 mod streaming;
 mod tui;
@@ -70,6 +71,10 @@ pub enum Menu {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// `neuralkit login` — sign in with your passkey; anything else runs the TUI.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Serial port to connect to
     #[arg(default_value = "/dev/cu.usbmodem8D762F6448571")]
     port: String,
@@ -90,6 +95,16 @@ struct Args {
     /// Run as a subscriber to view the stream
     #[arg(long)]
     sub: bool,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Sign in to Neuralkit with your passkey — scan a QR with your phone.
+    Login {
+        /// The Neuralkit app origin (serves the CliAuth stream + /cli/auth page).
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
 }
 
 pub struct BrainWaveParser {
@@ -642,6 +657,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // `neuralkit login` — the passkey QR device flow; owns stdout, no TUI.
+    if let Some(Command::Login { url }) = &args.command {
+        if let Err(e) = login::run(url).await {
+            eprintln!("login failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
