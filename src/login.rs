@@ -2,9 +2,9 @@
 //!
 //! The CLI generates a SECRET `device_code`, holds the `CliAuth` SSE stream, and
 //! renders the returned `user_code` as a terminal QR. The phone scans it →
-//! `/cli/auth` → the existing passkey ceremony → `Cli.loginFinish` broadcasts a
-//! fresh session token to `cli:<device_code>`, which this held connection alone
-//! receives. The channel is plain over TLS (no per-frame seal) — the token is
+//! `/passkey?code=…` → the passkey login (which signs the phone in) → `Cli.authorize`
+//! broadcasts a fresh session token to `cli:<device_code>`, which this held
+//! connection alone receives. The channel is plain over TLS (no per-frame seal) — the token is
 //! one-time + revocable, so a distributed `neuralkit login` needs nothing but
 //! the URL: no keys, no config.
 
@@ -63,7 +63,7 @@ pub async fn run(base_url: &str) -> Result<()> {
 }
 
 fn render_qr(base_url: &str, code: &str) {
-    let url = format!("{base_url}/cli/auth?code={code}");
+    let url = format!("{base_url}/passkey?code={code}");
     if let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) {
         // module_dimensions(2, 1) compensates for the 1×2 terminal cell so the
         // modules read as square — phone cameras fail on stretched codes.

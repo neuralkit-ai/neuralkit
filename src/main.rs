@@ -101,7 +101,7 @@ struct Args {
 enum Command {
     /// Sign in to Neuralkit with your passkey — scan a QR with your phone.
     Login {
-        /// The Neuralkit app origin (serves the CliAuth stream + /cli/auth page).
+        /// The Neuralkit app origin (serves the CliAuth stream + /passkey page).
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
