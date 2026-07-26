@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod login;
 mod session;
+mod style;
 mod signal_processing;
 mod streaming;
 mod tui;

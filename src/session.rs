@@ -19,6 +19,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use phaze_crypto::{aes, ed25519, ml_kem};
 use serde_json::{json, Value};
+use crate::style;
 use std::io::Write as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -27,12 +28,16 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// The session's command table — `help` renders it. A new command = one row
-/// here + one dispatch arm in the `---Cli.session` fence body (transport.phaze).
-const COMMANDS: &[(&str, &str)] = &[
-    ("list", "list all users (admin)"),
-    ("help", "show this table"),
-    ("exit", "leave the session"),
+/// The session's command table — `help` renders it. A new command = one row here +
+/// one dispatch arm in the `---Cli.session` fence body (transport.phaze).
+///
+/// The third column is the role a command needs, and it only decides whether `help`
+/// LISTS it. Enforcement stays server-side: typing a hidden command still reaches the
+/// fence and is still refused there, so this table can never grant anything.
+const COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("list", "list all users", Some("admin")),
+    ("help", "show this table", None),
+    ("exit", "leave the session", None),
 ];
 
 struct Credentials {
@@ -125,38 +130,50 @@ impl Seal {
 
 pub async fn run() -> Result<()> {
     let creds = load_credentials()?;
-    let (mut ws, seal) = connect(&creds).await?;
+    let (mut ws, seal, roles) = connect(&creds).await?;
 
-    println!("\nneuralkit session — signed in as {}", creds.user);
-    println!("{}", match &seal {
-        Some(s) if s.verify_key.is_some() => "channel up (ML-KEM-768 DEK → AES-256-GCM + ed25519)",
-        Some(_) => "channel up (ML-KEM-768 DEK → AES-256-GCM)",
-        None => "channel up (JSON over TLS)",
-    });
-    println!("type 'help' for commands, 'exit' to leave\n");
+    // Header: one bright line (who you are), then dimmed chrome. The crypto line is
+    // status, not content — it should be legible on demand, not competing for the eye.
+    println!();
+    println!("  {} {}", style::bold("neuralkit"), style::dim(&format!("· {}", creds.user)));
+    println!("  {} {}", style::green("●"), style::dim(match &seal {
+        Some(s) if s.verify_key.is_some() => "ML-KEM-768 → AES-256-GCM · ed25519 verified",
+        Some(_) => "ML-KEM-768 → AES-256-GCM",
+        None => "plaintext over TLS",
+    }));
+    println!("  {}\n", style::dim("help for commands · exit to leave"));
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
-        print!("neuralkit> ");
+        print!("{} ", style::cyan("›"));
         std::io::stdout().flush()?;
         let Some(line) = lines.next_line().await? else { break };
         match line.trim() {
             "" => continue,
             "exit" | "quit" => break,
             "help" => {
-                for (cmd, what) in COMMANDS {
-                    println!("  {cmd:<8}{what}");
+                println!();
+                for (cmd, what, needs) in COMMANDS {
+                    // Hide what this account can't run — the server still enforces it.
+                    if needs.is_some_and(|r| !roles.iter().any(|held| held == r)) { continue }
+                    println!("  {}  {}", style::cyan(&format!("{cmd:<6}")), style::dim(what));
                 }
+                println!();
             }
             "list" => match command(&mut ws, seal.as_ref(), "list").await {
                 Ok(reply) => render_users(&reply),
-                Err(e) => println!("✗ {e:#}"),
+                Err(e) => println!("  {} {}", style::red("✗"), e),
             },
-            other => println!("unknown command: {other} — try 'help'"),
+            other => println!(
+                "  {} unknown command {} {}",
+                style::red("✗"),
+                style::bold(other),
+                style::dim("— try help"),
+            ),
         }
     }
     let _ = ws.close(None).await;
-    println!("bye");
+    println!("{}", style::dim("bye"));
     Ok(())
 }
 
@@ -184,7 +201,7 @@ fn load_credentials() -> Result<Credentials> {
 
 /// Upgrade to the command channel. (The ML-KEM handshake is temporarily removed —
 /// see the fence comment; restore both ends together from git.)
-async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>)> {
+async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>, Vec<String>)> {
     // rustls picks its process-level provider by crate-feature detection, which
     // PANICS when several are compiled in — quinn (via phaze-moq) brings both
     // aws-lc-rs and ring. Choose ring, the one moq-native-ietf installs for the
@@ -232,7 +249,13 @@ async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>)> {
             None => raw,
         };
         if v.get("ready").is_some() {
-            return Ok((ws, seal));
+            // Roles ride the ready frame so `help` can hide what this account can't run.
+            let roles = v
+                .get("roles")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default();
+            return Ok((ws, seal, roles));
         }
         if let Some(m) = v.pointer("/error/message").and_then(Value::as_str) {
             bail!("{m}");
@@ -270,6 +293,8 @@ async fn command(ws: &mut Ws, seal: Option<&Seal>, cmd: &str) -> Result<Value> {
     bail!("the channel closed mid-command")
 }
 
+/// Aligned columns, no box-drawing: borders would make the rows painful to copy out
+/// of the scrollback, which is the whole reason this stays a line-based REPL.
 fn render_users(reply: &Value) {
     let Some(users) = reply.get("users").and_then(Value::as_array) else {
         println!("{reply}");
@@ -282,11 +307,17 @@ fn render_users(reply: &Value) {
         .max()
         .unwrap_or(5)
         .max(5);
-    println!("  {:<width$}  VERIFIED", "EMAIL");
+    println!();
+    println!("  {}  {}", style::dim(&format!("{:<width$}", "EMAIL")), style::dim("VERIFIED"));
     for u in users {
         let email = u.get("email").and_then(Value::as_str).unwrap_or("?");
         let verified = u.get("verified").and_then(Value::as_i64).unwrap_or(0) == 1;
-        println!("  {email:<width$}  {}", if verified { "✓" } else { "·" });
+        // ✓/· carries the state on its own, so the row text stays unstyled and readable.
+        let mark = if verified { style::green("✓") } else { style::dim("·") };
+        println!("  {email:<width$}  {mark}");
     }
-    println!("  {} user{}", users.len(), if users.len() == 1 { "" } else { "s" });
+    println!(
+        "  {}\n",
+        style::dim(&format!("{} user{}", users.len(), if users.len() == 1 { "" } else { "s" })),
+    );
 }

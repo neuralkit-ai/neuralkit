@@ -79,7 +79,7 @@ pub async fn run(base_url: &str) -> Result<()> {
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
                     let user = v.get("user").and_then(Value::as_str).unwrap_or("");
                     save_credentials(base_url, token, user, &kem_sk.to_hex(), sign_key.as_deref())?;
-                    println!("\n✓ Signed in as {user}");
+                    println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(user));
                     return Ok(());
                 }
             }
@@ -102,7 +102,7 @@ fn render_qr(base_url: &str, code: &str) {
             .build();
         println!("{art}");
     }
-    println!("Scan with your mobile device to sign in.\n");
+    println!("{}\n", crate::style::dim("Scan with your mobile device to sign in."));
     // The QR is the ONLY way in, on purpose — neither the URL nor the user_code is
     // printed. The device-flow phishing case (RFC 8628 §5.4) is an attacker getting you
     // to authorize THEIR code; the usual mitigation is displaying the code so you can
