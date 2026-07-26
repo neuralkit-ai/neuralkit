@@ -15,7 +15,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use phaze_crypto::{aes, ed25519};
+use phaze_crypto::{aes, ed25519, ml_kem};
 use serde_json::{json, Value};
 use std::io::Write as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -37,27 +37,36 @@ struct Credentials {
     token: String,
     user: String,
     origin: String,
+    /// This install's ML-KEM secret, minted at login (see login.rs). Absent for a
+    /// credentials file written before that existed — the channel then falls back
+    /// to whatever the fence sends unsealed.
+    kem_secret: Option<String>,
 }
 
-/// The fence's per-frame seal, read from the app's PUBLIC key values — the same
-/// two the browser bundle already carries (`env.public.*`), so the CLI holds
-/// nothing the shipped client doesn't. Absent → frames are read as plain JSON,
-/// which is what an unsealed fence sends.
+/// The per-frame seal. `aes_key` is the DEK the server encapsulated to THIS install's
+/// ML-KEM public key and handed over in the one-time `__grant` frame — so it is fresh per
+/// connection and openable only here. Verification of the inner ed25519 signature is
+/// best-effort: it needs the app's PUBLIC sign key, and on a PQC stream the AES-GCM tag is
+/// already the per-frame integrity (internals/pqc: signature = provenance once, AEAD tag =
+/// tamper-evidence per frame).
 struct Seal {
     aes_key: [u8; 32],
-    verify_key: ed25519::PublicKey,
+    verify_key: Option<ed25519::PublicKey>,
 }
 
 impl Seal {
-    fn from_env() -> Option<Self> {
-        let hex_key = std::env::var("PUBLIC_PHAZE_ENCRYPT_KEY").ok()?;
-        let sign_key = std::env::var("PUBLIC_PHAZE_SIGN_KEY").ok()?;
-        let raw = (0..hex_key.len() / 2)
-            .map(|i| u8::from_str_radix(&hex_key[i * 2..i * 2 + 2], 16).ok())
-            .collect::<Option<Vec<u8>>>()?;
-        Some(Seal {
-            aes_key: raw.try_into().ok()?,
-            verify_key: ed25519::PublicKey::from_hex(&sign_key).ok()?,
+    /// Open the `{__grant:{kem}}` frame: decapsulate the ML-KEM ciphertext with this
+    /// install's secret to recover the 32-byte DEK the dispatcher is sealing with.
+    fn from_grant(kem_b64: &str, secret_hex: &str) -> Result<Self> {
+        let sk = ml_kem::SecretKey::from_hex(secret_hex).map_err(|e| anyhow!("kem secret: {e}"))?;
+        let ct = ml_kem::Ciphertext::from_bytes(&STANDARD.decode(kem_b64)?)
+            .map_err(|e| anyhow!("kem ciphertext: {e}"))?;
+        let ss = sk.decapsulate(&ct).map_err(|e| anyhow!("decapsulate: {e}"))?;
+        Ok(Seal {
+            aes_key: *ss.as_bytes(),
+            verify_key: std::env::var("PUBLIC_PHAZE_SIGN_KEY")
+                .ok()
+                .and_then(|h| ed25519::PublicKey::from_hex(&h).ok()),
         })
     }
 
@@ -85,25 +94,29 @@ impl Seal {
         ) else {
             return Ok(signed) // encrypt: without sign: — no inner envelope
         };
-        let sig_bytes: [u8; 64] = STANDARD
-            .decode(s)?
-            .try_into()
-            .map_err(|_| anyhow!("signature is not 64 bytes"))?;
-        self.verify_key
-            .verify(v.as_bytes(), &ed25519::Signature::from_bytes(&sig_bytes))
-            .map_err(|e| anyhow!("signature rejected: {e}"))?;
+        // Verify only when the app's PUBLIC sign key is available. On a PQC stream the
+        // AES-GCM tag already proved this frame came from a DEK holder; the signature is
+        // the provenance layer, so its absence degrades rather than fails.
+        if let Some(vk) = &self.verify_key {
+            let sig_bytes: [u8; 64] = STANDARD
+                .decode(s)?
+                .try_into()
+                .map_err(|_| anyhow!("signature is not 64 bytes"))?;
+            vk.verify(v.as_bytes(), &ed25519::Signature::from_bytes(&sig_bytes))
+                .map_err(|e| anyhow!("signature rejected: {e}"))?;
+        }
         serde_json::from_str(v).context("signed payload is not JSON")
     }
 }
 
 pub async fn run() -> Result<()> {
     let creds = load_credentials()?;
-    let seal = Seal::from_env();
-    let mut ws = connect(&creds, seal.as_ref()).await?;
+    let (mut ws, seal) = connect(&creds).await?;
 
     println!("\nneuralkit session — signed in as {}", creds.user);
-    println!("{}", match seal {
-        Some(_) => "channel up (per-frame ed25519 + AES-256-GCM)",
+    println!("{}", match &seal {
+        Some(s) if s.verify_key.is_some() => "channel up (ML-KEM-768 DEK → AES-256-GCM + ed25519)",
+        Some(_) => "channel up (ML-KEM-768 DEK → AES-256-GCM)",
         None => "channel up (JSON over TLS)",
     });
     println!("type 'help' for commands, 'exit' to leave\n");
@@ -146,12 +159,17 @@ fn load_credentials() -> Result<Credentials> {
             .map(String::from)
             .ok_or_else(|| anyhow!("credentials.json missing `{k}`"))
     };
-    Ok(Credentials { token: field("token")?, user: field("user")?, origin: field("origin")? })
+    Ok(Credentials {
+        token: field("token")?,
+        user: field("user")?,
+        origin: field("origin")?,
+        kem_secret: v.get("kem_secret").and_then(Value::as_str).map(String::from),
+    })
 }
 
 /// Upgrade to the command channel. (The ML-KEM handshake is temporarily removed —
 /// see the fence comment; restore both ends together from git.)
-async fn connect(creds: &Credentials, seal: Option<&Seal>) -> Result<Ws> {
+async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>)> {
     // rustls picks its process-level provider by crate-feature detection, which
     // PANICS when several are compiled in — quinn (via phaze-moq) brings both
     // aws-lc-rs and ring. Choose ring, the one moq-native-ietf installs for the
@@ -176,19 +194,30 @@ async fn connect(creds: &Credentials, seal: Option<&Seal>) -> Result<Ws> {
         .await
         .context("connect to the session channel (is the API reachable?)")?;
 
-    // Frame 1 is the readiness ack. Anything else first = an auth/setup error.
+    // The grant arrives ONCE, before any data frame: {"__grant":{"kem":…}} carries the
+    // ML-KEM ciphertext encapsulated to this install's public key. Decapsulating it yields
+    // the DEK every later frame is sealed with — so the seal is built here, not up front.
+    // Then the readiness ack; anything else first is an auth/setup error.
+    let mut seal: Option<Seal> = None;
     while let Some(msg) = ws.next().await {
         let Message::Text(t) = msg? else { continue };
         let raw: Value = serde_json::from_str(&t).context("first frame is not JSON")?;
-        if raw.get("__ping").is_some() || raw.get("__grant").is_some() {
-            continue // control frame — see the note in `command`
+        if raw.get("__ping").is_some() {
+            continue
         }
-        let v = match seal {
+        if let Some(kem) = raw.pointer("/__grant/kem").and_then(Value::as_str) {
+            let secret = creds.kem_secret.as_deref().ok_or_else(|| {
+                anyhow!("this stream is ML-KEM sealed but credentials.json has no kem_secret — re-run `neuralkit auth login`")
+            })?;
+            seal = Some(Seal::from_grant(kem, secret)?);
+            continue
+        }
+        let v = match &seal {
             Some(s) => s.open(&raw)?,
             None => raw,
         };
         if v.get("ready").is_some() {
-            return Ok(ws);
+            return Ok((ws, seal));
         }
         if let Some(m) = v.pointer("/error/message").and_then(Value::as_str) {
             bail!("{m}");

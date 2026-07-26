@@ -44,7 +44,7 @@ qrcode = "0.14"
 # phaze-crypto (no features: aes + ed25519 only, no lattice tree) reads that wire
 # with the same primitives the fence's server half uses.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-phaze-crypto = { path = "../phaze/crates/phaze-crypto" }
+phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
 base64 = "0.22"
 # TLS provider selection ONLY. quinn pulls BOTH aws-lc-rs and ring into the graph,
 # which makes rustls' feature-detected process default ambiguous (it panics on

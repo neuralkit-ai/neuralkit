@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
+use phaze_crypto::ml_kem;
 use serde_json::Value;
 use std::io::Write;
 
@@ -22,11 +23,28 @@ pub async fn run(base_url: &str) -> Result<()> {
     getrandom::getrandom(&mut dc).map_err(|e| anyhow!("rng: {e}"))?;
     let device_code = to_hex(&dc);
 
+    // This install's ML-KEM-768 keypair, minted HERE so the secret never travels. The public
+    // half rides the device flow and Cli.authorize binds it to the session it mints; the
+    // session channel's per-connection DEK is then encapsulated to it, so only this machine
+    // can open those frames. Nothing is shared between installs and nothing is in the binary.
+    let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
+
     // Self-signed cert on localhost (the dev app/relay); real cert in prod/tunnel.
     let insecure = base_url.contains("127.0.0.1") || base_url.contains("localhost");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
         .build()?;
+    // Register this install's PUBLIC key against the device_code — a POST body, never the
+    // URL: an ML-KEM-768 key is 1184 bytes (2368 hex chars) and has no business in a query
+    // string or an access log. Best-effort: if it fails the login still completes, the
+    // session channel just isn't PQC-sealed.
+    let _ = client
+        .post(format!("{base_url}/transport/action/Cli/register"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "device": device_code, "pk": kem_pk.to_hex() }).to_string())
+        .send()
+        .await;
+
     let url = format!("{base_url}/transport/stream/CliAuth?device={device_code}");
     let resp = client.get(&url).send().await?.error_for_status()?;
 
@@ -52,7 +70,7 @@ pub async fn run(base_url: &str) -> Result<()> {
                     }
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
                     let user = v.get("user").and_then(Value::as_str).unwrap_or("");
-                    save_credentials(base_url, token, user)?;
+                    save_credentials(base_url, token, user, &kem_sk.to_hex())?;
                     println!("\n✓ Signed in as {user}");
                     return Ok(());
                 }
@@ -92,12 +110,15 @@ fn render_qr(base_url: &str, code: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn save_credentials(origin: &str, token: &str, user: &str) -> Result<()> {
+fn save_credentials(origin: &str, token: &str, user: &str, kem_secret: &str) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
+    // `kem_secret` is the ML-KEM secret whose public half the server bound to this session —
+    // the only thing that can open the session channel's frames. It is paired with `token`:
+    // a new login mints a new keypair, and the server drops the old binding with the session.
     let body = serde_json::to_string_pretty(&serde_json::json!({
-        "token": token, "user": user, "origin": origin,
+        "token": token, "user": user, "origin": origin, "kem_secret": kem_secret,
     }))?;
     std::fs::write(format!("{dir}/credentials.json"), body)?;
     Ok(())
