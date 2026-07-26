@@ -7,10 +7,12 @@
 //! `/transport/stream/Cli/session` — the same wire the browser's streams use,
 //! which is what makes it behave identically in dev, preview and prod.
 //!
-//! No per-frame seal: the channel is TLS and the token is one-time + revocable,
-//! so a distributed CLI carries no keys and needs no crypto deps (the same
-//! reasoning that keeps `---CliAuth` unsealed). The session token is an ordinary
-//! session record, so the server resolves it exactly as it would a browser cookie.
+//! Frames are sealed per connection. At login this install mints its own ML-KEM-768
+//! keypair and registers the PUBLIC half; the server encapsulates each connection's
+//! DEK to it and sends the ciphertext once as `{"__grant":{kem}}`. Decapsulating that
+//! with the secret in credentials.json yields the AES-256-GCM key every later frame is
+//! sealed with — so no key is shared between installs and none is embedded here.
+//! The session token is an ordinary session record, resolved exactly as a browser cookie.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -41,6 +43,9 @@ struct Credentials {
     /// credentials file written before that existed — the channel then falls back
     /// to whatever the fence sends unsealed.
     kem_secret: Option<String>,
+    /// The app's PUBLIC ed25519 key, handed over at login. Not a secret — it only
+    /// verifies signatures, and the browser bundle carries the same value.
+    sign_key: Option<String>,
 }
 
 /// The per-frame seal. `aes_key` is the DEK the server encapsulated to THIS install's
@@ -57,16 +62,25 @@ struct Seal {
 impl Seal {
     /// Open the `{__grant:{kem}}` frame: decapsulate the ML-KEM ciphertext with this
     /// install's secret to recover the 32-byte DEK the dispatcher is sealing with.
-    fn from_grant(kem_b64: &str, secret_hex: &str) -> Result<Self> {
+    fn from_grant(kem_b64: &str, secret_hex: &str, sign_key: Option<&str>) -> Result<Self> {
         let sk = ml_kem::SecretKey::from_hex(secret_hex).map_err(|e| anyhow!("kem secret: {e}"))?;
         let ct = ml_kem::Ciphertext::from_bytes(&STANDARD.decode(kem_b64)?)
             .map_err(|e| anyhow!("kem ciphertext: {e}"))?;
         let ss = sk.decapsulate(&ct).map_err(|e| anyhow!("decapsulate: {e}"))?;
         Ok(Seal {
             aes_key: *ss.as_bytes(),
-            verify_key: std::env::var("PUBLIC_PHAZE_SIGN_KEY")
-                .ok()
-                .and_then(|h| ed25519::PublicKey::from_hex(&h).ok()),
+            // From login (credentials.json); the env var stays as an override for a
+            // credentials file written before the key was handed over. A key that is
+            // PRESENT but unparseable is an error, not a silent skip — otherwise a
+            // corrupted value turns verification off while everything still appears
+            // to work, which is the worst of both.
+            verify_key: match sign_key.map(String::from).or_else(|| std::env::var("PUBLIC_PHAZE_SIGN_KEY").ok()) {
+                Some(h) => Some(
+                    ed25519::PublicKey::from_hex(&h)
+                        .map_err(|e| anyhow!("sign_key in credentials.json is not a valid ed25519 public key: {e}"))?,
+                ),
+                None => None,
+            },
         })
     }
 
@@ -164,6 +178,7 @@ fn load_credentials() -> Result<Credentials> {
         user: field("user")?,
         origin: field("origin")?,
         kem_secret: v.get("kem_secret").and_then(Value::as_str).map(String::from),
+        sign_key: v.get("sign_key").and_then(Value::as_str).map(String::from),
     })
 }
 
@@ -209,7 +224,7 @@ async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>)> {
             let secret = creds.kem_secret.as_deref().ok_or_else(|| {
                 anyhow!("this stream is ML-KEM sealed but credentials.json has no kem_secret — re-run `neuralkit auth login`")
             })?;
-            seal = Some(Seal::from_grant(kem, secret)?);
+            seal = Some(Seal::from_grant(kem, secret, creds.sign_key.as_deref())?);
             continue
         }
         let v = match &seal {

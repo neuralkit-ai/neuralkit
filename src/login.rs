@@ -38,12 +38,20 @@ pub async fn run(base_url: &str) -> Result<()> {
     // URL: an ML-KEM-768 key is 1184 bytes (2368 hex chars) and has no business in a query
     // string or an access log. Best-effort: if it fails the login still completes, the
     // session channel just isn't PQC-sealed.
-    let _ = client
-        .post(format!("{base_url}/transport/action/Cli/register"))
-        .header("content-type", "application/json")
-        .body(serde_json::json!({ "device": device_code, "pk": kem_pk.to_hex() }).to_string())
-        .send()
-        .await;
+    // The reply carries the app's ed25519 PUBLIC key, so the session channel can verify
+    // each frame's signature without the user configuring anything.
+    let sign_key = async {
+        let res = client
+            .post(format!("{base_url}/transport/action/Cli/register"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({ "device": device_code, "pk": kem_pk.to_hex() }).to_string())
+            .send()
+            .await
+            .ok()?;
+        let body: Value = serde_json::from_str(&res.text().await.ok()?).ok()?;
+        body.pointer("/data/signKey").and_then(Value::as_str).map(String::from)
+    }
+    .await;
 
     let url = format!("{base_url}/transport/stream/CliAuth?device={device_code}");
     let resp = client.get(&url).send().await?.error_for_status()?;
@@ -70,7 +78,7 @@ pub async fn run(base_url: &str) -> Result<()> {
                     }
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
                     let user = v.get("user").and_then(Value::as_str).unwrap_or("");
-                    save_credentials(base_url, token, user, &kem_sk.to_hex())?;
+                    save_credentials(base_url, token, user, &kem_sk.to_hex(), sign_key.as_deref())?;
                     println!("\n✓ Signed in as {user}");
                     return Ok(());
                 }
@@ -110,15 +118,18 @@ fn render_qr(base_url: &str, code: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn save_credentials(origin: &str, token: &str, user: &str, kem_secret: &str) -> Result<()> {
+fn save_credentials(origin: &str, token: &str, user: &str, kem_secret: &str, sign_key: Option<&str>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
     // `kem_secret` is the ML-KEM secret whose public half the server bound to this session —
     // the only thing that can open the session channel's frames. It is paired with `token`:
     // a new login mints a new keypair, and the server drops the old binding with the session.
+    // `sign_key` is the app's PUBLIC ed25519 key (not a secret), kept here so frame signatures
+    // can be verified with no configuration.
     let body = serde_json::to_string_pretty(&serde_json::json!({
-        "token": token, "user": user, "origin": origin, "kem_secret": kem_secret,
+        "token": token, "user": user, "origin": origin,
+        "kem_secret": kem_secret, "sign_key": sign_key,
     }))?;
     std::fs::write(format!("{dir}/credentials.json"), body)?;
     Ok(())
