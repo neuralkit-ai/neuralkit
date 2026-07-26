@@ -65,19 +65,30 @@ pub async fn run(base_url: &str) -> Result<()> {
 fn render_qr(base_url: &str, code: &str) {
     let url = format!("{base_url}/passkey?code={code}");
     if let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) {
-        // module_dimensions(2, 1) compensates for the 1×2 terminal cell so the
-        // modules read as square — phone cameras fail on stretched codes.
+        // Dense1x2 packs two vertical modules into each character cell (▀▄█),
+        // rendering at ~half the width AND height of the full-block char form
+        // while staying square + scannable — no stretched modules. (Was
+        // `render::<char>().module_dimensions(2, 1)` — 2N×N chars; this is N×N/2.)
         let art = qr
-            .render::<char>()
+            .render::<qrcode::render::unicode::Dense1x2>()
             .quiet_zone(true)
-            .module_dimensions(2, 1)
-            .light_color(' ')
-            .dark_color('█')
+            .module_dimensions(1, 1)
             .build();
         println!("{art}");
     }
-    println!("Scan the code above with your phone, or open:\n  {url}\n");
-    println!("code: {code}\n");
+    println!("Scan with your mobile device to sign in.\n");
+    // The QR is the ONLY way in, on purpose — neither the URL nor the user_code is
+    // printed. The device-flow phishing case (RFC 8628 §5.4) is an attacker getting you
+    // to authorize THEIR code; the usual mitigation is displaying the code so you can
+    // compare it against the one the page shows. Here the phishable channel is REMOVED
+    // instead of mitigated: with nothing pasteable on screen, the only path is scanning
+    // your own QR, which matches by construction. Re-adding a printed URL re-opens
+    // "someone sent me this link"; if a printed code ever comes back, it is that
+    // comparison — not decoration — so keep it next to the page's own code display.
+    // The headless E2E has no camera, so it opts into the URL via this env var.
+    if std::env::var_os("NEURALKIT_LOGIN_PRINT_URL").is_some() {
+        println!("{url}");
+    }
     let _ = std::io::stdout().flush();
 }
 
