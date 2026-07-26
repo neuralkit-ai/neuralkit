@@ -131,7 +131,21 @@ fn save_credentials(origin: &str, token: &str, user: &str, kem_secret: &str, sig
         "token": token, "user": user, "origin": origin,
         "kem_secret": kem_secret, "sign_key": sign_key,
     }))?;
-    std::fs::write(format!("{dir}/credentials.json"), body)?;
+    // 0600, set at CREATE time rather than chmod'd afterwards — a plain write lands 0644
+    // under the usual umask, and fixing it after the fact leaves a window where the file is
+    // readable. This holds a session token AND the ML-KEM secret, and unlike the token the
+    // secret is not made harmless by revoking the session: whoever has it can still open any
+    // traffic they recorded while it was live. Directory 0700 for the same reason.
+    let path = format!("{dir}/credentials.json");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    opts.open(&path)?.write_all(body.as_bytes())?;
     Ok(())
 }
 
