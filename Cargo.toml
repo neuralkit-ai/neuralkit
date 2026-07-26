@@ -23,7 +23,7 @@ crossterm = "0.28.1"
 # Async runtime — trimmed from `full` to the features actually used
 # (#[tokio::main], spawn, select, sync::mpsc, time::{sleep,timeout},
 # net::TcpStream). Drops fs/process/signal/io-std/… from the build.
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-std", "io-util"] }
 # MoQ pub/sub over QUIC (streaming.rs) — our own client on Cloudflare's own
 # moq-transport/moq-native-ietf (../phaze/crates/phaze-moq, a sibling repo).
 # Direct subscribe-by-name only, matching what Cloudflare's production relay
@@ -38,6 +38,13 @@ url = "2.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
 qrcode = "0.14"
+# Interactive session (auth login → REPL, session.rs): ONE sealed WebSocket to
+# the ---Cli.session fence on rust-api. Client-supplied-pk ML-KEM: phaze-crypto
+# generates the ephemeral keypair + decapsulates the DEK + opens each {e,iv}
+# frame — the SAME crate that seals them server-side, both ends of one wire.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
+base64 = "0.22"
 serde_json = "1"
 getrandom = "0.2"
 # Logging → neuralkit_debug.log (the TUI owns the terminal).

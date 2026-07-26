@@ -1,9 +1,10 @@
 use clap::Parser;
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::time::{Duration, Instant};
 
 mod login;
+mod session;
 mod signal_processing;
 mod streaming;
 mod tui;
@@ -71,7 +72,7 @@ pub enum Menu {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// `neuralkit login` — sign in with your passkey; anything else runs the TUI.
+    /// `neuralkit auth login` — sign in with your passkey; anything else runs the TUI.
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -99,6 +100,13 @@ struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 enum Command {
+    /// Authentication — sign in and manage credentials.
+    #[command(subcommand)]
+    Auth(AuthCommand),
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuthCommand {
     /// Sign in to Neuralkit with your passkey — scan a QR with your phone.
     Login {
         /// The Neuralkit app origin (serves the CliAuth stream + /passkey page).
@@ -658,11 +666,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // `neuralkit login` — the passkey QR device flow; owns stdout, no TUI.
-    if let Some(Command::Login { url }) = &args.command {
+    // `neuralkit auth login` — the passkey QR device flow owns stdout until the
+    // token lands, then enters the interactive session (session.rs: the sealed
+    // command REPL — NOT the EEG dashboard; that stays the bare-`neuralkit`
+    // view, launchable from the session later). Headless callers (the E2E,
+    // piped scripts) get sign-in-and-exit: a REPL needs a real terminal.
+    if let Some(Command::Auth(AuthCommand::Login { url })) = &args.command {
         if let Err(e) = login::run(url).await {
             eprintln!("login failed: {e:#}");
             std::process::exit(1);
+        }
+        if io::stdout().is_terminal() && io::stdin().is_terminal() {
+            if let Err(e) = session::run().await {
+                eprintln!("session error: {e:#}");
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
