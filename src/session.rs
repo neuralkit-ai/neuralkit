@@ -1,18 +1,21 @@
 //! The interactive session — `neuralkit auth login` drops in here once the
 //! token lands (TTY only; headless callers exit after sign-in). This is NOT
-//! the EEG dashboard (main.rs TUI) — it's a command REPL holding ONE sealed
-//! WebSocket to the `---Cli.session` fence (rust-api, direct).
+//! the EEG dashboard (main.rs TUI) — it's a command REPL holding ONE WebSocket
+//! to the `---Cli.session` fence.
 //!
-//! The seal is client-supplied-pk ML-KEM: an EPHEMERAL keypair per session,
-//! the public key rides `?pk=` on the upgrade, the server encapsulates the
-//! per-connection DEK to it and pushes the `{kem}` grant as frame 1; every
-//! data reply is AES-256-GCM `{e,iv}` opened with that DEK. phaze-crypto on
-//! both ends of the wire — no app key ever ships in a distributed CLI.
+//! That fence is a DISPATCHER stream, so it is served by the app itself at
+//! `/transport/stream/Cli/session` — the same wire the browser's streams use,
+//! which is what makes it behave identically in dev, preview and prod.
+//!
+//! No per-frame seal: the channel is TLS and the token is one-time + revocable,
+//! so a distributed CLI carries no keys and needs no crypto deps (the same
+//! reasoning that keeps `---CliAuth` unsealed). The session token is an ordinary
+//! session record, so the server resolves it exactly as it would a browser cookie.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use phaze_crypto::{aes, ml_kem};
+use phaze_crypto::{aes, ed25519};
 use serde_json::{json, Value};
 use std::io::Write as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,12 +39,73 @@ struct Credentials {
     origin: String,
 }
 
+/// The fence's per-frame seal, read from the app's PUBLIC key values — the same
+/// two the browser bundle already carries (`env.public.*`), so the CLI holds
+/// nothing the shipped client doesn't. Absent → frames are read as plain JSON,
+/// which is what an unsealed fence sends.
+struct Seal {
+    aes_key: [u8; 32],
+    verify_key: ed25519::PublicKey,
+}
+
+impl Seal {
+    fn from_env() -> Option<Self> {
+        let hex_key = std::env::var("PUBLIC_PHAZE_ENCRYPT_KEY").ok()?;
+        let sign_key = std::env::var("PUBLIC_PHAZE_SIGN_KEY").ok()?;
+        let raw = (0..hex_key.len() / 2)
+            .map(|i| u8::from_str_radix(&hex_key[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        Some(Seal {
+            aes_key: raw.try_into().ok()?,
+            verify_key: ed25519::PublicKey::from_hex(&sign_key).ok()?,
+        })
+    }
+
+    /// One sealed frame → its payload. The wire is the dispatcher's
+    /// `sealStreamFrame`, read in reverse: `{e,iv}` → AES-256-GCM → `{v,s}` →
+    /// verify `s` over `v`'s bytes → `v` is the JSON the fence returned.
+    fn open(&self, frame: &Value) -> Result<Value> {
+        let (Some(e), Some(iv)) = (
+            frame.get("e").and_then(Value::as_str),
+            frame.get("iv").and_then(Value::as_str),
+        ) else {
+            return Ok(frame.clone()) // not sealed — pass through
+        };
+        let nonce: [u8; aes::NONCE_LEN] = STANDARD
+            .decode(iv)?
+            .try_into()
+            .map_err(|_| anyhow!("iv is not {} bytes", aes::NONCE_LEN))?;
+        let plain = aes::open(&self.aes_key, &nonce, &STANDARD.decode(e)?)
+            .map_err(|e| anyhow!("decrypt: {e}"))?;
+        let signed: Value = serde_json::from_slice(&plain).context("sealed payload is not JSON")?;
+        // Sign-then-encrypt, so the signature is INSIDE the envelope: verify last.
+        let (Some(v), Some(s)) = (
+            signed.get("v").and_then(Value::as_str),
+            signed.get("s").and_then(Value::as_str),
+        ) else {
+            return Ok(signed) // encrypt: without sign: — no inner envelope
+        };
+        let sig_bytes: [u8; 64] = STANDARD
+            .decode(s)?
+            .try_into()
+            .map_err(|_| anyhow!("signature is not 64 bytes"))?;
+        self.verify_key
+            .verify(v.as_bytes(), &ed25519::Signature::from_bytes(&sig_bytes))
+            .map_err(|e| anyhow!("signature rejected: {e}"))?;
+        serde_json::from_str(v).context("signed payload is not JSON")
+    }
+}
+
 pub async fn run() -> Result<()> {
     let creds = load_credentials()?;
-    let (mut ws, dek) = connect(&creds).await?;
+    let seal = Seal::from_env();
+    let mut ws = connect(&creds, seal.as_ref()).await?;
 
     println!("\nneuralkit session — signed in as {}", creds.user);
-    println!("sealed channel up (ML-KEM-768 grant → AES-256-GCM frames)");
+    println!("{}", match seal {
+        Some(_) => "channel up (per-frame ed25519 + AES-256-GCM)",
+        None => "channel up (JSON over TLS)",
+    });
     println!("type 'help' for commands, 'exit' to leave\n");
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -57,7 +121,7 @@ pub async fn run() -> Result<()> {
                     println!("  {cmd:<8}{what}");
                 }
             }
-            "list" => match command(&mut ws, &dek, "list").await {
+            "list" => match command(&mut ws, seal.as_ref(), "list").await {
                 Ok(reply) => render_users(&reply),
                 Err(e) => println!("✗ {e:#}"),
             },
@@ -85,68 +149,79 @@ fn load_credentials() -> Result<Credentials> {
     Ok(Credentials { token: field("token")?, user: field("user")?, origin: field("origin")? })
 }
 
-/// Upgrade to the sealed channel: ephemeral ML-KEM keypair → `?pk=` →
-/// consume the `{kem}` grant → decapsulate → the 32-byte DEK.
-async fn connect(creds: &Credentials) -> Result<(Ws, [u8; 32])> {
-    let (pk, sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
+/// Upgrade to the command channel. (The ML-KEM handshake is temporarily removed —
+/// see the fence comment; restore both ends together from git.)
+async fn connect(creds: &Credentials, seal: Option<&Seal>) -> Result<Ws> {
+    // rustls picks its process-level provider by crate-feature detection, which
+    // PANICS when several are compiled in — quinn (via phaze-moq) brings both
+    // aws-lc-rs and ring. Choose ring, the one moq-native-ietf installs for the
+    // MoQ side. Err = already installed by another path, which is equally fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // http→ws / https→wss; the /api/* route reaches rust-api (CF route in prod,
-    // dev proxy locally) — same origin credentials.json already stores.
+    // http→ws / https→wss. The fence is a DISPATCHER stream, so it is served by the
+    // app itself at /transport/stream/<Group>/<action> — the same wire the browser's
+    // streams use, identical in dev, preview and prod.
     let ws_origin = creds.origin.replacen("http", "ws", 1);
-    let url = format!("{ws_origin}/api/cli/session?pk={}", pk.to_hex());
+    let url = format!("{ws_origin}/transport/stream/Cli/session");
     let mut req = url.into_client_request()?;
-    // Cookie name mirrors the server's own pick (rust-api current_user: the
-    // ORIGIN var's scheme decides) — https origin ⇒ the __Secure- name.
-    let cookie = if creds.origin.starts_with("https") {
-        format!("__Secure-session={}", creds.token)
-    } else {
-        format!("session={}", creds.token)
-    };
+    // Send BOTH names. The app picks its cookie name from BUILD MODE
+    // (`env.prod ? '__Secure-session' : 'session'`, auth.ts), which a client can't
+    // infer from the URL — an https tunnel in front of a dev build wants the plain
+    // name, a deployed build wants the prefixed one. Offering both lets the
+    // resolver read whichever it is configured for; only one is ever looked up.
+    let cookie = format!("session={0}; __Secure-session={0}", creds.token);
     req.headers_mut().insert("cookie", cookie.parse()?);
 
     let (mut ws, _) = connect_async(req)
         .await
         .context("connect to the session channel (is the API reachable?)")?;
 
-    // Frame 1 is the grant. Anything else first = an auth/setup error.
+    // Frame 1 is the readiness ack. Anything else first = an auth/setup error.
     while let Some(msg) = ws.next().await {
         let Message::Text(t) = msg? else { continue };
-        let v: Value = serde_json::from_str(&t).context("grant frame is not JSON")?;
-        if let Some(kem) = v.get("kem").and_then(Value::as_str) {
-            let ct = ml_kem::Ciphertext::from_bytes(&STANDARD.decode(kem)?)
-                .map_err(|e| anyhow!("kem ciphertext: {e}"))?;
-            let ss = sk.decapsulate(&ct).map_err(|e| anyhow!("decapsulate: {e}"))?;
-            return Ok((ws, *ss.as_bytes()));
+        let raw: Value = serde_json::from_str(&t).context("first frame is not JSON")?;
+        if raw.get("__ping").is_some() || raw.get("__grant").is_some() {
+            continue // control frame — see the note in `command`
+        }
+        let v = match seal {
+            Some(s) => s.open(&raw)?,
+            None => raw,
+        };
+        if v.get("ready").is_some() {
+            return Ok(ws);
         }
         if let Some(m) = v.pointer("/error/message").and_then(Value::as_str) {
             bail!("{m}");
         }
     }
-    bail!("the channel closed before the key grant")
+    bail!("the channel closed before it was ready")
 }
 
-/// One request/response turn: send `{"cmd":…}`, open the sealed reply.
-async fn command(ws: &mut Ws, dek: &[u8; 32], cmd: &str) -> Result<Value> {
+/// One request/response turn: send `{"cmd":…}`, read the reply.
+async fn command(ws: &mut Ws, seal: Option<&Seal>, cmd: &str) -> Result<Value> {
     ws.send(Message::Text(json!({ "cmd": cmd }).to_string())).await?;
     while let Some(msg) = ws.next().await {
         let Message::Text(t) = msg? else { continue };
-        let v: Value = serde_json::from_str(&t).context("reply is not JSON")?;
+        let raw: Value = serde_json::from_str(&t).context("reply is not JSON")?;
+        // Control frames ride PLAIN, outside the seal — the dispatcher sends
+        // `{"__ping":1}` as a keepalive (SSE's `: ping` has no ws equivalent) and
+        // `{"__grant":…}` for a PQC stream's key grant. The browser's s.bind recipe
+        // drops both before setting a value; drop them BEFORE opening, or a
+        // keepalive is read as the reply (and would fail to decrypt).
+        if raw.get("__ping").is_some() || raw.get("__grant").is_some() {
+            continue
+        }
+        let v = match seal {
+            Some(s) => s.open(&raw)?,
+            None => raw,
+        };
         if let Some(m) = v.pointer("/error/message").and_then(Value::as_str) {
             bail!("{m}");
         }
-        let (Some(e), Some(iv)) = (
-            v.get("e").and_then(Value::as_str),
-            v.get("iv").and_then(Value::as_str),
-        ) else {
-            continue // not a data frame
-        };
-        let iv: [u8; aes::NONCE_LEN] = STANDARD
-            .decode(iv)?
-            .try_into()
-            .map_err(|_| anyhow!("iv is not {} bytes", aes::NONCE_LEN))?;
-        let plain = aes::open(dek, &iv, &STANDARD.decode(e)?)
-            .map_err(|e| anyhow!("open sealed frame: {e}"))?;
-        return serde_json::from_slice(&plain).context("sealed payload is not JSON");
+        if v.get("ready").is_some() {
+            continue // a late readiness ack, not a reply
+        }
+        return Ok(v);
     }
     bail!("the channel closed mid-command")
 }

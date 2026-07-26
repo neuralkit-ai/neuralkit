@@ -677,90 +677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "dcrypt-algorithms"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5179e0e1e91c64ff843edd692db6931add07d84bfb1ff94688dbe6479dc178b"
-dependencies = [
- "base64",
- "byteorder",
- "dcrypt-api",
- "dcrypt-common",
- "dcrypt-internal",
- "dcrypt-params",
- "getrandom 0.2.17",
- "hex",
- "portable-atomic",
- "rand 0.8.5",
- "rand_chacha",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "dcrypt-api"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a09c7127a23e86a84c2b3ad0ead8da510ea3909c191c9503802c1c98d8ab1982"
-dependencies = [
- "dcrypt-internal",
- "rand 0.8.5",
- "subtle",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "dcrypt-common"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0c87a1b70ee62621fe18b14d620425823e0ed30bd653a0113e917525b783b0"
-dependencies = [
- "dcrypt-api",
- "dcrypt-internal",
- "rand 0.8.5",
- "subtle",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "dcrypt-internal"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf73208436081e3eac64de9b1c51dc39a5cdb5f361faeb427db8887bfbe64799"
-dependencies = [
- "subtle",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "dcrypt-kem"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cd43bf801a8b710671d6116e6a26a98a1823566e9ee2742a03b4442aa3ad154"
-dependencies = [
- "dcrypt-algorithms",
- "dcrypt-api",
- "dcrypt-common",
- "dcrypt-internal",
- "dcrypt-params",
- "rand 0.8.5",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "dcrypt-params"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "452d51c23707de2e120b65032eab6083023301207564027432f78e5a06b6cbcb"
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1986,6 +1902,7 @@ dependencies = [
  "ratatui",
  "realfft",
  "reqwest",
+ "rustls",
  "serde_json",
  "serialport",
  "tokio",
@@ -2270,8 +2187,6 @@ dependencies = [
  "aes-gcm",
  "base64",
  "ciborium",
- "dcrypt-api",
- "dcrypt-kem",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hex",
@@ -4809,20 +4724,6 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
-dependencies = [
- "zeroize_derive",
-]
-
-[[package]]
-name = "zeroize_derive"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.116",
-]
 
 [[package]]
 name = "zerotrie"

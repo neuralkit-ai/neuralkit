@@ -38,13 +38,19 @@ url = "2.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
 qrcode = "0.14"
-# Interactive session (auth login → REPL, session.rs): ONE sealed WebSocket to
-# the ---Cli.session fence on rust-api. Client-supplied-pk ML-KEM: phaze-crypto
-# generates the ephemeral keypair + decapsulates the DEK + opens each {e,iv}
-# frame — the SAME crate that seals them server-side, both ends of one wire.
+# Interactive session (auth login → REPL, session.rs): ONE WebSocket to the
+# ---Cli.session dispatcher stream. The fence declares sign:'ed25519' +
+# encrypt:'aes-gcm-256', so each frame is {e,iv} → AES-GCM → {v,s} → ed25519.
+# phaze-crypto (no features: aes + ed25519 only, no lattice tree) reads that wire
+# with the same primitives the fence's server half uses.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
+phaze-crypto = { path = "../phaze/crates/phaze-crypto" }
 base64 = "0.22"
+# TLS provider selection ONLY. quinn pulls BOTH aws-lc-rs and ring into the graph,
+# which makes rustls' feature-detected process default ambiguous (it panics on
+# first use); `ring` is the one moq-native-ietf installs, so both TLS paths in
+# this binary end up on one provider. See session.rs's install_default call.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json = "1"
 getrandom = "0.2"
 # Logging → neuralkit_debug.log (the TUI owns the terminal).
