@@ -110,7 +110,7 @@ enum Command {
 enum AuthCommand {
     /// Sign in to Neuralkit with your passkey — scan a QR with your phone.
     Login {
-        /// The Neuralkit app origin (serves the CliAuth stream + /passkey page).
+        /// The Neuralkit app origin (serves the QrCode.request stream + /passkey page).
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },

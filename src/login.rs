@@ -1,8 +1,8 @@
 //! `neuralkit auth login` — passkey QR device flow.
 //!
-//! The CLI generates a SECRET `device_code`, holds the `CliAuth` SSE stream, and
+//! The CLI generates a SECRET `device_code`, holds the `QrCode.request` SSE stream, and
 //! renders the returned `user_code` as a terminal QR. The phone scans it →
-//! `/passkey?code=…` → the passkey login (which signs the phone in) → `Cli.authorize`
+//! `/passkey?code=…` → the passkey login (which signs the phone in) → `QrCode.approve`
 //! broadcasts a fresh session token to `cli:<device_code>`, which this held
 //! connection alone receives. The channel is plain over TLS (no per-frame seal) — the token is
 //! one-time + revocable, so a distributed `neuralkit auth login` needs nothing
@@ -24,7 +24,7 @@ pub async fn run(base_url: &str) -> Result<()> {
     let device_code = to_hex(&dc);
 
     // This install's ML-KEM-768 keypair, minted HERE so the secret never travels. The public
-    // half rides the device flow and Cli.authorize binds it to the session it mints; the
+    // half rides the device flow and QrCode.approve binds it to the session it mints; the
     // session channel's per-connection DEK is then encapsulated to it, so only this machine
     // can open those frames. Nothing is shared between installs and nothing is in the binary.
     let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
@@ -42,7 +42,7 @@ pub async fn run(base_url: &str) -> Result<()> {
     // each frame's signature without the user configuring anything.
     let sign_key = async {
         let res = client
-            .post(format!("{base_url}/transport/action/Cli/register"))
+            .post(format!("{base_url}/transport/action/Cli/registerKey"))
             .header("content-type", "application/json")
             .body(serde_json::json!({ "device": device_code, "pk": kem_pk.to_hex() }).to_string())
             .send()
@@ -53,7 +53,7 @@ pub async fn run(base_url: &str) -> Result<()> {
     }
     .await;
 
-    let url = format!("{base_url}/transport/stream/CliAuth?device={device_code}");
+    let url = format!("{base_url}/transport/stream/QrCode/request?device={device_code}");
     let resp = client.get(&url).send().await?.error_for_status()?;
 
     let mut stream = resp.bytes_stream();
