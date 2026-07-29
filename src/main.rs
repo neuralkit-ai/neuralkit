@@ -108,12 +108,31 @@ enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 enum AuthCommand {
-    /// Sign in to Neuralkit with your passkey — scan a QR with your phone.
+    /// Sign in — and register this machine, so later sign-ins need only a code.
     Login {
         /// The Neuralkit app origin (serves the QrCode.request stream + /passkey page).
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
+        /// Sign in by scanning a QR code with your phone. Works on any machine.
+        #[arg(long, conflicts_with = "totp")]
+        qr: bool,
+        /// Sign in with a code from your authenticator app. Needs a previous sign-in on
+        /// this machine — that is what leaves the account id on disk.
+        #[arg(long)]
+        totp: bool,
     },
+    /// Forget this machine — revoke its session and clear its registration.
+    ///
+    /// Deliberately not called logout: logging out ends a session and leaves the machine
+    /// registered, which is what lets the next sign-in be a code. This removes the
+    /// registration itself, so the next `auth login` starts from a QR as a machine that
+    /// had never signed in would.
+    ///
+    /// Takes no `--url`: the origin comes from the machine's own credentials, since it
+    /// recorded where it registered. A repeated (or defaulted) origin here could revoke
+    /// nothing while the delete still succeeded, leaving a live session with nothing on
+    /// disk to reach it.
+    Unregister,
 }
 
 pub struct BrainWaveParser {
@@ -672,8 +691,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // command REPL — NOT the EEG dashboard; that stays the bare-`neuralkit`
     // view, launchable from the session later). Headless callers (the E2E,
     // piped scripts) get sign-in-and-exit: a REPL needs a real terminal.
-    if let Some(Command::Auth(AuthCommand::Login { url })) = &args.command {
-        if let Err(e) = login::run(url).await {
+    if let Some(Command::Auth(AuthCommand::Login { url, qr, totp })) = &args.command {
+        // clap already refused both at once, so this is a total mapping: neither flag
+        // means "decide at runtime" — ask, or fall to the QR when there is no choice.
+        let method = if *qr { Some(login::Method::Qr) } else if *totp { Some(login::Method::Totp) } else { None };
+        if let Err(e) = login::run(url, method).await {
             eprintln!("login failed: {e:#}");
             std::process::exit(1);
         }
@@ -682,6 +704,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("session error: {e:#}");
                 std::process::exit(1);
             }
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Auth(AuthCommand::Unregister)) = &args.command {
+        if let Err(e) = login::unregister().await {
+            eprintln!("unregister failed: {e:#}");
+            std::process::exit(1);
         }
         return Ok(());
     }
