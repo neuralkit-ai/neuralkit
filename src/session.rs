@@ -37,6 +37,7 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("list", "list all users", Some("admin")),
     ("help", "show this table", None),
+    ("logout", "end this session and forget it", None),
     ("exit", "leave the session", None),
 ];
 
@@ -51,6 +52,26 @@ struct Credentials {
     /// The app's PUBLIC ed25519 key, handed over at login. Not a secret — it only
     /// verifies signatures, and the browser bundle carries the same value.
     sign_key: Option<String>,
+    /// When this session dies — the record's own absolute ms timestamp, captured at
+    /// login. Absolute rather than a duration, so it stays correct however long the file
+    /// sits between runs. Absent for a file written before this existed.
+    expires: Option<i64>,
+}
+
+/// The expiry in the DEVICE's local time — the only frame of reference the person
+/// reading it has. Returns None if the stamp is out of range for a local datetime.
+fn expires_at(ms: i64) -> Option<String> {
+    use chrono::{Local, TimeZone};
+    Local.timestamp_millis_opt(ms).single().map(|t| t.format("%-I:%M%p").to_string())
+}
+
+/// What woke the prompt. The REPL blocks on stdin, so without a second arm to race it
+/// the session's own deadline could never fire — the person would sit at a live prompt
+/// holding a token the server stopped honouring.
+enum Wake {
+    Line(String),
+    Eof,
+    Expired,
 }
 
 /// The per-frame seal. `aes_key` is the DEK the server encapsulated to THIS install's
@@ -135,7 +156,12 @@ pub async fn run() -> Result<()> {
     // Header: one bright line (who you are), then dimmed chrome. The crypto line is
     // status, not content — it should be legible on demand, not competing for the eye.
     println!();
-    println!("  {} {}", style::bold("neuralkit"), style::dim(&format!("· {}", creds.user)));
+    let expiry = creds
+        .expires
+        .and_then(expires_at)
+        .map(|t| format!(" · expires {t}"))
+        .unwrap_or_default();
+    println!("  {} {}", style::bold("neuralkit"), style::dim(&format!("· {}{}", creds.user, expiry)));
     println!("  {} {}", style::green("●"), style::dim(match &seal {
         Some(s) if s.verify_key.is_some() => "ML-KEM-768 → AES-256-GCM · ed25519 verified",
         Some(_) => "ML-KEM-768 → AES-256-GCM",
@@ -143,11 +169,49 @@ pub async fn run() -> Result<()> {
     }));
     println!("  {}\n", style::dim("help for commands · exit to leave"));
 
+    // The session's death clock. `expires` is an ABSOLUTE wall-clock stamp, so convert
+    // it to a remaining duration once and hand that to a monotonic timer: a laptop that
+    // suspends past the deadline wakes with the sleep already elapsed and fires at once.
+    // A credentials file written before `expires` existed has no deadline and keeps the
+    // old behaviour — the server still refuses it, just less gracefully.
+    let deadline = creds.expires.map(|at| {
+        let left = (at - chrono::Utc::now().timestamp_millis()).max(0) as u64;
+        tokio::time::Instant::now() + std::time::Duration::from_millis(left)
+    });
+
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         print!("{} ", style::cyan("›"));
         std::io::stdout().flush()?;
-        let Some(line) = lines.next_line().await? else { break };
+        // `biased` polls the deadline first, so it wins a tie rather than letting one
+        // more command through on a session that has just died. Losing a half-typed
+        // line to the cancelled `next_line` is fine — the only path out of that arm
+        // leaves the REPL.
+        let wake = match deadline {
+            Some(at) => tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(at) => Wake::Expired,
+                line = lines.next_line() => line?.map_or(Wake::Eof, Wake::Line),
+            },
+            None => lines.next_line().await?.map_or(Wake::Eof, Wake::Line),
+        };
+        let line = match wake {
+            Wake::Line(l) => l,
+            Wake::Eof => break,
+            // Nothing to tell the server: the KV record's TTL and this deadline are the
+            // same number from the same mint, so it has already lapsed on its own. Drop
+            // the token — it can no longer authenticate anything, and leaving it makes
+            // the next run fail against a session that does not exist.
+            Wake::Expired => {
+                println!();
+                println!("  {} session expired", style::red("✗"));
+                if let Err(e) = remove_credentials() {
+                    println!("  {} {}", style::red("✗"), e);
+                }
+                println!("  {}", style::dim("run `neuralkit auth login` to sign in again"));
+                break
+            }
+        };
         match line.trim() {
             "" => continue,
             "exit" | "quit" => break,
@@ -164,6 +228,22 @@ pub async fn run() -> Result<()> {
                 Ok(reply) => render_users(&reply),
                 Err(e) => println!("  {} {}", style::red("✗"), e),
             },
+            // Server FIRST, disk second. `command` bails on an error reply, so a failed
+            // revoke never reaches the delete — which matters, because deleting the file
+            // first would leave a token that is valid for its full TTL and no longer on
+            // disk to retry with. No confirmation: the loss is a re-login, and a y/n
+            // prompt inside a command REPL invites the answer landing as the next command.
+            "logout" => match command(&mut ws, seal.as_ref(), "logout").await {
+                Ok(_) => {
+                    if let Err(e) = remove_credentials() {
+                        println!("  {} session ended, but {}", style::red("✗"), e);
+                    } else {
+                        println!("  {} signed out", style::green("✓"));
+                    }
+                    break
+                }
+                Err(e) => println!("  {} {}", style::red("✗"), e),
+            },
             other => println!(
                 "  {} unknown command {} {}",
                 style::red("✗"),
@@ -175,6 +255,19 @@ pub async fn run() -> Result<()> {
     let _ = ws.close(None).await;
     println!("{}", style::dim("bye"));
     Ok(())
+}
+
+/// Remove the credentials file. Only ever called AFTER the server confirms the session
+/// is revoked — the token it holds is worthless by then, and leaving it would make the
+/// next run fail confusingly against a session that no longer exists.
+fn remove_credentials() -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = format!("{home}/.config/neuralkit/credentials.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow!("could not remove {path}: {e}")),
+    }
 }
 
 /// Read `~/.config/neuralkit/credentials.json` (written by `auth login`).
@@ -196,6 +289,7 @@ fn load_credentials() -> Result<Credentials> {
         origin: field("origin")?,
         kem_secret: v.get("kem_secret").and_then(Value::as_str).map(String::from),
         sign_key: v.get("sign_key").and_then(Value::as_str).map(String::from),
+        expires: v.get("expires").and_then(Value::as_i64),
     })
 }
 

@@ -1973,6 +1973,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
+ "chrono",
  "clap",
  "crossterm 0.28.1",
  "flatbuffers",

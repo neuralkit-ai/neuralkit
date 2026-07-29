@@ -82,8 +82,8 @@ pub async fn run(base_url: &str) -> Result<()> {
                     // QR handshake — the token is an ordinary session record, so it answers
                     // this the same way a browser cookie does. Best-effort: a passkey-only
                     // account has no address, and the id remains what identifies it.
-                    let email = resolve_email(&client, base_url, token).await;
-                    save_credentials(base_url, token, user, email.as_deref(), &kem_sk.to_hex(), sign_key.as_deref())?;
+                    let (email, expires) = resolve_session(&client, base_url, token).await;
+                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref())?;
                     println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.as_deref().unwrap_or(user)));
                     return Ok(());
                 }
@@ -93,16 +93,26 @@ pub async fn run(base_url: &str) -> Result<()> {
     Err(anyhow!("the stream closed before sign-in completed"))
 }
 
-/// Ask the session we were just granted who it belongs to.
-async fn resolve_email(client: &reqwest::Client, base_url: &str, token: &str) -> Option<String> {
-    let res = client
-        .post(format!("{base_url}/transport/action/Session/request"))
-        .header("cookie", format!("session={token}; __Secure-session={token}"))
-        .send()
-        .await
-        .ok()?;
-    let v: Value = serde_json::from_str(&res.text().await.ok()?).ok()?;
-    v.pointer("/data/user/email").and_then(Value::as_str).map(String::from)
+/// Ask the session we were just granted who it belongs to, and when it dies.
+/// `expires` is the record's own absolute ms timestamp — storing the deadline rather than
+/// a duration means the remaining time stays correct however long the file sits unread.
+async fn resolve_session(client: &reqwest::Client, base_url: &str, token: &str) -> (Option<String>, Option<i64>) {
+    let fetch = async {
+        let res = client
+            .post(format!("{base_url}/transport/action/Session/request"))
+            .header("cookie", format!("session={token}; __Secure-session={token}"))
+            .send()
+            .await
+            .ok()?;
+        serde_json::from_str::<Value>(&res.text().await.ok()?).ok()
+    };
+    match fetch.await {
+        Some(v) => (
+            v.pointer("/data/user/email").and_then(Value::as_str).map(String::from),
+            v.pointer("/data/expires").and_then(Value::as_i64),
+        ),
+        None => (None, None),
+    }
 }
 
 fn render_qr(base_url: &str, code: &str) {
@@ -135,7 +145,7 @@ fn render_qr(base_url: &str, code: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, kem_secret: &str, sign_key: Option<&str>) -> Result<()> {
+fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, expires: Option<i64>, kem_secret: &str, sign_key: Option<&str>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
@@ -145,7 +155,7 @@ fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, 
     // `sign_key` is the app's PUBLIC ed25519 key (not a secret), kept here so frame signatures
     // can be verified with no configuration.
     let body = serde_json::to_string_pretty(&serde_json::json!({
-        "token": token, "user": user, "email": email, "origin": origin,
+        "token": token, "user": user, "email": email, "expires": expires, "origin": origin,
         "kem_secret": kem_secret, "sign_key": sign_key,
     }))?;
     // 0600, set at CREATE time rather than chmod'd afterwards — a plain write lands 0644

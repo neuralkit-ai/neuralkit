@@ -45,6 +45,10 @@ qrcode = "0.14"
 # with the same primitives the fence's server half uses.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
+# Session expiry is stored as an absolute ms timestamp and shown in the DEVICE's local
+# time, which needs a tz-aware conversion. Already in the tree transitively, so making it
+# direct costs no extra build; `clock` is the feature that provides `Local`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 base64 = "0.22"
 # TLS provider selection ONLY. quinn pulls BOTH aws-lc-rs and ring into the graph,
 # which makes rustls' feature-detected process default ambiguous (it panics on
