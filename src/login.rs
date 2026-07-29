@@ -38,6 +38,16 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     // can open those frames. Nothing is shared between installs and nothing is in the binary.
     let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
 
+    // The registration this machine already holds, if any. A fresh keypair every login
+    // means the row's key must be replaced, not duplicated — so the id travels with it.
+    // Option, never an empty string: the field is `.optional()` server-side, which permits
+    // ABSENT and not "" — an empty value fails the length check and takes the whole
+    // registration down with it.
+    let prior_device_id = read_credentials_json()
+        .ok()
+        .and_then(|v| v.get("device_id").and_then(Value::as_str).map(String::from))
+        .filter(|s| !s.is_empty());
+
     // Self-signed cert on localhost (the dev app/relay); real cert in prod/tunnel.
     let insecure = base_url.contains("127.0.0.1") || base_url.contains("localhost");
     let client = reqwest::Client::builder()
@@ -53,7 +63,26 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
         let res = client
             .post(format!("{base_url}/transport/action/Cli/registerKey"))
             .header("content-type", "application/json")
-            .body(serde_json::json!({ "device": device_code, "pk": kem_pk.to_hex() }).to_string())
+            // The hostname rides along as a LABEL — cosmetic, so a device list reads as
+            // machines rather than opaque ids. Never interpreted server-side.
+            //
+            // `deviceId` is this machine's existing registration, when it has one. Sending
+            // it is what makes a re-login UPDATE the row rather than mint a second device;
+            // the server honours it only if that row already belongs to the account that
+            // authenticates, so it is a claim rather than a credential.
+            .body({
+                let mut b = serde_json::json!({
+                    "device": device_code,
+                    "pk": kem_pk.to_hex(),
+                    "label": hostname(),
+                    "os": os_label(),
+                    "terminal": terminal_type(),
+                });
+                if let Some(id) = &prior_device_id {
+                    b["deviceId"] = Value::String(id.clone());
+                }
+                b.to_string()
+            })
             .send()
             .await
             .ok()?;
@@ -61,6 +90,19 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
         body.pointer("/data/signKey").and_then(Value::as_str).map(String::from)
     }
     .await;
+
+    // Registration is no longer optional decoration. It stages the key QrCode.approve
+    // promotes AND the row that names this machine — so a silent failure here surfaces
+    // much later as a REPL that never reaches its prompt, because the channel declares a
+    // seal, no DEK is ever established, and the signed-but-unsealed frames that result are
+    // a shape the client cannot read. Say so here, where the cause still is the effect.
+    if sign_key.is_none() {
+        println!(
+            "  {} {}",
+            crate::style::red("✗"),
+            crate::style::dim("could not register this machine — the session channel will not be sealed"),
+        );
+    }
 
     let url = format!("{base_url}/transport/stream/QrCode/request?device={device_code}");
     let resp = client.get(&url).send().await?.error_for_status()?;
@@ -97,12 +139,16 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     }
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
                     let user = v.get("user").and_then(Value::as_str).unwrap_or("");
+                    // The registration the server just wrote or refreshed. Kept so the NEXT
+                    // login names the same machine instead of registering a second one, and
+                    // so `unregister` has a row to revoke rather than only a file to delete.
+                    let device_id = v.get("deviceId").and_then(Value::as_str);
                     // Resolve our OWN session rather than having identity pushed through the
                     // QR handshake — the token is an ordinary session record, so it answers
                     // this the same way a browser cookie does. Best-effort: a passkey-only
                     // account has no address, and the id remains what identifies it.
                     let (email, expires) = resolve_session(&client, base_url, token).await;
-                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref())?;
+                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id)?;
                     // Two lines, because a login does two things: it authenticates you and
                     // it registers the machine. Naming the second is what makes the code
                     // option on the next run — and `auth unregister` — make sense.
@@ -351,7 +397,11 @@ async fn totp_approve(client: &reqwest::Client, base_url: &str, user_code: &str,
         .post(format!("{base_url}/transport/action/QrCode/approve"))
         .header("content-type", "application/json")
         .header("cookie", &cookie)
-        .body(serde_json::json!({ "code": user_code }).to_string())
+        // `via: "totp"` marks a SELF-approval: the machine being registered is also the one
+        // approving, so the row's approved_by_* columns will repeat its own network rather
+        // than describe a second device. Without it a self-approval is indistinguishable
+        // from a phone that happened to be on the same wifi.
+        .body(serde_json::json!({ "code": user_code, "via": "totp" }).to_string())
         .send()
         .await?;
     let ap_body: Value = serde_json::from_str(&ap.text().await?).unwrap_or(Value::Null);
@@ -434,7 +484,7 @@ fn render_qr(base_url: &str, code: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, expires: Option<i64>, kem_secret: &str, sign_key: Option<&str>) -> Result<()> {
+fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, expires: Option<i64>, kem_secret: &str, sign_key: Option<&str>, device_id: Option<&str>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
@@ -446,6 +496,9 @@ fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, 
     let body = serde_json::to_string_pretty(&serde_json::json!({
         "token": token, "user": user, "email": email, "expires": expires, "origin": origin,
         "kem_secret": kem_secret, "sign_key": sign_key,
+        // The server-minted registration id. Unlike the token it is not a secret and does
+        // not expire — it names this machine's row for as long as the row exists.
+        "device_id": device_id,
     }))?;
     // 0600, set at CREATE time rather than chmod'd afterwards — a plain write lands 0644
     // under the usual umask, and fixing it after the fact leaves a window where the file is
@@ -463,6 +516,112 @@ fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, 
     }
     opts.open(&path)?.write_all(body.as_bytes())?;
     Ok(())
+}
+
+/// The OS environment this install runs in — "macos", "linux", "windows", or
+/// "wsl:Ubuntu" when it is Linux hosted by Windows.
+///
+/// `std::env::consts::OS` is resolved at COMPILE time for the target, so a binary built for
+/// linux and run under WSL reports plain "linux" — indistinguishable from a native machine,
+/// which is precisely wrong when someone asks for help. `WSL_DISTRO_NAME` is set only by
+/// WSL, names the distribution, and is the one signal that separates them.
+///
+/// Folded into `os` rather than given its own column: it IS the OS environment, the column
+/// is free-form and client-claimed already, and a dedicated column would be empty on all
+/// but a handful of rows. Bounded to fit the field's 32-char limit.
+fn os_label() -> String {
+    // WSL first: it is Linux, and /etc/os-release below would answer "ubuntu" without
+    // saying that Windows is hosting it — which is the part that changes the answer.
+    if let Ok(distro) = std::env::var("WSL_DISTRO_NAME") {
+        let distro = distro.trim();
+        if !distro.is_empty() {
+            return truncate(&format!("wsl:{distro}"), 32)
+        }
+    }
+    // Linux: /etc/os-release is the freedesktop standard and present on every modern
+    // distro. A plain file read — no subprocess, no crate, and it answers "ubuntu 24.04"
+    // where consts::OS only ever says "linux".
+    if std::env::consts::OS == "linux" {
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            let field = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .map(|v| v.trim_matches(['"', '\'']).trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
+            if let Some(id) = field("ID=") {
+                return match field("VERSION_ID=") {
+                    Some(ver) => truncate(&format!("{id} {ver}"), 32),
+                    None => truncate(&id, 32),
+                }
+            }
+        }
+    }
+    // macOS keeps no os-release file, so the version costs a subprocess. Paid once at
+    // login, which is not a hot path — and "macos 15.2" is the difference between a
+    // support answer and a guess. Best-effort: a missing or unreadable sw_vers falls
+    // through to the bare family name rather than failing a login over a label.
+    if std::env::consts::OS == "macos" {
+        if let Some(v) = first_line("sw_vers", &["-productVersion"]) {
+            return truncate(&format!("macos {v}"), 32)
+        }
+    }
+    // Windows stays the bare family name: its version needs `wmic`/`ver` parsing that
+    // varies by shell and edition, for a value nothing yet reads.
+    std::env::consts::OS.to_string()
+}
+
+/// First trimmed line of a command's stdout, or None if it cannot run. Every caller here
+/// is decorating a label, so a failure must never propagate.
+fn first_line(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let line = s.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Byte-safe truncation for the label fields, which the fence bounds. Cuts on a char
+/// boundary so a multi-byte distro name cannot panic the slice.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string()
+    }
+    let end = (0..=max).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    s[..end].to_string()
+}
+
+/// What is driving this session — iTerm.app, vscode, tmux, xterm-256color.
+///
+/// A multiplexer is checked FIRST and wins: inside tmux the outer terminal is still named
+/// in `TERM_PROGRAM`, but the multiplexer is the environment the session actually lives in,
+/// and it is what survives a detach. `TERM` is the last resort because it describes a
+/// capability set rather than an application.
+///
+/// Every source here is an environment variable, so this is a claim like the hostname —
+/// context for someone reading a device list, never something to decide on.
+fn terminal_type() -> String {
+    if std::env::var_os("TMUX").is_some() {
+        return "tmux".to_string()
+    }
+    for key in ["TERM_PROGRAM", "TERM"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string()
+            }
+        }
+    }
+    String::new()
+}
+
+/// This machine's name, for the device list. Best-effort and cosmetic: `HOSTNAME` is not
+/// exported by every shell, so `hostname(1)` is the fallback, and an empty label is fine.
+fn hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.trim().is_empty() {
+            return h.trim().to_string()
+        }
+    }
+    first_line("hostname", &[]).unwrap_or_default()
 }
 
 fn to_hex(bytes: &[u8]) -> String {

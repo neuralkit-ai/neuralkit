@@ -338,6 +338,14 @@ async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>, Vec<String>)>
             seal = Some(Seal::from_grant(kem, secret, creds.sign_key.as_deref())?);
             continue
         }
+        // A frame carrying `v` + `s` with no seal established means the stream signed but
+        // never sealed — the DEK establish failed, usually because this install's key is
+        // not registered against the session. Without this the loop would spin on frames
+        // it cannot interpret and the prompt would simply never appear, which reads as a
+        // hang rather than a failure. Name it instead.
+        if seal.is_none() && raw.get("v").is_some() && raw.get("s").is_some() {
+            bail!("the session channel is signed but not sealed — this machine's key is not registered for this session. Run `neuralkit auth login --qr` to register it again.")
+        }
         let v = match &seal {
             Some(s) => s.open(&raw)?,
             None => raw,
