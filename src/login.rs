@@ -21,6 +21,8 @@ use std::io::Write;
 pub enum Method {
     Qr,
     Totp,
+    Passkey,
+    Email,
 }
 
 pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
@@ -43,10 +45,10 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     // Option, never an empty string: the field is `.optional()` server-side, which permits
     // ABSENT and not "" — an empty value fails the length check and takes the whole
     // registration down with it.
-    let prior_device_id = read_credentials_json()
-        .ok()
-        .and_then(|v| v.get("device_id").and_then(Value::as_str).map(String::from))
-        .filter(|s| !s.is_empty());
+    // From the DURABLE file, never the session one. credentials.json is deleted on logout and
+    // on expiry, so an id kept there is lost exactly when a machine stops being used — and the
+    // next sign-in, with nothing to claim, registers the same machine as a second device.
+    let prior_device_id = crate::passkey::device_id();
 
     // Self-signed cert on localhost (the dev app/relay); real cert in prod/tunnel.
     let insecure = base_url.contains("127.0.0.1") || base_url.contains("localhost");
@@ -147,13 +149,49 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     // QR handshake — the token is an ordinary session record, so it answers
                     // this the same way a browser cookie does. Best-effort: a passkey-only
                     // account has no address, and the id remains what identifies it.
-                    let (email, expires) = resolve_session(&client, base_url, token).await;
-                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id)?;
+                    let (email, expires, totp_enabled) = resolve_session(&client, base_url, token).await;
+                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id, totp_enabled)?;
                     // Two lines, because a login does two things: it authenticates you and
                     // it registers the machine. Naming the second is what makes the code
                     // option on the next run — and `auth unregister` — make sense.
                     println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.as_deref().unwrap_or(user)));
                     println!("  {}", crate::style::dim("cli registered"));
+
+                    // BOOTSTRAP, DONE ONCE AND INVISIBLY. Whichever path just signed this
+                    // machine in, it now holds the one thing registering a passkey needs: a
+                    // session. Doing it here is what makes the passkey a real option rather
+                    // than a command someone has to know about — the NEXT sign-in can use it,
+                    // on a machine whose owner never asked for one.
+                    //
+                    // Best-effort and quiet: a sign-in must not fail because a convenience
+                    // did, and the paths that already work are unaffected either way.
+                    if !crate::passkey::is_registered() {
+                        match crate::passkey::register(base_url, true).await {
+                            Ok(()) => println!("  {}", crate::style::dim("passkey registered · next sign-in can use it")),
+                            Err(e) => println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string())),
+                        }
+                    }
+
+                    // AFTER the registration, not before — that is what creates passkey.json.
+                    // Writing the id earlier found no file and silently did nothing, which left
+                    // the id only in the session file and defeated the point of moving it.
+                    if let Some(id) = device_id {
+                        let _ = crate::passkey::save_device_id(id);
+                    }
+
+                    // A POINTER, NOT A PROMPT. Enrolment is the one path that needs a person —
+                    // scan a code, type six digits — so it cannot be done for them here. But a
+                    // machine that has just signed in knows the account has no authenticator,
+                    // and saying so once is the difference between a path that exists and a
+                    // path anyone finds. Interrupting the sign-in to ask would put a question
+                    // in a flow that otherwise ends cleanly.
+                    if totp_enabled == Some(false) {
+                        println!(
+                            "  {} {}",
+                            crate::style::dim("setup authenticator?"),
+                            crate::style::dim("neuralkit auth totp enroll"),
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -205,6 +243,36 @@ pub async fn unregister() -> Result<()> {
     let origin = prev.get("origin").and_then(Value::as_str).unwrap_or_default().trim_end_matches('/');
     if let Some(token) = prev.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()) {
         if !origin.is_empty() {
+            // THE MACHINE'S PASSKEY IS ITS PROOF, so the stored token is only a shortcut.
+            // Unregistering happens when someone has finished with a machine, which is exactly
+            // when its session has expired — so depending on that token meant the revocation
+            // almost never fired and orphaned rows accumulated on every cycle. Asserting the
+            // credential we are about to destroy always works while it still exists, and the
+            // case with no credential needs no revoke at all: nothing was ever registered.
+            let live = match crate::passkey::revoke(origin, token).await {
+                Ok(counts) => Some(Ok(counts)),
+                // Only an auth failure is worth a second attempt — a network error would fail
+                // the same way twice, and the passkey path is a round trip, not a retry.
+                Err(_) if crate::passkey::is_registered() => None,
+                Err(e) => Some(Err(e)),
+            };
+            let outcome = match live {
+                Some(r) => r,
+                None => match crate::passkey::assert_session(origin).await {
+                    Ok(fresh) => crate::passkey::revoke(origin, &fresh).await,
+                    Err(e) => Err(e),
+                },
+            };
+            match outcome {
+                Ok((d, c)) if d + c > 0 => println!(
+                    "  {} {}",
+                    crate::style::green("✓"),
+                    crate::style::dim(&format!("server forgot this machine · {d} device, {c} credential")),
+                ),
+                Ok(_) => {}
+                Err(e) => println!("  {} {}", crate::style::dim("could not revoke server-side:"), crate::style::dim(&e.to_string())),
+            }
+
             let insecure = origin.contains("127.0.0.1") || origin.contains("localhost");
             let client = reqwest::Client::builder().danger_accept_invalid_certs(insecure).build()?;
             let _ = client
@@ -261,27 +329,93 @@ async fn choose_method(
     if matches!(method, Some(Method::Qr)) {
         return Ok(false)
     }
-    // Both remaining cases need the account id, so read it once. Its absence is what
-    // makes this a first run: nothing deletes credentials.json, so a machine that has
-    // ever signed in still names its account long after the token died.
-    let Ok(prev) = read_credentials_json() else { return Ok(false) };
-    let Some(user) = prev.get("user").and_then(Value::as_str).map(String::from) else { return Ok(false) };
-    let who = prev.get("email").and_then(Value::as_str).unwrap_or(&user).to_string();
 
+    // WHAT THIS MACHINE CAN ACTUALLY OFFER, asked separately for each path — they do not
+    // expire together. An authenticator code needs the ACCOUNT ID, which lives in
+    // credentials.json and outlives the token there. A passkey needs a REGISTRATION, which
+    // lives in its own file and outlives credentials.json entirely. Reading only the session
+    // file would hide the passkey on exactly the machine most likely to have one: signed out.
+    let prev = read_credentials_json().ok();
+    let user = prev.as_ref().and_then(|v| v.get("user").and_then(Value::as_str)).map(String::from);
+    let who = prev
+        .as_ref()
+        .and_then(|v| v.get("email").and_then(Value::as_str))
+        .map(String::from)
+        .or_else(|| user.clone())
+        .unwrap_or_else(|| "this machine".to_string());
+    let mut can_passkey = crate::passkey::is_registered();
+
+    if matches!(method, Some(Method::Passkey)) {
+        return passkey_approve(client, base_url, user_code).await
+    }
+    if matches!(method, Some(Method::Email)) {
+        return email_approve(client, base_url, user_code).await
+    }
     if matches!(method, Some(Method::Totp)) {
-        return totp_approve(client, base_url, user_code, &user).await
+        let Some(user) = &user else { return Ok(false) };
+        return totp_approve(client, base_url, user_code, user).await
+    }
+
+    // A REGISTERED MACHINE JUST SIGNS IN. Holding a credential the server already knows is
+    // not a decision to put to someone — it is the answer. So the passkey is TRIED rather
+    // than offered, and the menu only appears if there is something left to choose.
+    //
+    // A refusal falls through instead of dead-ending: a credential can be revoked
+    // server-side, or the account deleted from under it, and the machine cannot know that
+    // until it asks. Dropping to the other paths is what turns that from a lockout into a
+    // slower sign-in. The failed path is then dropped from the menu — offering it again
+    // after it just refused would only invite the same failure.
+    if can_passkey {
+        if passkey_approve(client, base_url, user_code).await? {
+            return Ok(true)
+        }
+        can_passkey = false;
+        println!("  {}", crate::style::dim("this machine's passkey was refused — other ways in:"));
+    }
+
+    // Offer only what is usable — the same rule the REPL's `help` follows. A machine with
+    // nothing to choose between never sees a menu, which keeps a first run to one path.
+    // The email path needs NOTHING on this machine — just an address someone can read mail
+    // at — which is what makes it the only option that works on a machine that has never
+    // signed in. Every other path is downstream of a session that already happened.
+    let mut labels: Vec<&str> = vec!["scan a QR code with your phone", "email me a sign-in code"];
+    let mut paths: Vec<Method> = vec![Method::Qr, Method::Email];
+    // Absent means an older credentials.json that predates the field — offer it rather than
+    // hide a path that may well work.
+    let has_totp = prev
+        .as_ref()
+        .and_then(|v| v.get("totp_enabled"))
+        .map(|t| t.as_bool().unwrap_or(true))
+        .unwrap_or(true);
+    if user.is_some() && has_totp {
+        labels.push("use your authenticator app");
+        paths.push(Method::Totp);
+    }
+    if can_passkey {
+        labels.push("use this machine's passkey");
+        paths.push(Method::Passkey);
+    }
+    if paths.len() == 1 {
+        return Ok(false)
     }
 
     // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
     // event::read blocks, and this task is holding the SSE connection open.
     let header = format!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim(&format!("· {who}")));
+    let owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
     let picked = tokio::task::spawn_blocking(move || {
-        select(&header, &["scan a QR code with your phone", "enter a code from your authenticator app"])
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        select(&header, &refs)
     })
     .await??;
 
-    match picked {
-        Some(1) => totp_approve(client, base_url, user_code, &user).await,
+    match picked.map(|i| paths[i]) {
+        Some(Method::Totp) => match &user {
+            Some(u) => totp_approve(client, base_url, user_code, u).await,
+            None => Ok(false),
+        },
+        Some(Method::Passkey) => passkey_approve(client, base_url, user_code).await,
+        Some(Method::Email) => email_approve(client, base_url, user_code).await,
         _ => Ok(false),
     }
 }
@@ -416,31 +550,161 @@ async fn totp_approve(client: &reqwest::Client, base_url: &str, user_code: &str,
         println!("  {} {}\n", crate::style::red("✗"), msg);
         return Ok(false)
     };
+    approve_and_release(client, base_url, user_code, &token, "totp").await
+}
+
+/// Approve this device flow with an emailed code — the path that needs nothing but an inbox.
+///
+/// THE ONE THAT BOOTSTRAPS. Every other path is downstream of a session that already existed:
+/// the QR needs a passkey to scan with, the code path needs a prior sign-in to leave an account
+/// id behind, the passkey path needs a credential registered against the account. This needs
+/// only an address that is already approved — so it is what a machine that has never signed in
+/// can actually do, with no browser and no phone.
+///
+/// It also binds the RIGHT identity, which the alternatives do not: `EmailCode.login`
+/// find-or-creates by address, so the session is the approved account's rather than a fresh
+/// anonymous one. Everything downstream — the device row, the passkey registered afterwards —
+/// then belongs to the person who owns that inbox.
+async fn email_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<bool> {
+    println!();
+    // THE ONE PATH WITH AN UNBOUNDED WAIT IN IT. Both the staged key and the user code are
+    // held for five minutes from the moment this command started, and every other path
+    // finishes in seconds — a scan, six digits, a signature. Waiting on an inbox is the only
+    // way to overrun it, so the deadline is said out loud rather than discovered.
+    println!("  {}", crate::style::dim("finish within 5 minutes — the sign-in window is already open"));
+    print!("  {} ", crate::style::dim("email address:"));
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
+        return Ok(false)
+    }
+    let email = line.trim().to_string();
+    if email.is_empty() {
+        println!();
+        return Ok(false)
+    }
+
+    // The SUCCESS answer is deliberately the same whether or not an address has access — the
+    // server will not say which, so neither does this. A REFUSAL is a different thing and must
+    // be shown: rate limiting describes the caller, not the address, so surfacing it leaks
+    // nothing and hiding it turns "you have used your five attempts this hour" into "the mail
+    // never arrived", which sends someone looking in the wrong place entirely.
+    let res = client
+        .post(format!("{base_url}/transport/action/Cli/requestCode"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "email": email }).to_string())
+        .send()
+        .await?;
+    let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
+    if let Some(m) = body.pointer("/error/message").and_then(Value::as_str) {
+        println!("  {} {}\n", crate::style::red("✗"), m);
+        return Ok(false)
+    }
+    println!("  {}", crate::style::dim("if that address has access, a code is on its way"));
+
+    print!("  {} ", crate::style::dim("code:"));
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
+        return Ok(false)
+    }
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        println!();
+        return Ok(false)
+    }
+
+    let res = client
+        .post(format!("{base_url}/transport/action/EmailCode/login"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "email": email, "code": code }).to_string())
+        .send()
+        .await?;
+    let token = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| {
+            let (name, rest) = c.split_once('=')?;
+            matches!(name.trim(), "session" | "__Secure-session")
+                .then(|| rest.split(';').next().unwrap_or("").to_string())
+        });
+    let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        let msg = body.pointer("/error/message").and_then(Value::as_str).unwrap_or("that code was not accepted");
+        println!("  {} {}\n", crate::style::red("✗"), msg);
+        return Ok(false)
+    };
+
+    approve_and_release(client, base_url, user_code, &token, "email").await
+}
+
+/// Approve this device flow with THIS machine's own passkey.
+///
+/// The third way to supply the approving session, and structurally the same move the
+/// authenticator code makes: obtain a session, perform the approval the phone would have
+/// performed, drop the session afterwards. The device flow itself is untouched — same
+/// device_code, same held stream, same QrCode.approve doing the mint and promoting this
+/// install's key, which is why the sealed channel comes up exactly as it does after a scan.
+///
+/// It is also the path that needs nothing from the person: no phone, no code, no typing.
+async fn passkey_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<bool> {
+    println!();
+    println!("  {}", crate::style::dim("signing in with this machine's passkey…"));
+    let token = match crate::passkey::assert_session(base_url).await {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  {} {}\n", crate::style::red("✗"), e);
+            return Ok(false)
+        }
+    };
+    approve_and_release(client, base_url, user_code, &token, "passkey").await
+}
+
+/// The half every self-approval shares: approve the flow with a session we just obtained, then
+/// give that session back.
+///
+/// `via` records WHICH path did it. The approver is this machine either way, so the row's
+/// `approved_by_*` columns will repeat its own network — the field is what stops that reading
+/// as a second party, and what tells a device list apart later.
+///
+/// Releasing the session is not tidiness. Its whole purpose was to authorise one call, and the
+/// terminal's real token is minted BY that call — leaving this one behind would accumulate a
+/// dead record per login, which is exactly the growth the E2E measures.
+async fn approve_and_release(
+    client: &reqwest::Client,
+    base_url: &str,
+    user_code: &str,
+    token: &str,
+    via: &str,
+) -> Result<bool> {
     let cookie = format!("session={token}; __Secure-session={token}");
 
-    // 2. Approve, from that session — the step the phone would have performed.
     let ap = client
         .post(format!("{base_url}/transport/action/QrCode/approve"))
         .header("content-type", "application/json")
         .header("cookie", &cookie)
-        // `via: "totp"` marks a SELF-approval: the machine being registered is also the one
-        // approving, so the row's approved_by_* columns will repeat its own network rather
-        // than describe a second device. Without it a self-approval is indistinguishable
-        // from a phone that happened to be on the same wifi.
-        .body(serde_json::json!({ "code": user_code, "via": "totp" }).to_string())
+        .body(serde_json::json!({ "code": user_code, "via": via }).to_string())
         .send()
         .await?;
     let ap_body: Value = serde_json::from_str(&ap.text().await?).unwrap_or(Value::Null);
     if ap_body.pointer("/data/ok").and_then(Value::as_bool) != Some(true) {
         let msg = ap_body.pointer("/error/message").and_then(Value::as_str).unwrap_or("approval refused");
-        println!("  {} {}\n", crate::style::red("✗"), msg);
+        println!("  {} {}", crate::style::red("✗"), msg);
+        // The server can only say the code is unknown or expired; it cannot know that five
+        // minutes passed while someone waited for mail. Say the part it cannot, because the
+        // recovery is different from every other failure here — run the command again, and
+        // note that an emailed code is spent whether or not the approval landed.
+        if msg.contains("expired") || msg.contains("unknown") {
+            println!("  {}", crate::style::dim("the 5-minute sign-in window closed — run `auth login` again"));
+        }
+        println!();
         return Ok(false)
     }
 
-    // 3. Drop the session the code bought. Its whole purpose was to authorize the
-    //    approval, and the terminal's own token is minted by that approval — leaving this
-    //    one behind would accumulate a dead session per login, which is the growth the
-    //    E2E already measures. Best-effort: a failure here costs a stale record, not a login.
+    // Best-effort: a failure here costs a stale record, not a login.
     let _ = client
         .post(format!("{base_url}/transport/action/Session/delete"))
         .header("cookie", &cookie)
@@ -461,7 +725,7 @@ fn read_credentials_json() -> Result<Value> {
 /// Ask the session we were just granted who it belongs to, and when it dies.
 /// `expires` is the record's own absolute ms timestamp — storing the deadline rather than
 /// a duration means the remaining time stays correct however long the file sits unread.
-async fn resolve_session(client: &reqwest::Client, base_url: &str, token: &str) -> (Option<String>, Option<i64>) {
+async fn resolve_session(client: &reqwest::Client, base_url: &str, token: &str) -> (Option<String>, Option<i64>, Option<bool>) {
     let fetch = async {
         let res = client
             .post(format!("{base_url}/transport/action/Session/request"))
@@ -475,9 +739,31 @@ async fn resolve_session(client: &reqwest::Client, base_url: &str, token: &str) 
         Some(v) => (
             v.pointer("/data/user/email").and_then(Value::as_str).map(String::from),
             v.pointer("/data/expires").and_then(Value::as_i64),
+            // The session projection already carries this, so knowing it costs no extra call.
+            // D1 returns INTEGER as a NUMBER while the resolver's type says string, so read
+            // every shape rather than comparing against one.
+            v.pointer("/data/user/totp_enabled").map(|t| {
+                t.as_i64().map(|n| n == 1).or_else(|| t.as_str().map(|s| s == "1")).or_else(|| t.as_bool()).unwrap_or(false)
+            }),
         ),
-        None => (None, None),
+        None => (None, None, None),
     }
+}
+
+/// A scannable QR, as terminal art. Shared because the device flow and TOTP enrolment need the
+/// same thing pointed at different URIs — one at the approval page, one at an `otpauth://` URI.
+///
+/// Dense1x2 packs two vertical modules per character cell (▀▄█), so it renders at ~half the
+/// width AND height of the full-block form while staying square and scannable — no stretched
+/// modules.
+pub(crate) fn qr_art(data: &str) -> Option<String> {
+    let qr = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    Some(
+        qr.render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .module_dimensions(1, 1)
+            .build(),
+    )
 }
 
 fn render_qr(base_url: &str, code: &str) {
@@ -510,7 +796,7 @@ fn render_qr(base_url: &str, code: &str) {
     let _ = std::io::stdout().flush();
 }
 
-fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, expires: Option<i64>, kem_secret: &str, sign_key: Option<&str>, device_id: Option<&str>) -> Result<()> {
+fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, expires: Option<i64>, kem_secret: &str, sign_key: Option<&str>, device_id: Option<&str>, totp_enabled: Option<bool>) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
@@ -525,6 +811,10 @@ fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, 
         // The server-minted registration id. Unlike the token it is not a secret and does
         // not expire — it names this machine's row for as long as the row exists.
         "device_id": device_id,
+        // Which paths this account can actually offer next time. Recorded so the sign-in menu
+        // lists only what will work — offering an authenticator code to someone who never
+        // enrolled one is a dead end the machine could have known about.
+        "totp_enabled": totp_enabled,
     }))?;
     // 0600, set at CREATE time rather than chmod'd afterwards — a plain write lands 0644
     // under the usual umask, and fixing it after the fact leaves a window where the file is

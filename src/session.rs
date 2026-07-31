@@ -52,6 +52,11 @@ struct Credentials {
     /// The app's PUBLIC ed25519 key, handed over at login. Not a secret — it only
     /// verifies signatures, and the browser bundle carries the same value.
     sign_key: Option<String>,
+    /// The address this account signs in as, when it has one. Shown instead of the opaque id
+    /// for the same reason `auth login` greets by address: an id is not something a person
+    /// recognises. Absent for a passkey-only account, which is why the id remains the
+    /// fallback rather than being replaced.
+    email: Option<String>,
     /// When this session dies — the record's own absolute ms timestamp, captured at
     /// login. Absolute rather than a duration, so it stays correct however long the file
     /// sits between runs. Absent for a file written before this existed.
@@ -161,7 +166,8 @@ pub async fn run() -> Result<()> {
         .and_then(expires_at)
         .map(|t| format!(" · expires {t}"))
         .unwrap_or_default();
-    println!("  {} {}", style::bold("neuralkit"), style::dim(&format!("· {}{}", creds.user, expiry)));
+    let who = creds.email.as_deref().unwrap_or(&creds.user);
+    println!("  {} {}", style::bold("neuralkit"), style::dim(&format!("· {who}{expiry}")));
     println!("  {} {}", style::green("●"), style::dim(match &seal {
         Some(s) if s.verify_key.is_some() => "ML-KEM-768 → AES-256-GCM · ed25519 verified",
         Some(_) => "ML-KEM-768 → AES-256-GCM",
@@ -287,6 +293,7 @@ fn load_credentials() -> Result<Credentials> {
         token: field("token")?,
         user: field("user")?,
         origin: field("origin")?,
+        email: v.get("email").and_then(Value::as_str).map(String::from),
         kem_secret: v.get("kem_secret").and_then(Value::as_str).map(String::from),
         sign_key: v.get("sign_key").and_then(Value::as_str).map(String::from),
         expires: v.get("expires").and_then(Value::as_i64),

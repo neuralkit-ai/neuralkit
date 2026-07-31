@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod login;
 mod passkey;
+mod totp;
 mod session;
 mod style;
 mod signal_processing;
@@ -107,31 +108,79 @@ enum Command {
     Auth(AuthCommand),
 }
 
+/// The two halves of a native passkey. Separate verbs because they are separate acts: one
+/// needs an existing session and changes server state, the other needs neither.
+#[derive(clap::Subcommand, Debug)]
+enum PasskeyAction {
+    /// Bind this machine's key to the account you are signed in as. Needs a session.
+    Register {
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
+    /// Sign in using this machine's key — no browser, no phone, no code.
+    Login {
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum TotpAction {
+    /// Set up an authenticator app against the account you are signed in as.
+    Enroll {
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
+}
+
 #[derive(clap::Subcommand, Debug)]
 enum AuthCommand {
-    /// Sign in — and register this machine, so later sign-ins need only a code.
+    /// Sign in — and register this machine, so later sign-ins have more ways in.
+    ///
+    /// Every path registers as it goes: the QR scan stages the install's key, and a successful
+    /// sign-in mints a passkey. So a machine that has signed in once can later use an
+    /// authenticator code or its own passkey, and is offered whichever actually work.
     Login {
         /// The Neuralkit app origin (serves the QrCode.request stream + /passkey page).
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
         /// Sign in by scanning a QR code with your phone. Works on any machine.
-        #[arg(long, conflicts_with = "totp")]
+        #[arg(long, conflicts_with_all = ["totp", "passkey", "email"])]
         qr: bool,
-        /// Sign in with a code from your authenticator app. Needs a previous sign-in on
-        /// this machine — that is what leaves the account id on disk.
-        #[arg(long)]
+        /// Sign in with your authenticator app. Needs a previous sign-in on this machine —
+        /// that is what leaves the account id on disk.
+        #[arg(long, conflicts_with_all = ["passkey", "email"])]
         totp: bool,
+        /// Sign in with this machine's own passkey. Needs a previous sign-in on this machine —
+        /// any path registers one, so this appears from the second sign-in onward.
+        #[arg(long)]
+        passkey: bool,
+        /// Sign in with a code emailed to you. The only path that needs nothing on this
+        /// machine, so it is how a machine that has never signed in gets started.
+        #[arg(long)]
+        email: bool,
     },
     /// This machine's own passkey — create it if absent, and prove it can assert.
     ///
     /// Held natively: no browser, no WebAuthn API. Deliberately outlives sessions, so
     /// `logout` and expiry leave it alone and only `unregister` removes it.
     Passkey {
+        /// `register` binds this machine's key to the signed-in account; `login` signs in with
+        /// it. With neither, the command just shows the credential and self-tests it offline.
+        #[command(subcommand)]
+        action: Option<PasskeyAction>,
         /// The origin the assertion is bound to — WebAuthn signs the host, so this decides
         /// which server would accept it.
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
+    /// Authenticator app — the one path that cannot register itself.
+    ///
+    /// Enrolling needs a human to scan a code and type six digits back, so unlike the passkey
+    /// it is a command rather than something a sign-in does quietly. The browser page enrols
+    /// the same way; either surface produces the same secret.
+    #[command(subcommand)]
+    Totp(TotpAction),
     /// Forget this machine — revoke its session and clear its registration.
     ///
     /// Deliberately not called logout: logging out ends a session and leaves the machine
@@ -702,10 +751,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // command REPL — NOT the EEG dashboard; that stays the bare-`neuralkit`
     // view, launchable from the session later). Headless callers (the E2E,
     // piped scripts) get sign-in-and-exit: a REPL needs a real terminal.
-    if let Some(Command::Auth(AuthCommand::Login { url, qr, totp })) = &args.command {
+    if let Some(Command::Auth(AuthCommand::Login { url, qr, totp, passkey, email })) = &args.command {
         // clap already refused both at once, so this is a total mapping: neither flag
         // means "decide at runtime" — ask, or fall to the QR when there is no choice.
-        let method = if *qr { Some(login::Method::Qr) } else if *totp { Some(login::Method::Totp) } else { None };
+        let method = if *qr {
+            Some(login::Method::Qr)
+        } else if *totp {
+            Some(login::Method::Totp)
+        } else if *passkey {
+            Some(login::Method::Passkey)
+        } else if *email {
+            Some(login::Method::Email)
+        } else {
+            None
+        };
         if let Err(e) = login::run(url, method).await {
             eprintln!("login failed: {e:#}");
             std::process::exit(1);
@@ -719,9 +778,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(Command::Auth(AuthCommand::Passkey { url })) = &args.command {
-        if let Err(e) = passkey::run(url) {
+    if let Some(Command::Auth(AuthCommand::Passkey { action, url })) = &args.command {
+        let outcome = match action {
+            Some(PasskeyAction::Register { url }) => passkey::register(url, false).await,
+            Some(PasskeyAction::Login { url }) => passkey::login(url).await,
+            None => passkey::run(url),
+        };
+        if let Err(e) = outcome {
             eprintln!("passkey failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Auth(AuthCommand::Totp(TotpAction::Enroll { url }))) = &args.command {
+        if let Err(e) = totp::enroll(url).await {
+            eprintln!("enrolment failed: {e:#}");
             std::process::exit(1);
         }
         return Ok(());
