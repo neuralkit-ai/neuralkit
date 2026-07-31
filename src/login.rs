@@ -767,7 +767,11 @@ pub(crate) fn qr_art(data: &str) -> Option<String> {
 }
 
 fn render_qr(base_url: &str, code: &str) {
-    let url = format!("{base_url}/passkey?code={code}");
+    // /qr, not /passkey. The authorization screen is its own surface: it resolves the code
+    // server-side, NAMES the machine that is waiting from what registerKey staged, and offers
+    // only routes that need no typing — a button when already signed in, a biometric when this
+    // phone holds a credential. /passkey is a test surface and stays one.
+    let url = format!("{base_url}/qr?code={code}");
     if let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) {
         // Dense1x2 packs two vertical modules into each character cell (▀▄█),
         // rendering at ~half the width AND height of the full-block char form
