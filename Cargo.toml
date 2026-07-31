@@ -45,6 +45,9 @@ qrcode = "0.14"
 # with the same primitives the fence's server half uses.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
+# The authenticator half — producing WebAuthn assertions natively (passkey.rs). Same crate the
+# SERVER verifies with, which is the point: the bytes this CLI makes are bytes it already reads.
+phaze-auth = { path = "../phaze/crates/phaze-auth" }
 # Session expiry is stored as an absolute ms timestamp and shown in the DEVICE's local
 # time, which needs a tz-aware conversion. Already in the tree transitively, so making it
 # direct costs no extra build; `clock` is the feature that provides `Local`.

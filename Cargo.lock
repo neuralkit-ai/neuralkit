@@ -1979,6 +1979,7 @@ dependencies = [
  "flatbuffers",
  "futures-util",
  "getrandom 0.2.17",
+ "phaze-auth",
  "phaze-crypto",
  "phaze-moq",
  "prost",
@@ -2248,6 +2249,23 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset 0.5.7",
  "indexmap 2.13.0",
+]
+
+[[package]]
+name = "phaze-auth"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ciborium",
+ "getrandom 0.2.17",
+ "hmac",
+ "phaze-core",
+ "phaze-crypto",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
 ]
 
 [[package]]

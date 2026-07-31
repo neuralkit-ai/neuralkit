@@ -174,8 +174,23 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
 /// on disk to revoke it with. The revoke is best-effort, because an ALREADY-dead session
 /// must not block the delete — reaching a clean state after an expiry is the main case.
 pub async fn unregister() -> Result<()> {
+    // TWO INDEPENDENT THINGS now live on this machine, and the passkey is the one that
+    // outlives sessions — so an absent credentials.json can no longer end this early. A
+    // machine with no session but a live passkey is the ordinary state after a logout, and
+    // it is exactly the state this command exists to clear.
+    let had_passkey = crate::passkey::exists();
+
     let Ok(prev) = read_credentials_json() else {
-        println!("\n  {}\n", crate::style::dim("this machine is not registered"));
+        if had_passkey {
+            if let Err(e) = crate::passkey::forget() {
+                println!("\n  {} {}\n", crate::style::red("✗"), e);
+                return Err(e)
+            }
+            println!("\n  {} {}", crate::style::green("✓"), "this machine's passkey was deleted");
+            println!("  {}\n", crate::style::dim("no session was signed in"));
+        } else {
+            println!("\n  {}\n", crate::style::dim("this machine is not registered"));
+        }
         return Ok(())
     };
     let who = prev
@@ -211,8 +226,19 @@ pub async fn unregister() -> Result<()> {
         }
     }
 
+    // The machine's own credential goes too. `unregister` is the command that means "forget
+    // this machine", and the passkey is the most durable thing that makes it recognisable —
+    // leaving it behind would mean a machine that still holds a credential for an account it
+    // no longer has a session for. `logout` deliberately does NOT do this.
+    if let Err(e) = crate::passkey::forget() {
+        println!("  {} {}", crate::style::red("✗"), e);
+    }
+
     println!();
     println!("  {} unregistered {}", crate::style::green("✓"), crate::style::dim(&format!("· {who}")));
+    if had_passkey {
+        println!("  {}", crate::style::dim("this machine's passkey was deleted"));
+    }
     println!("  {}\n", crate::style::dim("the next `auth login` will show a QR"));
     Ok(())
 }

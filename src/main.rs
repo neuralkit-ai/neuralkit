@@ -4,6 +4,7 @@ use std::io::{self, IsTerminal, Read};
 use std::time::{Duration, Instant};
 
 mod login;
+mod passkey;
 mod session;
 mod style;
 mod signal_processing;
@@ -120,6 +121,16 @@ enum AuthCommand {
         /// this machine — that is what leaves the account id on disk.
         #[arg(long)]
         totp: bool,
+    },
+    /// This machine's own passkey — create it if absent, and prove it can assert.
+    ///
+    /// Held natively: no browser, no WebAuthn API. Deliberately outlives sessions, so
+    /// `logout` and expiry leave it alone and only `unregister` removes it.
+    Passkey {
+        /// The origin the assertion is bound to — WebAuthn signs the host, so this decides
+        /// which server would accept it.
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
     },
     /// Forget this machine — revoke its session and clear its registration.
     ///
@@ -704,6 +715,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("session error: {e:#}");
                 std::process::exit(1);
             }
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Auth(AuthCommand::Passkey { url })) = &args.command {
+        if let Err(e) = passkey::run(url) {
+            eprintln!("passkey failed: {e:#}");
+            std::process::exit(1);
         }
         return Ok(());
     }
