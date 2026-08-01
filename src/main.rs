@@ -122,12 +122,22 @@ enum PasskeyAction {
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
+    /// Hold this machine's key in hardware, and require a person before it signs.
+    ///
+    /// The OS decides WHICH person-check: Touch ID, a paired Apple Watch, or the account
+    /// password — whichever this Mac has. `auth passkey` reports which one it would use.
+    /// Needs the signed build; an ordinary `cargo` binary cannot persist an enclave key.
+    Presence {
+        /// Turn it off again and go back to the software key.
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
 enum TotpAction {
     /// Set up an authenticator app against the account you are signed in as.
-    Enroll {
+    Setup {
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
@@ -176,7 +186,7 @@ enum AuthCommand {
     },
     /// Authenticator app — the one path that cannot register itself.
     ///
-    /// Enrolling needs a human to scan a code and type six digits back, so unlike the passkey
+    /// Setup needs a human to scan a code and type six digits back, so unlike the passkey
     /// it is a command rather than something a sign-in does quietly. The browser page enrols
     /// the same way; either surface produces the same secret.
     #[command(subcommand)]
@@ -769,6 +779,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("login failed: {e:#}");
             std::process::exit(1);
         }
+        // OFFERED ONCE, WHERE BOTH PATHS MEET. `login::run` returns the same way whether it
+        // took the four-call flow or the one-call one, so asking here covers both without the
+        // question living in two places. Only when the account has no authenticator — an
+        // account that already has one has nothing to answer.
+        //
+        // This replaces a printed pointer (`setup authenticator? neuralkit auth totp setup`).
+        // The pointer was deliberate — it kept a question out of a flow that ends cleanly — but
+        // a line of dim text is a path only someone already looking will find, and setup is the
+        // one thing a fresh machine most wants next.
+        if io::stdout().is_terminal() && io::stdin().is_terminal() && login::totp_enabled() == Some(false) {
+            // The SAME picker the sign-in menu uses — arrow keys, one highlighted row — so the
+            // two questions this command asks look like one thing. It runs OFF the async
+            // runtime for the same reason it does there: crossterm's event::read blocks.
+            let header = format!("  {} {}", style::bold("neuralkit"), style::dim("· one more thing"));
+            let picked = tokio::task::spawn_blocking(move || {
+                login::select(&header, &["set up an authenticator app", "skip — go to the terminal"])
+            })
+            .await;
+            if let Ok(Ok(Some(0))) = picked {
+                if let Err(e) = totp::setup(url).await {
+                    // Not fatal: the sign-in already succeeded, and setup can be run again by
+                    // name. Ending the session over a declined or mistyped code would throw
+                    // away the thing that worked.
+                    eprintln!("  totp setup failed: {e:#}");
+                }
+            }
+        }
+
         if io::stdout().is_terminal() && io::stdin().is_terminal() {
             if let Err(e) = session::run().await {
                 eprintln!("session error: {e:#}");
@@ -782,6 +820,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let outcome = match action {
             Some(PasskeyAction::Register { url }) => passkey::register(url, false).await,
             Some(PasskeyAction::Login { url }) => passkey::login(url).await,
+            #[cfg(target_os = "macos")]
+            Some(PasskeyAction::Presence { off }) => passkey::set_presence(*off),
+            #[cfg(not(target_os = "macos"))]
+            Some(PasskeyAction::Presence { .. }) => Err(anyhow::anyhow!("hardware-held keys are macOS-only for now")),
             None => passkey::run(url),
         };
         if let Err(e) = outcome {
@@ -791,9 +833,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(Command::Auth(AuthCommand::Totp(TotpAction::Enroll { url }))) = &args.command {
-        if let Err(e) = totp::enroll(url).await {
-            eprintln!("enrolment failed: {e:#}");
+    if let Some(Command::Auth(AuthCommand::Totp(TotpAction::Setup { url }))) = &args.command {
+        if let Err(e) = totp::setup(url).await {
+            eprintln!("totp setup failed: {e:#}");
             std::process::exit(1);
         }
         return Ok(());

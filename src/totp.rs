@@ -20,7 +20,7 @@ use std::io::Write as _;
 use tokio::io::AsyncBufReadExt;
 
 /// Enrol an authenticator app against the account this machine is signed in as.
-pub async fn enroll(base_url: &str) -> Result<()> {
+pub async fn setup(base_url: &str) -> Result<()> {
     let base_url = base_url.trim_end_matches('/');
     let token = crate::passkey::session_token()?;
     let cookie = format!("session={token}; __Secure-session={token}");

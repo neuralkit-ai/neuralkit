@@ -50,7 +50,12 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     // expired one, a revoked credential, a device row that is no longer this account's. A
     // shortcut that could strand a machine would be worse than no shortcut, so the only thing a
     // refusal costs is the four extra calls it was trying to save.
-    match crate::passkey::quick_login(base_url, &kem_pk.to_hex()).await {
+    //
+    // ONLY WHEN NOTHING WAS ASKED FOR. `--totp`/`--email`/`--qr`/`--passkey` name a path, and a
+    // shortcut that overrode them would make the flag silently do nothing — the machine would
+    // answer a question the caller did not ask. `None` means "decide at runtime", which is the
+    // only case where deciding is ours to do.
+    match if method.is_some() { Ok(None) } else { crate::passkey::quick_login(base_url, &kem_pk.to_hex()).await } {
         Ok(Some((token, d))) => {
             let user = d.get("user").and_then(Value::as_str).unwrap_or("");
             let email = d.get("email").and_then(Value::as_str);
@@ -64,10 +69,23 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             }
             println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.unwrap_or(user)));
             println!("  {}", crate::style::dim("cli registered"));
+            if crate::passkey::is_registered() {
+                println!("  {}", crate::style::dim("passkey registered"));
+            }
+            if totp == Some(true) {
+                println!("  {}", crate::style::dim("authenticator registered"));
+            }
             return Ok(())
         }
         Ok(None) => {}
-        Err(e) => println!("  {}", crate::style::dim(&format!("one-step sign-in unavailable ({e}) — falling back"))),
+        // The gate refusing is not a failure to report as one — it is the machine saying the
+        // key is locked, which the menu below then explains and routes around.
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("Apple Watch") && !msg.contains("verify a person") {
+                println!("  {}", crate::style::dim(&format!("one-step sign-in unavailable ({msg}) — falling back")));
+            }
+        }
     }
 
     // The registration this machine already holds, if any. A fresh keypair every login
@@ -203,10 +221,21 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     // Best-effort and quiet: a sign-in must not fail because a convenience
                     // did, and the paths that already work are unaffected either way.
                     if !crate::passkey::is_registered() {
-                        match crate::passkey::register(base_url, true).await {
-                            Ok(()) => println!("  {}", crate::style::dim("passkey registered · next sign-in can use it")),
-                            Err(e) => println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string())),
+                        if let Err(e) = crate::passkey::register(base_url, true).await {
+                            println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string()));
                         }
+                    }
+
+                    // WHAT THIS MACHINE HOLDS, said every time — not only when it changed. The
+                    // passkey line used to print solely on the run that created one, so every
+                    // later sign-in was silent about it and there was no way to tell a machine
+                    // that has one from a machine that never got one. A sign-in should state
+                    // where you stand, not just what happened in the last few seconds.
+                    if crate::passkey::is_registered() {
+                        println!("  {}", crate::style::dim("passkey registered"));
+                    }
+                    if totp_enabled == Some(true) {
+                        println!("  {}", crate::style::dim("authenticator registered"));
                     }
 
                     // AFTER the registration, not before — that is what creates passkey.json.
@@ -224,19 +253,6 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                         let _ = crate::passkey::save_next_challenge(next);
                     }
 
-                    // A POINTER, NOT A PROMPT. Enrolment is the one path that needs a person —
-                    // scan a code, type six digits — so it cannot be done for them here. But a
-                    // machine that has just signed in knows the account has no authenticator,
-                    // and saying so once is the difference between a path that exists and a
-                    // path anyone finds. Interrupting the sign-in to ask would put a question
-                    // in a flow that otherwise ends cleanly.
-                    if totp_enabled == Some(false) {
-                        println!(
-                            "  {} {}",
-                            crate::style::dim("setup authenticator?"),
-                            crate::style::dim("neuralkit auth totp enroll"),
-                        );
-                    }
                     return Ok(());
                 }
             }
@@ -388,7 +404,18 @@ async fn choose_method(
         .map(String::from)
         .or_else(|| user.clone())
         .unwrap_or_else(|| "this machine".to_string());
-    let mut can_passkey = crate::passkey::is_registered();
+    // A KEY THIS MACHINE CANNOT USE IS NOT AN OPTION. The gate is the owner's choice and is
+    // honoured rather than worked around — but it locks one path, not the person out. Say why
+    // once, drop that path, and offer the others: QR, an authenticator code and an emailed code
+    // never touch this machine's key.
+    let blocked = crate::passkey::presence_blocked();
+    let mut can_passkey = crate::passkey::is_registered() && blocked.is_none();
+    if let Some(why) = &blocked {
+        println!();
+        for line in why.lines() {
+            println!("  {}", crate::style::dim(line.trim()));
+        }
+    }
 
     if matches!(method, Some(Method::Passkey)) {
         return passkey_approve(client, base_url, user_code).await
@@ -440,6 +467,14 @@ async fn choose_method(
         labels.push("use this machine's passkey");
         paths.push(Method::Passkey);
     }
+    // THE LOCKED PATH STAYS ON THE MENU AS A RETRY. Dropping it entirely told the truth — the
+    // key cannot sign right now — but it also removed the option the person most likely wants:
+    // fetch the Watch and carry on. Re-checking at the moment they pick is what makes it a
+    // retry rather than a stale entry, since availability changes minute to minute.
+    if blocked.is_some() && crate::passkey::is_registered() {
+        labels.push("try again with my Apple Watch");
+        paths.push(Method::Passkey);
+    }
     if paths.len() == 1 {
         return Ok(false)
     }
@@ -459,7 +494,24 @@ async fn choose_method(
             Some(u) => totp_approve(client, base_url, user_code, u).await,
             None => Ok(false),
         },
-        Some(Method::Passkey) => passkey_approve(client, base_url, user_code).await,
+        Some(Method::Passkey) => {
+            // Asked AGAIN here, not reused from above: the menu may have been on screen a
+            // while, and the whole point of that entry is that the answer can have changed.
+            // Keep asking for a few seconds rather than answering once — a wrist raise, a
+            // Bluetooth reconnect and an unlock all take a moment, and the person has just
+            // told us they are fetching it.
+            // Two minutes. The person has just walked off to fetch the Watch, and a wrist
+            // raise, a Bluetooth reconnect and an unlock stack up on top of the walk. Giving up
+            // while they are still on their way back is the wrong failure, and Ctrl-C is always
+            // there for someone who changed their mind.
+            if let Some(why) = crate::passkey::wait_for_presence(120) {
+                println!();
+                println!("  {} {}", crate::style::red("✗"), crate::style::dim(why.lines().next().unwrap_or("still unavailable")));
+                println!();
+                return Ok(false)
+            }
+            passkey_approve(client, base_url, user_code).await
+        }
         Some(Method::Email) => email_approve(client, base_url, user_code).await,
         _ => Ok(false),
     }
@@ -473,7 +525,7 @@ async fn choose_method(
 ///
 /// Raw mode is entered and left around ONE closure so no early return can strand the
 /// terminal without an echo, which is the classic way a picker breaks a shell.
-fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
+pub(crate) fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
     use crossterm::{
         cursor,
         event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -756,6 +808,13 @@ async fn approve_and_release(
 
 /// credentials.json as raw JSON. Deliberately not session.rs's typed loader: this path
 /// exists for a file whose token has already lapsed, and reads only what outlives it.
+/// Whether the account this machine is signed in as has an authenticator. Absent means an
+/// older credentials.json that predates the field — treated as "has one" for the same reason
+/// `choose_method` does: offer a path that may well work rather than hide it.
+pub(crate) fn totp_enabled() -> Option<bool> {
+    read_credentials_json().ok()?.get("totp_enabled")?.as_bool()
+}
+
 fn read_credentials_json() -> Result<Value> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let raw = std::fs::read_to_string(format!("{home}/.config/neuralkit/credentials.json"))?;
