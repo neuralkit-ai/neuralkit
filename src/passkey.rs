@@ -133,6 +133,27 @@ pub(crate) fn save_device_id(device_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The challenge the server handed this machine on its way out of the last sign-in.
+///
+/// STORED BESIDE THE KEY, not with the session, for the same reason the credential is: a session
+/// dies and this must not, or the machine would fall back to the long flow after every expiry —
+/// which is exactly the cost it exists to remove. Single-use server-side; a spent or lapsed one
+/// simply means the fast path is skipped this run.
+pub(crate) fn save_next_challenge(challenge: &str) -> Result<()> {
+    let path = path()?;
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let mut v: Value = serde_json::from_str(&raw)?;
+    v["next_challenge"] = Value::String(challenge.to_string());
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
+pub(crate) fn next_challenge() -> Option<String> {
+    let raw = std::fs::read_to_string(path().ok()?).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("next_challenge").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from)
+}
+
 pub(crate) fn device_id() -> Option<String> {
     let raw = std::fs::read_to_string(path().ok()?).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
@@ -584,4 +605,68 @@ fn read_credential_id() -> Result<Option<Vec<u8>>> {
         Some(h) => Ok(Some(decode_hex(h)?)),
         None => Ok(None),
     }
+}
+
+/// `Cli.login` — the whole sign-in in ONE request, for a machine the server already knows.
+///
+/// WHAT IT SKIPS, and why that is the point: the device flow (stage a key, hold a stream, draw a
+/// user_code, have something approve it) exists so a SECOND device can do the approving. A
+/// machine holding its own passkey is authenticating and enrolling ITSELF, so all of that is
+/// ceremony it does not need — four round trips spent borrowing a phone's protocol.
+///
+/// It can sign before it speaks because the server handed it a challenge on the way out of the
+/// last sign-in. Everything else — the assertion, the session, the device row, the ML-KEM key —
+/// happens inside the one handler.
+///
+/// RETURNS Ok(None) WHEN THE FAST PATH SIMPLY DOES NOT APPLY (no challenge stored, no device id,
+/// no credential yet) so the caller falls through to the full flow. Err is reserved for a request
+/// that was made and refused, which the caller also treats as "fall back" — a machine must never
+/// be left unable to sign in because its shortcut failed.
+pub(crate) async fn quick_login(
+    base_url: &str,
+    kem_pk_hex: &str,
+) -> Result<Option<(String, Value)>> {
+    let base_url = base_url.trim_end_matches('/');
+    let (Some(device_id), Some(challenge)) = (device_id(), next_challenge()) else { return Ok(None) };
+    let Some(cred_id) = read_credential_id()? else { return Ok(None) };
+    let (key, created) = load_or_create()?;
+    if created { return Ok(None) }
+
+    // The device_code is fresh per run — it keys nothing durable here (the row is named by
+    // device_id), but `enrollMachine` still deletes a staging key by it, so it must be present.
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|e| anyhow!("rng: {e}"))?;
+    let device_code: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+
+    let a = assert(&key, &url_host(base_url)?, base_url, &challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
+    let res = http(base_url)?
+        .post(format!("{base_url}/transport/action/Cli/login"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({
+            "deviceId": device_id,
+            "device":   device_code,
+            "pk":       kem_pk_hex,
+            "label":    crate::login::hostname(),
+            "os":       crate::login::os_label(),
+            "terminal": crate::login::terminal_type(),
+            "id":                b64(&cred_id),
+            "authenticatorData": b64(&a.authenticator_data),
+            "clientDataJSON":    b64(&a.client_data_json),
+            "signature":         b64(&a.signature),
+        }).to_string())
+        .send()
+        .await?;
+    let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
+    if let Some(m) = body.pointer("/error/message").and_then(Value::as_str) {
+        return Err(anyhow!("{m}"))
+    }
+    let Some(token) = body.pointer("/data/token").and_then(Value::as_str) else {
+        return Err(anyhow!("no token came back"))
+    };
+    // The NEXT challenge, immediately — a run that forgot to store it would silently take the
+    // long path forever after.
+    if let Some(next) = body.pointer("/data/nextChallenge").and_then(Value::as_str) {
+        save_next_challenge(next)?;
+    }
+    Ok(Some((token.to_string(), body.pointer("/data").cloned().unwrap_or(Value::Null))))
 }

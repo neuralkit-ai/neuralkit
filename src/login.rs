@@ -40,6 +40,36 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     // can open those frames. Nothing is shared between installs and nothing is in the binary.
     let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
 
+    // THE ONE-CALL PATH, TRIED FIRST. A machine the server already knows has nothing to be
+    // approved — it is authenticating and enrolling itself, so the device flow below (stage a
+    // key, hold a stream, draw a user_code, wait for something to approve it) is a protocol
+    // built for a SECOND device that this one does not need. `Cli.login` does the whole thing in
+    // one request, signing a challenge the server handed over on the way out of the last one.
+    //
+    // ANY miss falls through rather than failing: no stored challenge, one already spent, an
+    // expired one, a revoked credential, a device row that is no longer this account's. A
+    // shortcut that could strand a machine would be worse than no shortcut, so the only thing a
+    // refusal costs is the four extra calls it was trying to save.
+    match crate::passkey::quick_login(base_url, &kem_pk.to_hex()).await {
+        Ok(Some((token, d))) => {
+            let user = d.get("user").and_then(Value::as_str).unwrap_or("");
+            let email = d.get("email").and_then(Value::as_str);
+            let expires = d.get("expires").and_then(Value::as_i64);
+            let totp = d.get("totpEnabled").and_then(Value::as_bool);
+            let device_id = d.get("deviceId").and_then(Value::as_str);
+            let sign_key = d.get("signKey").and_then(Value::as_str);
+            save_credentials(base_url, &token, user, email, expires, &kem_sk.to_hex(), sign_key, device_id, totp)?;
+            if let Some(id) = device_id {
+                crate::passkey::save_device_id(id)?;
+            }
+            println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.unwrap_or(user)));
+            println!("  {}", crate::style::dim("cli registered"));
+            return Ok(())
+        }
+        Ok(None) => {}
+        Err(e) => println!("  {}", crate::style::dim(&format!("one-step sign-in unavailable ({e}) — falling back"))),
+    }
+
     // The registration this machine already holds, if any. A fresh keypair every login
     // means the row's key must be replaced, not duplicated — so the id travels with it.
     // Option, never an empty string: the field is `.optional()` server-side, which permits
@@ -184,6 +214,14 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     // the id only in the session file and defeated the point of moving it.
                     if let Some(id) = device_id {
                         let _ = crate::passkey::save_device_id(id);
+                    }
+
+                    // THE CHALLENGE THAT MAKES THE NEXT LOGIN ONE CALL. Handed over on this
+                    // grant precisely because the machine has just proved itself and been
+                    // enrolled; storing it here is what arms `quick_login` above. Best-effort —
+                    // without it the next run simply takes this same path again.
+                    if let Some(next) = v.get("nextChallenge").and_then(Value::as_str) {
+                        let _ = crate::passkey::save_next_challenge(next);
                     }
 
                     // A POINTER, NOT A PROMPT. Enrolment is the one path that needs a person —
@@ -851,7 +889,7 @@ fn save_credentials(origin: &str, token: &str, user: &str, email: Option<&str>, 
 /// Folded into `os` rather than given its own column: it IS the OS environment, the column
 /// is free-form and client-claimed already, and a dedicated column would be empty on all
 /// but a handful of rows. Bounded to fit the field's 32-char limit.
-fn os_label() -> String {
+pub(crate) fn os_label() -> String {
     // WSL first: it is Linux, and /etc/os-release below would answer "ubuntu" without
     // saying that Windows is hosting it — which is the part that changes the answer.
     if let Ok(distro) = std::env::var("WSL_DISTRO_NAME") {
@@ -921,7 +959,7 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// Every source here is an environment variable, so this is a claim like the hostname —
 /// context for someone reading a device list, never something to decide on.
-fn terminal_type() -> String {
+pub(crate) fn terminal_type() -> String {
     if std::env::var_os("TMUX").is_some() {
         return "tmux".to_string()
     }
@@ -937,7 +975,7 @@ fn terminal_type() -> String {
 
 /// This machine's name, for the device list. Best-effort and cosmetic: `HOSTNAME` is not
 /// exported by every shell, so `hostname(1)` is the fallback, and an empty label is fine.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         if !h.trim().is_empty() {
             return h.trim().to_string()
