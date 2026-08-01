@@ -1,8 +1,8 @@
 //! `neuralkit auth login` — passkey QR device flow.
 //!
-//! The CLI generates a SECRET `device_code`, holds the `QrCode.request` SSE stream, and
+//! The CLI generates a SECRET `device_code`, holds the `QR.request` SSE stream, and
 //! renders the returned `user_code` as a terminal QR. The phone scans it →
-//! `/passkey?code=…` → the passkey login (which signs the phone in) → `QrCode.approve`
+//! `/passkey?code=…` → the passkey login (which signs the phone in) → `QR.approve`
 //! broadcasts a fresh session token to `cli:<device_code>`, which this held
 //! connection alone receives. The channel is plain over TLS (no per-frame seal) — the token is
 //! one-time + revocable, so a distributed `neuralkit auth login` needs nothing
@@ -35,7 +35,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     let device_code = to_hex(&dc);
 
     // This install's ML-KEM-768 keypair, minted HERE so the secret never travels. The public
-    // half rides the device flow and QrCode.approve binds it to the session it mints; the
+    // half rides the device flow and QR.approve binds it to the session it mints; the
     // session channel's per-connection DEK is then encapsulated to it, so only this machine
     // can open those frames. Nothing is shared between installs and nothing is in the binary.
     let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
@@ -93,7 +93,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     }
     .await;
 
-    // Registration is no longer optional decoration. It stages the key QrCode.approve
+    // Registration is no longer optional decoration. It stages the key QR.approve
     // promotes AND the row that names this machine — so a silent failure here surfaces
     // much later as a REPL that never reaches its prompt, because the channel declares a
     // seal, no DEK is ever established, and the signed-but-unsealed frames that result are
@@ -106,7 +106,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
         );
     }
 
-    let url = format!("{base_url}/transport/stream/QrCode/request?device={device_code}");
+    let url = format!("{base_url}/transport/stream/QR/request?device={device_code}");
     let resp = client.get(&url).send().await?.error_for_status()?;
 
     let mut stream = resp.bytes_stream();
@@ -130,7 +130,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                         // A machine that has signed in here before can approve its OWN
                         // device flow with an authenticator code instead of a phone. The
                         // flow itself is untouched — same device_code, same held stream,
-                        // same QrCode.approve doing the mint and the key promotion. Only
+                        // same QR.approve doing the mint and the key promotion. Only
                         // WHERE the approving session comes from changes: a code typed
                         // here rather than a passkey on a second screen. Anything that
                         // does not complete falls through to the QR, so a fresh machine
@@ -145,11 +145,18 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     // login names the same machine instead of registering a second one, and
                     // so `unregister` has a row to revoke rather than only a file to delete.
                     let device_id = v.get("deviceId").and_then(Value::as_str);
-                    // Resolve our OWN session rather than having identity pushed through the
-                    // QR handshake — the token is an ordinary session record, so it answers
-                    // this the same way a browser cookie does. Best-effort: a passkey-only
-                    // account has no address, and the id remains what identifies it.
-                    let (email, expires, totp_enabled) = resolve_session(&client, base_url, token).await;
+                    // THE GRANT CARRIES THE PROJECTION. `QR.approve` holds the user row
+                    // and the minted expiry when it broadcasts, so it says both — this used to
+                    // be a second round trip asking the server who we had just become.
+                    // Falls back to asking only if a field is genuinely absent.
+                    let email = v.get("email").and_then(Value::as_str).map(String::from);
+                    let expires = v.get("expires").and_then(Value::as_i64);
+                    let totp_enabled = v.get("totpEnabled").and_then(Value::as_bool);
+                    let (email, expires, totp_enabled) = if expires.is_some() {
+                        (email, expires, totp_enabled)
+                    } else {
+                        resolve_session(&client, base_url, token).await
+                    };
                     save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id, totp_enabled)?;
                     // Two lines, because a login does two things: it authenticates you and
                     // it registers the machine. Naming the second is what makes the code
@@ -496,7 +503,7 @@ fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
 /// and six digits prove the owner is present.
 ///
 /// So this is two ordinary calls, not a new mechanism: sign in with the code, then perform
-/// the SAME approval step the phone performs. `QrCode.approve` still does the minting and
+/// the SAME approval step the phone performs. `QR.approve` still does the minting and
 /// still promotes `cli:pk:code:<device>` onto the token it mints, which is why the command
 /// channel comes up sealed exactly as it does after a scan.
 ///
@@ -504,7 +511,7 @@ fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
 /// code — so the caller renders the QR instead. Never a dead end.
 async fn totp_approve(client: &reqwest::Client, base_url: &str, user_code: &str, user: &str) -> Result<bool> {
     // Nothing is read from disk here: `user` came from the caller's read, and the keys +
-    // the new token are written by the stream branch once QrCode.approve broadcasts —
+    // the new token are written by the stream branch once QR.approve broadcasts —
     // the same path the QR takes, with this run's fresh keypair.
     println!();
     print!("  {} ", crate::style::dim("authenticator code:"));
@@ -646,7 +653,7 @@ async fn email_approve(client: &reqwest::Client, base_url: &str, user_code: &str
 /// The third way to supply the approving session, and structurally the same move the
 /// authenticator code makes: obtain a session, perform the approval the phone would have
 /// performed, drop the session afterwards. The device flow itself is untouched — same
-/// device_code, same held stream, same QrCode.approve doing the mint and promoting this
+/// device_code, same held stream, same QR.approve doing the mint and promoting this
 /// install's key, which is why the sealed channel comes up exactly as it does after a scan.
 ///
 /// It is also the path that needs nothing from the person: no phone, no code, no typing.
@@ -683,10 +690,12 @@ async fn approve_and_release(
     let cookie = format!("session={token}; __Secure-session={token}");
 
     let ap = client
-        .post(format!("{base_url}/transport/action/QrCode/approve"))
+        .post(format!("{base_url}/transport/action/QR/approve"))
         .header("content-type", "application/json")
         .header("cookie", &cookie)
-        .body(serde_json::json!({ "code": user_code, "via": via }).to_string())
+        // `release` asks the handler to drop this session as it finishes — it exists only to
+        // authorise this one call, and deleting it from here cost a third round trip.
+        .body(serde_json::json!({ "code": user_code, "via": via, "release": true }).to_string())
         .send()
         .await?;
     let ap_body: Value = serde_json::from_str(&ap.text().await?).unwrap_or(Value::Null);
@@ -703,13 +712,6 @@ async fn approve_and_release(
         println!();
         return Ok(false)
     }
-
-    // Best-effort: a failure here costs a stale record, not a login.
-    let _ = client
-        .post(format!("{base_url}/transport/action/Session/delete"))
-        .header("cookie", &cookie)
-        .send()
-        .await;
 
     Ok(true)
 }

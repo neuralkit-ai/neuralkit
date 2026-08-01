@@ -12,7 +12,7 @@
 //!
 //! ZERO NEW SERVER SURFACE: `Totp.enrollStart` and `Totp.enrollFinish` already exist and are
 //! `transport: rpc` + `use: [session]`, which the CLI reaches with a cookie exactly as it
-//! reaches `Totp.login` and `QrCode.approve`. The browser page uses the same two.
+//! reaches `Totp.login` and `QR.approve`. The browser page uses the same two.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;

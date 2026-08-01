@@ -361,7 +361,7 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
             .send()
             .await?;
     // registerFinish declares `mint: [session]`, so a successful registration hands back a
-    // SECOND session. The caller already holds the one it wants — the one QrCode.approve
+    // SECOND session. The caller already holds the one it wants — the one QR.approve
     // minted, which has this install's key promoted onto it — so this one is released rather
     // than kept, the same discipline the authenticator-code path follows.
     let minted = session_cookie(&finish_res);
