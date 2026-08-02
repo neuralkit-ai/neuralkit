@@ -978,3 +978,92 @@ pub(crate) fn wait_for_presence(seconds: u64) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn wait_for_presence(_seconds: u64) -> Option<String> { None }
+
+/// `neuralkit auth passkey system` — ask macOS to assert the ACCOUNT's own passkey.
+///
+/// THE PROBE THAT DECIDES A DESIGN. Everything else this CLI does with passkeys uses a key the
+/// MACHINE holds; this asks the OS for one the ACCOUNT holds, synced through iCloud Keychain from
+/// whichever device registered it. If it works, a brand-new Mac on the same Apple ID can sign in
+/// with no email, no code and no QR — the only path that removes email from bootstrap.
+///
+/// The open question is not the API, it is the PLATFORM: whether macOS will draw its passkey sheet
+/// for an accessory app with an offscreen window. If it refuses, the same request belongs in a tray
+/// app and nothing in `phaze_auth::system_passkey` changes.
+#[cfg(target_os = "macos")]
+pub async fn system(base_url: &str) -> Result<()> {
+    let base_url = base_url.trim_end_matches('/');
+    let rp_id = url_host(base_url)?;
+    let client = http(base_url)?;
+
+    println!();
+    println!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim("· the account's own passkey"));
+    println!();
+    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "relying party")), crate::style::dim(&rp_id));
+
+    // The SERVER's challenge, exactly as every other assertion path uses. Nothing about this is
+    // local: a challenge we invented would prove the sheet appeared and nothing about identity.
+    let start: Value = serde_json::from_str(
+        &client
+            .post(format!("{base_url}/transport/action/Passkey/loginStart"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await?
+            .text()
+            .await?,
+    )?;
+    if let Some(m) = start.pointer("/error/message").and_then(Value::as_str) {
+        return Err(anyhow!("loginStart: {m}"))
+    }
+    let challenge_b64 = start
+        .pointer("/data/challenge")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("loginStart returned no challenge"))?;
+    let challenge = URL_SAFE_NO_PAD.decode(challenge_b64).map_err(|e| anyhow!("challenge: {e}"))?;
+    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "challenge")), crate::style::dim(&format!("{} B from the server", challenge.len())));
+
+    // NO allow-list ON PURPOSE. An empty list is the discoverable form — "any credential for this
+    // domain" — which is what a machine that does not yet know whose it is has to ask.
+    println!();
+    println!("  {}", crate::style::dim("macOS should now show its passkey sheet — approve it"));
+    let asrt = phaze_auth::system_passkey::assert(&rp_id, &challenge, &[], 60.0)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    println!();
+    println!("  {} {}", crate::style::green("✓"), "the OS returned an assertion");
+    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "credential")), crate::style::dim(&b64(&asrt.credential_id)));
+    println!(
+        "  {}  {}",
+        crate::style::dim(&format!("{:<13}", "sizes")),
+        crate::style::dim(&format!(
+            "authData {} B · clientData {} B · signature {} B",
+            asrt.authenticator_data.len(), asrt.client_data_json.len(), asrt.signature.len(),
+        )),
+    );
+
+    // THE REAL PROOF is the server accepting it, not the sheet appearing. `loginFinish` resolves
+    // the user from the credential id, so a success here means this machine just authenticated as
+    // an account it was never told the name of.
+    let res = client
+        .post(format!("{base_url}/transport/action/Passkey/loginFinish"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({
+            "id": b64(&asrt.credential_id),
+            "authenticatorData": b64(&asrt.authenticator_data),
+            "clientDataJSON": b64(&asrt.client_data_json),
+            "signature": b64(&asrt.signature),
+        }).to_string())
+        .send()
+        .await?;
+    let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
+    if let Some(m) = body.pointer("/error/message").and_then(Value::as_str) {
+        println!("  {} {}", crate::style::red("✗"), crate::style::dim(&format!("the server rejected it — {m}")));
+        return Ok(())
+    }
+    let user = body.pointer("/data/userId").and_then(Value::as_str).unwrap_or("");
+    println!();
+    println!("  {} signed in as {}", crate::style::green("✓"), crate::style::bold(user));
+    println!("  {}", crate::style::dim("no email, no code, no QR — the account's own credential"));
+    println!();
+    Ok(())
+}

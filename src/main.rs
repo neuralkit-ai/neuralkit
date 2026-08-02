@@ -122,6 +122,15 @@ enum PasskeyAction {
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
+    /// Ask macOS for the ACCOUNT's own passkey — the bootstrap path that needs no email.
+    ///
+    /// Uses the credential already on your Apple ID (the one your phone registered, synced
+    /// through iCloud Keychain) rather than a key this machine holds. Needs the signed build,
+    /// an associated domain, and a GUI session — it cannot work over SSH.
+    System {
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
     /// Hold this machine's key in hardware, and require a person before it signs.
     ///
     /// The OS decides WHICH person-check: Touch ID, a paired Apple Watch, or the account
@@ -820,6 +829,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let outcome = match action {
             Some(PasskeyAction::Register { url }) => passkey::register(url, false).await,
             Some(PasskeyAction::Login { url }) => passkey::login(url).await,
+            #[cfg(target_os = "macos")]
+            Some(PasskeyAction::System { url }) => passkey::system(url).await,
+            #[cfg(not(target_os = "macos"))]
+            Some(PasskeyAction::System { .. }) => Err(anyhow::anyhow!("the system passkey store is macOS-only")),
             #[cfg(target_os = "macos")]
             Some(PasskeyAction::Presence { off }) => passkey::set_presence(*off),
             #[cfg(not(target_os = "macos"))]
