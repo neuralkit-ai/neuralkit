@@ -23,6 +23,22 @@ pub enum Method {
     Totp,
     Passkey,
     Email,
+    /// A passkey asserted in this machine's BROWSER rather than by the CLI itself.
+    ///
+    /// THERE IS ONLY ONE KIND OF PASSKEY, and both paths mint a real WebAuthn credential through
+    /// the same `Passkey/register*` + `Passkey/login*` fences into the same `credentials` table —
+    /// `phaze-auth` IS an authenticator, it does not imitate one. What differs is WHICH
+    /// authenticator answered, which is what `aaguid` exists to say:
+    ///
+    ///   fbfc3007-154e-4ecc-8c0b-6e020557d7bd  Apple Passwords  transports ["hybrid","internal"]
+    ///   91eec8ac-7c27-4485-9d3b-4b98f7b3027e  ours             transports []
+    ///
+    /// The empty transports are the whole difference. Our own credential's private half is sealed
+    /// in this Mac's enclave and cannot travel; Apple's syncs across the account's devices. So a
+    /// machine that has never signed in has no credential of ours to assert — but it may already
+    /// hold the person's, put there by iCloud. That is the only reason this path can bootstrap
+    /// and `Passkey` cannot, and it is a property of the AUTHENTICATOR, not of the credential.
+    Browser,
 }
 
 pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
@@ -450,8 +466,16 @@ async fn choose_method(
     // The email path needs NOTHING on this machine — just an address someone can read mail
     // at — which is what makes it the only option that works on a machine that has never
     // signed in. Every other path is downstream of a session that already happened.
-    let mut labels: Vec<&str> = vec!["scan a QR code with your phone", "email me a sign-in code"];
-    let mut paths: Vec<Method> = vec![Method::Qr, Method::Email];
+    // The QR's job is bridging TWO devices — the terminal cannot show a browser, so the code
+    // travels by eye. When the browser is on THIS machine there is nothing to bridge: the code
+    // goes straight there. Same code, same held stream, same QR.approve; only how the code
+    // reaches the page changes.
+    let mut labels: Vec<&str> = vec![
+        "scan a QR code with your phone",
+        "use your passkey",
+        "email me a sign-in code",
+    ];
+    let mut paths: Vec<Method> = vec![Method::Qr, Method::Browser, Method::Email];
     // Absent means an older credentials.json that predates the field — offer it rather than
     // hide a path that may well work.
     let has_totp = prev
@@ -513,6 +537,7 @@ async fn choose_method(
             passkey_approve(client, base_url, user_code).await
         }
         Some(Method::Email) => email_approve(client, base_url, user_code).await,
+        Some(Method::Browser) => browser_approve(base_url, user_code),
         _ => Ok(false),
     }
 }
@@ -747,6 +772,43 @@ async fn email_approve(client: &reqwest::Client, base_url: &str, user_code: &str
 /// install's key, which is why the sealed channel comes up exactly as it does after a scan.
 ///
 /// It is also the path that needs nothing from the person: no phone, no code, no typing.
+/// Hand the code to THIS machine's browser instead of to a phone's camera.
+///
+/// Returns true meaning "the QR is not needed", NOT "signed in" — nothing is approved here. The
+/// stream this task is already holding stays open, the person authorizes on the page, and the
+/// token arrives on that stream exactly as it does after a scan. Same `QR.approve`, same mint.
+///
+/// THE ANTI-PHISHING PROPERTY SURVIVES, and it is worth being explicit about because `render_qr`
+/// deliberately prints no URL (RFC 8628 §5.4 — an attacker's danger is getting you to authorize
+/// THEIR code). Handing the URL to a local process is not the same channel as putting it on
+/// screen: nothing pasteable appears, nothing leaves this machine, and the code still came from
+/// the flow this terminal started. Do not "helpfully" print it on failure.
+fn browser_approve(base_url: &str, user_code: &str) -> Result<bool> {
+    let url = format!("{base_url}/qr?code={user_code}");
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = std::process::Command::new("open"); c.arg(&url); c };
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = std::process::Command::new("cmd"); c.args(["/C", "start", "", &url]); c };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut cmd = { let mut c = std::process::Command::new("xdg-open"); c.arg(&url); c };
+
+    println!();
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            println!("  {}", crate::style::dim("opened your browser — approve there to sign in."));
+            println!();
+            Ok(true)
+        }
+        // No browser, or none that could be launched (a headless box, a bare SSH session).
+        // Falling through hands the caller back to the QR, which is the path that still works
+        // when this machine has no screen of its own.
+        _ => {
+            println!("  {} {}", crate::style::red("✗"), crate::style::dim("could not open a browser here"));
+            Ok(false)
+        }
+    }
+}
+
 async fn passkey_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<bool> {
     println!();
     println!("  {}", crate::style::dim("signing in with this machine's passkey…"));
