@@ -95,7 +95,7 @@ fn enclave_gate() -> Result<Option<phaze_auth::enclave::Gate>> {
             "this Mac can't verify a person right now — its key won't sign without that"
         },
         "put it on, unlock it, and keep it near this Mac — then try again",
-        "or run `neuralkit auth passkey presence` to choose a different factor",
+        "or unset the `gate` field in ~/.config/neuralkit/passkey.json to use the software key",
     ))
 }
 
@@ -176,13 +176,21 @@ fn load_or_create_software() -> Result<(SoftwareKey, bool)> {
     let path = path()?;
     if let Ok(raw) = std::fs::read_to_string(&path) {
         let v: Value = serde_json::from_str(&raw).context("passkey.json is not JSON")?;
-        let hex = v
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("passkey.json is missing `key` — delete it and register again"))?;
-        let bytes = decode_hex(hex)?;
-        let key = SoftwareKey::from_bytes(&bytes).map_err(|e| anyhow!("passkey.json holds an invalid key: {e}"))?;
-        return Ok((key, false));
+        // A KEYLESS FILE IS NORMAL, not corruption. `ensure_metadata_file` writes exactly that for
+        // the hardware path — the private half is in the enclave, so there is nothing to record —
+        // which means "the file exists" never implied "a key is in it". `presence --off` is when
+        // that meets this function: the gate is gone, the enclave is no longer chosen, and the
+        // software path finds a file it did not write. Erroring here made that command promise a
+        // fallback it could not deliver, and the advice it gave — delete the file — would take
+        // device_id and next_challenge with it.
+        if let Some(hex) = v.get("key").and_then(Value::as_str) {
+            let bytes = decode_hex(hex)?;
+            let key = SoftwareKey::from_bytes(&bytes).map_err(|e| anyhow!("passkey.json holds an invalid key: {e}"))?;
+            return Ok((key, false));
+        }
+        let key = SoftwareKey::generate();
+        save(&key)?;
+        return Ok((key, true));
     }
 
     let key = SoftwareKey::generate();
@@ -198,10 +206,24 @@ fn save(key: &SoftwareKey) -> Result<()> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = format!("{home}/.config/neuralkit");
     std::fs::create_dir_all(&dir)?;
-    let body = serde_json::to_string_pretty(&serde_json::json!({
-        "key": encode_hex(&key.to_bytes()),
-        "created_at": chrono::Local::now().to_rfc3339(),
-    }))?;
+    // MERGE, NEVER REPLACE. This file also carries device_id and next_challenge — the machine's
+    // registration and its one-call shortcut. Truncating would silently unregister the machine:
+    // the next login would find no id to claim and enrol a SECOND device row beside the live one.
+    //
+    // AND DROP credential_id, because this function only runs when a key was just MINTED. The
+    // credential registered against the previous key cannot be signed for any more, so keeping
+    // its id would leave `is_registered()` true, the login skipping re-registration, and every
+    // assertion failing verification server-side with nothing to say why.
+    let mut v: Value = std::fs::read_to_string(path()?)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.remove("credential_id");
+    }
+    v["key"] = Value::String(encode_hex(&key.to_bytes()));
+    v["created_at"] = Value::String(chrono::Local::now().to_rfc3339());
+    let body = serde_json::to_string_pretty(&v)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -851,7 +873,7 @@ pub(crate) async fn quick_login(
     Ok(Some((token.to_string(), body.pointer("/data").cloned().unwrap_or(Value::Null))))
 }
 
-/// `neuralkit auth passkey presence` — choose what must happen before this machine's key signs.
+/// Choose what must happen before this machine's key signs. NOT wired to a command today.
 ///
 /// A PREFERENCE, not a policy we impose: the answer is hardware and taste at once. A MacBook
 /// owner may want Touch ID and nothing else; a Mac mini owner has a Watch, or a password, or
@@ -859,6 +881,14 @@ pub(crate) async fn quick_login(
 /// `capabilities()` — offering a factor that cannot be met would be a promise the machine
 /// cannot keep, and the person only finds out when they are locked out of their own terminal.
 #[cfg(target_os = "macos")]
+// NOT WIRED TO A COMMAND (2026-08-03). The `auth passkey presence` subcommand is removed
+// until the release can ship a signed `.app`: an access control on a persisted key needs
+// `keychain-access-groups`, which needs a provisioning profile in a bundle, and the npm
+// package is a bare binary. Left in place because the flow is PROVEN — the Watch prompted
+// through NeuralkitCLI.app — and re-deriving it would cost the Apple round trip again.
+// With no way to store a gate, `stored_gate()` returns None, so the enclave path is never
+// chosen and login.rs's "try again with my Apple Watch" entry never appears.
+#[allow(dead_code)]
 pub fn set_presence(off: bool) -> Result<()> {
     if off {
         set_gate(None)?;
@@ -999,6 +1029,12 @@ pub async fn system(base_url: &str) -> Result<()> {
     println!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim("· the account's own passkey"));
     println!();
     println!("  {}  {}", crate::style::dim(&format!("{:<13}", "relying party")), crate::style::dim(&rp_id));
+    // WHAT THE OS THINKS IS RUNNING. The association is resolved against this, not against the
+    // code signature — so an empty identifier here would explain a refusal that every other
+    // input says should have worked.
+    let (bundle_id, bundle_path) = phaze_auth::system_passkey::running_bundle();
+    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "running as")), crate::style::dim(&bundle_id));
+    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "bundle")), crate::style::dim(&bundle_path));
 
     // The SERVER's challenge, exactly as every other assertion path uses. Nothing about this is
     // local: a challenge we invented would prove the sheet appeared and nothing about identity.

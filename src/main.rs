@@ -131,16 +131,6 @@ enum PasskeyAction {
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
-    /// Hold this machine's key in hardware, and require a person before it signs.
-    ///
-    /// The OS decides WHICH person-check: Touch ID, a paired Apple Watch, or the account
-    /// password — whichever this Mac has. `auth passkey` reports which one it would use.
-    /// Needs the signed build; an ordinary `cargo` binary cannot persist an enclave key.
-    Presence {
-        /// Turn it off again and go back to the software key.
-        #[arg(long)]
-        off: bool,
-    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -833,10 +823,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(PasskeyAction::System { url }) => passkey::system(url).await,
             #[cfg(not(target_os = "macos"))]
             Some(PasskeyAction::System { .. }) => Err(anyhow::anyhow!("the system passkey store is macOS-only")),
-            #[cfg(target_os = "macos")]
-            Some(PasskeyAction::Presence { off }) => passkey::set_presence(*off),
-            #[cfg(not(target_os = "macos"))]
-            Some(PasskeyAction::Presence { .. }) => Err(anyhow::anyhow!("hardware-held keys are macOS-only for now")),
             None => passkey::run(url),
         };
         if let Err(e) = outcome {
