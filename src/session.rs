@@ -36,6 +36,7 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// fence and is still refused there, so this table can never grant anything.
 const COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("dash", "open the EEG dashboard — Q returns here", None),
+    ("tray", "put the status icon in the menu bar", None),
     ("list", "list all users", Some("admin")),
     ("help", "show this table", None),
     ("logout", "end this session and forget it", None),
@@ -240,6 +241,48 @@ pub async fn run() -> Result<Next> {
             "dash" => {
                 let _ = ws.close(None).await;
                 return Ok(Next::Dash)
+            }
+            // The OPPOSITE hand-off from `dash`: a menu-bar icon needs no terminal, so
+            // blocking the prompt under it would hold the REPL hostage to a thing built
+            // to outlive glances. Spawned detached (own process group, no stdio) — the
+            // icon lives until its menu's Quit, whatever happens to this session.
+            "tray" => {
+                #[cfg(target_os = "macos")]
+                {
+                    // Checked HERE, not just in the child: the spawn nulls stdio, so the
+                    // child's own "already running" would vanish and this prompt would
+                    // claim success over a process that exited on arrival.
+                    if crate::tray::is_running() {
+                        println!("  {} {}", style::green("✓"), style::dim("the tray is already in the menu bar"));
+                    } else {
+                        match std::env::current_exe() {
+                            Ok(exe) => {
+                                use std::os::unix::process::CommandExt as _;
+                                match std::process::Command::new(exe)
+                                    .arg("tray")
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .process_group(0)
+                                    .spawn()
+                                {
+                                    Ok(mut child) => {
+                                        // Reap on a throwaway thread so a menu-Quit before
+                                        // this REPL exits doesn't leave a zombie at the table.
+                                        std::thread::spawn(move || {
+                                            let _ = child.wait();
+                                        });
+                                        println!("  {} {}", style::green("✓"), style::dim("tray is up — quit it from its menu"));
+                                    }
+                                    Err(e) => println!("  {} could not start the tray: {e}", style::red("✗")),
+                                }
+                            }
+                            Err(e) => println!("  {} {}", style::red("✗"), e),
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                println!("  {} the tray is macOS-only for now", style::red("✗"));
             }
             "help" => {
                 println!();

@@ -117,9 +117,123 @@ fn icon() -> Result<Icon> {
     Icon::from_rgba(rgba, W as u32, H as u32).context("build tray icon")
 }
 
+/// The one-instance lock — flock, not a PID file, because the kernel releases a flock
+/// with the process (crash, kill -9, anything), so there is no stale state to repair and
+/// no liveness probing. Holding the returned file IS holding the lock. Two icons were
+/// tolerable while the tray was a status card; the moment it owns processes (the relay is
+/// next), two owners fighting over one port is a UX bug, so singleness lands first.
+fn instance_lock() -> Result<Option<std::fs::File>> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let dir = format!("{home}/.config/neuralkit");
+    std::fs::create_dir_all(&dir)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(format!("{dir}/tray.lock"))?;
+    use std::os::unix::io::AsRawFd as _;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok(if rc == 0 { Some(f) } else { None })
+}
+
+/// Whether a tray already holds the lock — for callers (the REPL) that want to say
+/// "already up" instead of spawning a child that will only exit. Probe-and-release:
+/// the momentary acquisition is invisible to anyone else.
+pub fn is_running() -> bool {
+    matches!(instance_lock(), Ok(None))
+}
+
+/// The relay's glyph — a ring, distinct from the status card's waveform at a glance:
+/// two icons, two processes, two shapes.
+fn icon_ring() -> Result<Icon> {
+    const W: usize = 22;
+    const H: usize = 22;
+    let mut rgba = vec![0u8; W * H * 4];
+    let mut set = |x: i32, y: i32| {
+        if (0..W as i32).contains(&x) && (0..H as i32).contains(&y) {
+            let i = (y as usize * W + x as usize) * 4;
+            rgba[i + 3] = 255;
+        }
+    };
+    let (cx, cy, r) = (11.0f32, 11.0f32, 7.0f32);
+    for step in 0..256 {
+        let a = step as f32 / 256.0 * std::f32::consts::TAU;
+        set((cx + a.cos() * r) as i32, (cy + a.sin() * r) as i32);
+        set((cx + a.cos() * (r - 1.0)) as i32, (cy + a.sin() * (r - 1.0)) as i32);
+    }
+    // A center dot: a ring alone reads as "off"; a nucleus reads as "carrying something".
+    for dx in -1i32..=1 {
+        for dy in -1i32..=1 {
+            set(11 + dx, 11 + dy);
+        }
+    }
+    Icon::from_rgba(rgba, W as u32, H as u32).context("build relay icon")
+}
+
+/// The relay's own menu-bar presence — its whole lifetime, on the same one-icon-one-process
+/// contract as the status card. Never returns: Quit exits the process (the flock and the
+/// relay task die with it), and a relay that stops on its own takes the icon down rather
+/// than leaving a lie in the menu bar.
+pub fn relay_icon(
+    bind: String,
+    lock: std::fs::File,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let menu = Menu::new();
+    // Which relay this is — the same tell-me-what-it's-wired-to rule the dashboard's
+    // relay/protocol label follows.
+    menu.append(&MenuItem::new(format!("relay — {bind}"), false, None)).context("menu")?;
+    menu.append(&MenuItem::new(format!("logs: {}", crate::relay::log_path().unwrap_or_default()), false, None))
+        .context("menu")?;
+    menu.append(&PredefinedMenuItem::separator()).context("menu")?;
+    let quit = MenuItem::new("Quit relay", true, None);
+    menu.append(&quit).context("menu")?;
+
+    let quit_id = quit.id().clone();
+    let icon = icon_ring()?;
+    let mut tray = None;
+    let event_loop = EventLoopBuilder::new().build();
+    let menu_events = MenuEvent::receiver();
+
+    event_loop.run(move |event, _, control_flow| {
+        let _hold = &lock;
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(150));
+
+        if let Event::NewEvents(StartCause::Init) = event {
+            tray = Some(
+                TrayIconBuilder::new()
+                    .with_menu(Box::new(menu.clone()))
+                    .with_tooltip(format!("neuralkit relay — {bind}"))
+                    .with_icon(icon.clone())
+                    .with_icon_as_template(true)
+                    .build()
+                    .expect("create the relay menu-bar item"),
+            );
+        }
+
+        // The relay task ended (port taken, cert failure, crash): the icon must not
+        // outlive the thing it stands for. The reason is already in relay.log.
+        if dead.load(std::sync::atomic::Ordering::Relaxed) {
+            tray.take();
+            std::process::exit(1);
+        }
+
+        if let Ok(e) = menu_events.try_recv() {
+            if e.id() == &quit_id {
+                tray.take();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 /// Runs the menu bar item until Quit. Never returns on success — the event loop owns the
 /// process from here, which is what a menu-bar agent is.
 pub fn run(url: &str) -> Result<()> {
+    // One tray per machine, enforced before anything touches the menu bar.
+    let Some(lock) = instance_lock()? else {
+        println!("  the tray is already in the menu bar");
+        return Ok(());
+    };
     let url = url.trim_end_matches('/').to_string();
     let s = snapshot();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
@@ -199,6 +313,9 @@ pub fn run(url: &str) -> Result<()> {
     let menu_events = MenuEvent::receiver();
 
     event_loop.run(move |event, _, control_flow| {
+        // The lock lives in the closure so it is held for exactly the icon's lifetime —
+        // the event loop never returns, and process exit is what releases it.
+        let _hold = &lock;
         // WaitUntil, not Wait: menu events arrive on a crossbeam channel with nothing to
         // wake the loop, so a fully-parked loop would sit on a click until some other event
         // happened by. A 150ms poll is imperceptible for a menu and free for the battery.

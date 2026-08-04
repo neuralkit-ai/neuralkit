@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod login;
 mod passkey;
+mod relay;
 mod totp;
 mod session;
 mod style;
@@ -116,6 +117,27 @@ enum Command {
         /// The site the "Open" item points at.
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
+    },
+    /// The local MoQ relay — spawned into its own menu-bar icon, which owns its lifetime.
+    ///
+    /// Idempotent: run it again and it reports the relay that already exists. Quit is on
+    /// the icon's menu. `--foreground` keeps it in the terminal instead (debugging, SSH).
+    Relay {
+        /// QUIC/WebTransport listener address.
+        #[arg(long, default_value = "[::]:4443")]
+        bind: std::net::SocketAddr,
+        /// Plain-HTTP address serving GET /certificate.sha256 (browser cert pinning).
+        #[arg(long, default_value = "[::]:4444")]
+        cert_listen: std::net::SocketAddr,
+        /// Hostname for the self-signed dev certificate.
+        #[arg(long, default_value = "localhost")]
+        tls_generate: String,
+        /// Own the terminal instead of the menu bar — Ctrl-C stops it.
+        #[arg(long)]
+        foreground: bool,
+        /// Internal: this IS the spawned icon-owned process.
+        #[arg(long, hide = true)]
+        icon: bool,
     },
 }
 
@@ -783,6 +805,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("the tray is macOS-only for now");
             std::process::exit(1);
         }
+    }
+
+    // `neuralkit relay` — the launcher spawns the icon-owned process and returns; the
+    // hidden --icon mode IS that process; --foreground trades the icon for the terminal.
+    if let Some(Command::Relay { bind, cert_listen, tls_generate, foreground, icon }) = &args.command {
+        let opts = relay::Opts {
+            bind: *bind,
+            cert_listen: *cert_listen,
+            tls_generate: tls_generate.clone(),
+        };
+        #[cfg(target_os = "macos")]
+        let outcome = if *icon {
+            relay::run_icon(opts).await
+        } else if *foreground {
+            relay::run_foreground(opts).await
+        } else {
+            relay::launch(&opts)
+        };
+        // No menu bar exists off macOS, so the terminal is the only owner there.
+        #[cfg(not(target_os = "macos"))]
+        let outcome = {
+            let _ = icon;
+            let _ = foreground;
+            relay::run_foreground(opts).await
+        };
+        if let Err(e) = outcome {
+            eprintln!("relay failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // `neuralkit auth login` — the passkey QR device flow owns stdout until the
