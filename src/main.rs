@@ -837,9 +837,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if io::stdout().is_terminal() && io::stdin().is_terminal() {
-            if let Err(e) = session::run().await {
-                eprintln!("session error: {e:#}");
-                std::process::exit(1);
+            // The REPL and the dashboard take turns owning the terminal: `dash` returns
+            // rather than launching, the dashboard runs with the REPL fully out of the
+            // way, and quitting it (Q) lands back at a fresh prompt — reconnected, since
+            // the sealed channel was closed on the way out.
+            loop {
+                match session::run().await {
+                    Ok(session::Next::Dash) => {
+                        if let Err(e) = run_dashboard(&args).await {
+                            // The dashboard restores the terminal on its own error paths;
+                            // this is insurance so a failure can't strand the REPL in raw
+                            // mode with no prompt.
+                            let _ = disable_raw_mode();
+                            eprintln!("  dashboard error: {e:#}");
+                        }
+                    }
+                    Ok(session::Next::Done) => break,
+                    Err(e) => {
+                        eprintln!("session error: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         return Ok(());
@@ -878,6 +896,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    run_dashboard(&args).await
+}
+
+/// The TUI dashboard — extracted from `main`'s tail so the REPL's `dash` command opens
+/// the SAME thing bare `neuralkit` runs, with the same args the process started with.
+/// Owns the whole terminal (raw mode + alternate screen) for its lifetime; every exit
+/// path restores it, which is what lets a REPL prompt survive on the other side.
+async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
     parser.is_subscriber = args.sub;

@@ -35,11 +35,24 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// LISTS it. Enforcement stays server-side: typing a hidden command still reaches the
 /// fence and is still refused there, so this table can never grant anything.
 const COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("dash", "open the EEG dashboard — Q returns here", None),
     ("list", "list all users", Some("admin")),
     ("help", "show this table", None),
     ("logout", "end this session and forget it", None),
     ("exit", "leave the session", None),
 ];
+
+/// What the REPL wants to happen after it returns. The dashboard is a MODE of the same
+/// process, not a command the REPL can run in place — it needs the whole terminal (raw
+/// mode + alternate screen) that the line-based REPL must not be holding. So `dash`
+/// returns this instead of doing anything, and main runs the dashboard with the terminal
+/// fully handed over, then re-enters the REPL when it comes back.
+pub enum Next {
+    /// The session is over — exit, logout, EOF or the deadline.
+    Done,
+    /// Open the EEG dashboard, then come back to a fresh REPL.
+    Dash,
+}
 
 struct Credentials {
     token: String,
@@ -154,7 +167,7 @@ impl Seal {
     }
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run() -> Result<Next> {
     let creds = load_credentials()?;
     let (mut ws, seal, roles) = connect(&creds).await?;
 
@@ -221,6 +234,13 @@ pub async fn run() -> Result<()> {
         match line.trim() {
             "" => continue,
             "exit" | "quit" => break,
+            // Hand the terminal over rather than run anything here: the WS is closed on
+            // the way out (a sealed channel idling unattended under a dashboard is worse
+            // than a reconnect), and main re-enters this REPL when the dashboard quits.
+            "dash" => {
+                let _ = ws.close(None).await;
+                return Ok(Next::Dash)
+            }
             "help" => {
                 println!();
                 for (cmd, what, needs) in COMMANDS {
@@ -260,7 +280,7 @@ pub async fn run() -> Result<()> {
     }
     let _ = ws.close(None).await;
     println!("{}", style::dim("bye"));
-    Ok(())
+    Ok(Next::Done)
 }
 
 /// Remove the credentials file. Only ever called AFTER the server confirms the session
