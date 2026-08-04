@@ -885,9 +885,12 @@ pub(crate) async fn quick_login(
 // until the release can ship a signed `.app`: an access control on a persisted key needs
 // `keychain-access-groups`, which needs a provisioning profile in a bundle, and the npm
 // package is a bare binary. Left in place because the flow is PROVEN — the Watch prompted
-// through NeuralkitCLI.app — and re-deriving it would cost the Apple round trip again.
-// With no way to store a gate, `stored_gate()` returns None, so the enclave path is never
-// chosen and login.rs's "try again with my Apple Watch" entry never appears.
+// through NeuralkitCLI.app, and again 2026-08-03 through release/macos/bundle.sh — and
+// re-deriving it would cost the Apple round trip again.
+// The gate CAN still be stored without this command: the tray's checkbox (tray.rs) writes
+// it through `set_gate`, and `NEURALKIT_ENCLAVE=1` forces it for a single run. Both are
+// deliberate choices by someone holding the signed bundle; this MENU is what stays off
+// until the npm binary can tell a bundled install from a bare one.
 #[allow(dead_code)]
 pub fn set_presence(off: bool) -> Result<()> {
     if off {

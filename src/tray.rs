@@ -3,61 +3,93 @@
 //! WHY THIS LIVES IN THE CLI, TODAY. The decided end-state is the Docker model: the desktop
 //! app owns the privileged parts and a thin CLI asks it (plan §C — "the Docker-Desktop
 //! shape"). That app does not exist yet, and a tray is useful before it does: status at a
-//! glance, the site a click away. So v0 is READ-ONLY — it reports what the files already
-//! say and starts no ceremonies. When the desktop app lands, this code migrates: tray-icon
-//! and tao are Tauri's own extracted crates, so the menu built here is the menu it would
-//! build there.
+//! glance, the site a click away. So the tray REPORTS what the files already say and starts
+//! no ceremonies. When the desktop app lands, this code migrates: tray-icon and tao are
+//! Tauri's own extracted crates, so the menu built here is the menu it would build there.
 //!
-//! WHAT IT DELIBERATELY DOES NOT DO YET: sign in, approve terminals, or touch the enclave.
-//! Those need either a session mutation or an `NSWindow` for the ceremony, and both belong
-//! to the socket protocol the desktop app will own. A tray that only tells the truth about
-//! the machine's state has no failure modes worth designing around.
+//! TWO KINDS OF TRUTH, KEPT VISIBLY APART. The top block is the SESSION — transient,
+//! expiring, gone on logout. "This machine" is the REGISTRATION — the credential and its
+//! owner, which deliberately outlive every session (passkey.rs's whole reason for a second
+//! file). Blurring these is how "signed in but expired" confusion happens, so the menu
+//! keeps the same boundary the files do.
 //!
-//! The status lines are read ONCE at launch. A tray that watches files needs fsevents and a
-//! refresh story; v0 would rather be honestly static than subtly stale.
+//! NOISE BUDGET. One line per fact-cluster, and the exception rather than the norm: an
+//! authenticator that IS set up says nothing — only the actionable absence gets a row.
+//!
+//! THE ONE WRITE: the hardware-gate toggle. A local file edit (`passkey::set_gate`) — no
+//! server, no session, no NSWindow — so it fits the "no ceremonies" boundary, and it is
+//! the surface the dropped `auth passkey presence` subcommand was waiting for.
+//!
+//! Status is read ONCE at launch. A tray that watches files needs fsevents and a refresh
+//! story; this one would rather be honestly static than subtly stale.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
-/// Who this machine is signed in as, read from the same file every other command trusts.
-/// Absent file = signed out; that is a normal state, not an error.
-fn status_line() -> String {
-    let read = || -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
-        let raw = std::fs::read_to_string(format!("{home}/.config/neuralkit/credentials.json")).ok()?;
-        let v: Value = serde_json::from_str(&raw).ok()?;
-        let who = v
-            .get("email")
-            .and_then(Value::as_str)
+/// Everything the menu says, read from the two files the CLI already trusts. Collected in
+/// one pass so the menu is a consistent snapshot rather than a mix of moments.
+struct Snapshot {
+    signed_in: Option<String>,
+    /// Absolute ms timestamp the session record carries — the same `expires` the REPL's
+    /// deadline uses, so the tray and the session agree about when the end is.
+    expires_ms: Option<i64>,
+    totp: Option<bool>,
+    /// Who the credential was REGISTERED to — written at registration time, because the
+    /// session file only knows who is signed in now, which is a different question.
+    account: Option<String>,
+    has_software_key: bool,
+    registered: bool,
+    gated: bool,
+}
+
+fn read_json(path: &str) -> Option<Value> {
+    let home = std::env::var("HOME").ok()?;
+    let raw = std::fs::read_to_string(format!("{home}/.config/neuralkit/{path}")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn snapshot() -> Snapshot {
+    let creds = read_json("credentials.json");
+    let pk = read_json("passkey.json");
+    let field = |v: &Option<Value>, k: &str| -> Option<String> {
+        v.as_ref()?
+            .get(k)?
+            .as_str()
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .or_else(|| v.get("user").and_then(Value::as_str).map(String::from))?;
-        Some(who)
     };
-    match read() {
-        Some(who) => format!("signed in as {who}"),
-        None => "signed out".into(),
+    Snapshot {
+        signed_in: field(&creds, "email").or_else(|| field(&creds, "user")),
+        expires_ms: creds.as_ref().and_then(|v| v.get("expires")).and_then(Value::as_i64),
+        totp: creds.as_ref().and_then(|v| v.get("totp_enabled")).and_then(Value::as_bool),
+        // Owner precedence: an `account` field beside the credential would win — none is
+        // written today (the registration path is tested and frozen), so the identity the
+        // bootstrap left in credentials.json stands in. It survives expiry (only logout /
+        // the REPL deadline remove the file), which is exactly the residue this reads.
+        // Known edge, accepted: a machine registered as A whose last sign-in was B would
+        // caption A's credential with B — the true fix is writing the owner at
+        // registration time, and that waits for the auth freeze to lift.
+        account: field(&pk, "account")
+            .or_else(|| field(&creds, "email"))
+            .or_else(|| field(&creds, "user")),
+        has_software_key: field(&pk, "key").is_some(),
+        registered: field(&pk, "credential_id").is_some(),
+        gated: field(&pk, "gate").is_some(),
     }
 }
 
-/// Which tier of key this machine holds — the capability-legibility line plan §C asks for:
-/// the weaker tier should be visible, not merely present.
-fn key_line() -> String {
-    let read = || -> Option<Value> {
-        let home = std::env::var("HOME").ok()?;
-        let raw = std::fs::read_to_string(format!("{home}/.config/neuralkit/passkey.json")).ok()?;
-        serde_json::from_str(&raw).ok()
-    };
-    match read() {
-        Some(v) if v.get("gate").and_then(Value::as_str).is_some() => "key: Secure Enclave, behind a person".into(),
-        Some(v) if v.get("key").and_then(Value::as_str).is_some() => "key: software".into(),
-        Some(_) => "key: hardware (metadata only on disk)".into(),
-        None => "no passkey on this machine".into(),
+/// "2h 04m" / "3d" — coarse on purpose: a menu is a glance, not a clock.
+fn left(expires_ms: i64, now_ms: i64) -> String {
+    let mins = (expires_ms - now_ms).max(0) / 60_000;
+    match mins {
+        m if m >= 2880 => format!("{}d", m / 1440),
+        m if m >= 60 => format!("{}h {:02}m", m / 60, m % 60),
+        m => format!("{m}m"),
     }
 }
 
@@ -76,8 +108,6 @@ fn icon() -> Result<Icon> {
             rgba[i + 3] = 255;
         }
     };
-    // One period of a wave across the width, 2px thick — legible at 22px, unmistakable at a
-    // glance next to neighbouring template icons.
     for x in 2..W - 2 {
         let t = (x - 2) as f32 / (W - 5) as f32 * std::f32::consts::TAU;
         let y = (H as f32 / 2.0 - t.sin() * 6.0) as usize;
@@ -91,24 +121,75 @@ fn icon() -> Result<Icon> {
 /// process from here, which is what a menu-bar agent is.
 pub fn run(url: &str) -> Result<()> {
     let url = url.trim_end_matches('/').to_string();
+    let s = snapshot();
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let expired = s.expires_ms.is_some_and(|ms| ms <= now_ms);
 
     let menu = Menu::new();
-    let status = MenuItem::new(status_line(), false, None);
-    let key = MenuItem::new(key_line(), false, None);
+
+    // ── the session — transient by nature ─────────────────────────────────
+    // Identity and liveness on ONE line: "signed in" is only claimed while the record's own
+    // deadline agrees. Nothing deletes credentials.json AT expiry — cleanup happens when
+    // the next command touches it — so a header trusting mere existence would say "signed
+    // in" for days after the session died.
+    // When it died, not just that it died — "expired" alone reads as an accusation; a
+    // timestamp reads as a fact. Local time, coarse to the minute: menus are glances.
+    let expired_at = s
+        .expires_ms
+        .filter(|_| expired)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string());
+    menu.append(&MenuItem::new(
+        match (&s.signed_in, &expired_at, s.expires_ms) {
+            (Some(w), Some(when), _) => format!("session expired {when} — was {w}"),
+            (Some(w), None, Some(ms)) => format!("signed in as {w} · {} left", left(ms, now_ms)),
+            (Some(w), None, None) => format!("signed in as {w}"),
+            (None, ..) => "signed out".into(),
+        },
+        false,
+        None,
+    ))
+    .context("menu")?;
+    // The exception, not the norm: set up = silence, absence = the one actionable line.
+    if s.totp == Some(false) {
+        menu.append(&MenuItem::new("authenticator app: not set up", false, None)).context("menu")?;
+    }
+
+    // ── this machine — the registration, which outlives sessions ─────────
+    menu.append(&PredefinedMenuItem::separator()).context("menu")?;
+    let tier = if s.gated { "Secure Enclave" } else { "software key" };
+    menu.append(&MenuItem::new(
+        match (&s.account, s.registered, s.has_software_key) {
+            (Some(a), true, _) => format!("registered to {a} · {tier}"),
+            (None, true, _) => format!("registered · {tier}"),
+            (_, false, true) => "passkey created, not registered".into(),
+            (_, false, false) => "no passkey yet".into(),
+        },
+        false,
+        None,
+    ))
+    .context("menu")?;
+
+    // The tray's one write. ON stores `biometry_or_watch` — the "never the password" gate
+    // the signed bundle proved against a real Watch. OFF removes the choice. A stored
+    // `user_presence`/`device_passcode` also shows checked: the box means "a hardware gate
+    // is chosen", and unchecking clears whichever it was.
+    let gate_toggle = CheckMenuItem::new("Require Apple Watch or Touch ID", true, s.gated, None);
+    menu.append(&gate_toggle).context("menu")?;
+    // The one fact a toggle cannot express: it decides which key signs NEXT time, so the
+    // server needs a re-register — and (today) the signed bundle to satisfy it.
+    menu.append(&MenuItem::new("  applies at next sign-in — re-register", false, None)).context("menu")?;
+
+    // ── actions ───────────────────────────────────────────────────────────
+    menu.append(&PredefinedMenuItem::separator()).context("menu")?;
     let open = MenuItem::new("Open neuralkit.ai", true, None);
     let quit = MenuItem::new("Quit", true, None);
-    menu.append_items(&[
-        &status,
-        &key,
-        &PredefinedMenuItem::separator(),
-        &open,
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])
-    .context("build tray menu")?;
+    menu.append(&open).context("menu")?;
+    menu.append(&quit).context("menu")?;
 
     let open_id = open.id().clone();
     let quit_id = quit.id().clone();
+    let gate_id = gate_toggle.id().clone();
     let icon = icon()?;
 
     // The icon must be created AFTER the event loop starts on macOS — tray-icon's own
@@ -136,7 +217,16 @@ pub fn run(url: &str) -> Result<()> {
         }
 
         if let Ok(e) = menu_events.try_recv() {
-            if e.id() == &open_id {
+            if e.id() == &gate_id {
+                // The item has already toggled itself by the time the event arrives, so its
+                // state IS the user's answer — persist it through the same single write
+                // path the CLI uses, and let the caption explain when it bites.
+                let on = gate_toggle.is_checked();
+                if let Err(err) = crate::passkey::set_gate(if on { Some("biometry_or_watch") } else { None }) {
+                    eprintln!("could not store the gate choice: {err:#}");
+                    gate_toggle.set_checked(!on);
+                }
+            } else if e.id() == &open_id {
                 // Same shape login.rs uses for the browser path — macOS's `open`, no crate.
                 let _ = std::process::Command::new("open").arg(&url).spawn();
             } else if e.id() == &quit_id {
