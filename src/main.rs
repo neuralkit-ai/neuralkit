@@ -774,19 +774,24 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     // Redirect tracing logs to a sink to prevent TUI corruption from background libraries
     // TUI owns the terminal — tracing goes to the debug log file instead of stdout.
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("neuralkit_debug.log")
-        .expect("open neuralkit_debug.log");
-    tracing_subscriber::fmt()
-        .with_writer(log_file)
-        .with_ansi(false)
-        .init();
-
-    let args = Args::parse();
+    // EXCEPT the icon-owned relay: it installs its own subscriber that fans tracing to
+    // attached lenses as RelayEvent::Log, so their log pane is as alive as an owner's.
+    let icon_relay = matches!(&args.command, Some(Command::Relay { icon: true, .. }));
+    if !icon_relay {
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("neuralkit_debug.log")
+            .expect("open neuralkit_debug.log");
+        tracing_subscriber::fmt()
+            .with_writer(log_file)
+            .with_ansi(false)
+            .init();
+    }
 
     // `neuralkit tray` — hands the main thread to the menu-bar event loop and never
     // comes back (AppKit requires thread 0, which block_on happens to be running on).

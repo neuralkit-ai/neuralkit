@@ -245,11 +245,43 @@ pub async fn run_icon(o: Opts) -> Result<()> {
     // Silent when beaten to the lock — the launcher already told the human.
     let Some(lock) = instance_lock()? else { return Ok(()) };
 
+    // The relay's birth, for every lens that ever attaches: uptime must be the
+    // RELAY's age, not the viewer's attachment age.
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
     // The event tap: the relay reports lifecycle on this channel; we keep a snapshot
     // and rebroadcast to every connected lens as JSON lines.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<phaze_relay::RelayEvent>();
     let mut cfg = config(&o);
-    cfg.events = Some(tx);
+    cfg.events = Some(tx.clone());
+
+    // This process owns the relay, so it owns the tracing too — fanned to every lens
+    // as Log events (main() skipped its file subscriber for exactly this mode). The
+    // moq stack's own lines (session accepted, negotiated, terminated) are the log
+    // pane's whole content; without this tap a lens shows an empty pane forever.
+    struct FanWriter(tokio::sync::mpsc::UnboundedSender<phaze_relay::RelayEvent>);
+    impl std::io::Write for FanWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            for line in String::from_utf8_lossy(data).lines() {
+                let line = line.trim_end();
+                if !line.is_empty() {
+                    let _ = self.0.send(phaze_relay::RelayEvent::Log { line: line.to_string() });
+                }
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let fan_tx = tx.clone();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(move || FanWriter(fan_tx.clone()))
+        .with_ansi(false)
+        .try_init();
 
     // The flock is held, so a stale socket file from a crash is ours to clear.
     let sock = sock_path()?;
@@ -265,6 +297,10 @@ pub async fn run_icon(o: Opts) -> Result<()> {
         ready: Option<String>,
         sessions: std::collections::BTreeSet<u64>,
         traffic: Option<(u64, u64)>,
+        // The pane's recent history — the standalone binary shows its ring from boot,
+        // and a lens deserves the same: boot lines are most of what a quiet relay ever
+        // says. Bounded well under the renderer's own 1000-line cap.
+        logs: std::collections::VecDeque<String>,
     }
     let snap = Arc::new(Mutex::new(Snap::default()));
     {
@@ -284,6 +320,14 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                         }
                         phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions } => {
                             s.traffic = Some((*broadcasts, *subscriptions))
+                        }
+                        // Synthesized by US into the replay, never received from the relay.
+                        phaze_relay::RelayEvent::Started { .. } => {}
+                        phaze_relay::RelayEvent::Log { line } => {
+                            s.logs.push_back(line.clone());
+                            while s.logs.len() > 300 {
+                                s.logs.pop_front();
+                            }
                         }
                     }
                 }
@@ -305,6 +349,8 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                     use tokio::io::AsyncWriteExt as _;
                     let mut w = stream;
                     let mut lines: Vec<String> = Vec::new();
+                    // Birth first, so the lens's uptime clock rebases before anything renders.
+                    lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Started { unix_ms: started_ms }).expect("json"));
                     if let Some(fp) = &replay.ready {
                         lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Ready { fingerprint: fp.clone() }).expect("json"));
                     }
@@ -313,6 +359,9 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                     }
                     if let Some((broadcasts, subscriptions)) = replay.traffic {
                         lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions }).expect("json"));
+                    }
+                    for l in &replay.logs {
+                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Log { line: l.clone() }).expect("json"));
                     }
                     for l in lines {
                         if w.write_all(l.as_bytes()).await.is_err() || w.write_all(b"\n").await.is_err() {
