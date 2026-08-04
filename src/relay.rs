@@ -295,7 +295,10 @@ pub async fn run_icon(o: Opts) -> Result<()> {
     #[derive(Default, Clone)]
     struct Snap {
         ready: Option<String>,
-        sessions: std::collections::BTreeSet<u64>,
+        // id → carriage ("WebTransport" / "raw QUIC"), mirroring what the dashboard
+        // shows — a late lens must learn HOW each live session arrived, not just that
+        // it exists.
+        sessions: std::collections::BTreeMap<u64, String>,
         traffic: Option<(u64, u64)>,
         // The pane's recent history — the standalone binary shows its ring from boot,
         // and a lens deserves the same: boot lines are most of what a quiet relay ever
@@ -312,8 +315,8 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                     let mut s = snap.lock().expect("snap");
                     match &ev {
                         phaze_relay::RelayEvent::Ready { fingerprint } => s.ready = Some(fingerprint.clone()),
-                        phaze_relay::RelayEvent::SessionUp { id } => {
-                            s.sessions.insert(*id);
+                        phaze_relay::RelayEvent::SessionUp { id, transport } => {
+                            s.sessions.insert(*id, transport.clone());
                         }
                         phaze_relay::RelayEvent::SessionDown { id } => {
                             s.sessions.remove(id);
@@ -354,8 +357,14 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                     if let Some(fp) = &replay.ready {
                         lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Ready { fingerprint: fp.clone() }).expect("json"));
                     }
-                    for id in &replay.sessions {
-                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::SessionUp { id: *id }).expect("json"));
+                    for (id, transport) in &replay.sessions {
+                        lines.push(
+                            serde_json::to_string(&phaze_relay::RelayEvent::SessionUp {
+                                id: *id,
+                                transport: transport.clone(),
+                            })
+                            .expect("json"),
+                        );
                     }
                     if let Some((broadcasts, subscriptions)) = replay.traffic {
                         lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions }).expect("json"));
