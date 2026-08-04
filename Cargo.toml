@@ -67,7 +67,9 @@ tracing-subscriber = "0.3"
 # FlatBuffers NeuroFrame (browser-facing eeg track).
 prost = "0.13"
 flatbuffers = "25"
-phaze-relay = { version = "0.1.0", path = "../phaze/crates/phaze-relay", default-features = false }
+# `tui` on: --foreground shows the SAME live relay dashboard the standalone binary
+# draws (lib-exported for exactly this embedder). The icon path stays headless.
+phaze-relay = { version = "0.1.0", path = "../phaze/crates/phaze-relay", default-features = false, features = ["tui"] }
 # DROPPED vs neurosky-rs: serde (no direct usage — leftover).
 # DROPPED vs the old placeholder: bollard (Docker client), color-eyre,
 # itertools, palette (all chart-demo-only cruft).

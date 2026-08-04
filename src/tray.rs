@@ -184,6 +184,7 @@ pub fn relay_icon(
     menu.append(&MenuItem::new(format!("relay — {bind}"), false, None)).context("menu")?;
     menu.append(&MenuItem::new(format!("logs: {}", crate::relay::log_path().unwrap_or_default()), false, None))
         .context("menu")?;
+    menu.append(&MenuItem::new("view: run `neuralkit relay` in a terminal", false, None)).context("menu")?;
     menu.append(&PredefinedMenuItem::separator()).context("menu")?;
     let quit = MenuItem::new("Quit relay", true, None);
     menu.append(&quit).context("menu")?;

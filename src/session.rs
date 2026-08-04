@@ -37,6 +37,7 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("dash", "open the EEG dashboard — Q returns here", None),
     ("tray", "put the status icon in the menu bar", None),
+    ("relay", "start the local relay under its own icon", None),
     ("list", "list all users", Some("admin")),
     ("help", "show this table", None),
     ("logout", "end this session and forget it", None),
@@ -283,6 +284,16 @@ pub async fn run() -> Result<Next> {
                 }
                 #[cfg(not(target_os = "macos"))]
                 println!("  {} the tray is macOS-only for now", style::red("✗"));
+            }
+            // Same spawn shape as `tray`: the relay's ring icon owns its lifetime, the
+            // REPL only asks for it to exist. `launch` reports an already-running one.
+            "relay" => {
+                #[cfg(target_os = "macos")]
+                if let Err(e) = crate::relay::launch(&Default::default()) {
+                    println!("  {} could not start the relay: {e:#}", style::red("✗"));
+                }
+                #[cfg(not(target_os = "macos"))]
+                println!("  {} the icon-owned relay is macOS-only — run `neuralkit relay` in a terminal", style::red("✗"));
             }
             "help" => {
                 println!();

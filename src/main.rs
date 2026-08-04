@@ -118,10 +118,13 @@ enum Command {
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
     },
-    /// The local MoQ relay — spawned into its own menu-bar icon, which owns its lifetime.
+    /// A MoQ relay of your own — loopback for dev, LAN for a lab; Cloudflare's is the
+    /// hosted default.
     ///
-    /// Idempotent: run it again and it reports the relay that already exists. Quit is on
-    /// the icon's menu. `--foreground` keeps it in the terminal instead (debugging, SSH).
+    /// No modes, no flags: WHERE you run it decides its face. A terminal gets the live
+    /// relay dashboard and owns it (q stops it). The REPL's `relay` command starts it
+    /// detached under its own menu-bar icon — the icon is then the truth, its Quit the
+    /// stop. Piped, it runs headless in-process: the systemd/launchd service shape.
     Relay {
         /// QUIC/WebTransport listener address.
         #[arg(long, default_value = "[::]:4443")]
@@ -132,9 +135,6 @@ enum Command {
         /// Hostname for the self-signed dev certificate.
         #[arg(long, default_value = "localhost")]
         tls_generate: String,
-        /// Own the terminal instead of the menu bar — Ctrl-C stops it.
-        #[arg(long)]
-        foreground: bool,
         /// Internal: this IS the spawned icon-owned process.
         #[arg(long, hide = true)]
         icon: bool,
@@ -807,9 +807,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // `neuralkit relay` — the launcher spawns the icon-owned process and returns; the
-    // hidden --icon mode IS that process; --foreground trades the icon for the terminal.
-    if let Some(Command::Relay { bind, cert_listen, tls_generate, foreground, icon }) = &args.command {
+    // `neuralkit relay` — the context decides its face: a terminal gets the live
+    // dashboard and owns the relay; piped runs headless IN-PROCESS (what a systemd/
+    // launchd unit expects to supervise — a self-detaching service reads as died);
+    // the hidden --icon mode IS the detached process the REPL/tray spawn.
+    if let Some(Command::Relay { bind, cert_listen, tls_generate, icon }) = &args.command {
         let opts = relay::Opts {
             bind: *bind,
             cert_listen: *cert_listen,
@@ -818,17 +820,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         let outcome = if *icon {
             relay::run_icon(opts).await
-        } else if *foreground {
-            relay::run_foreground(opts).await
         } else {
-            relay::launch(&opts)
+            relay::run_attended(opts).await
         };
-        // No menu bar exists off macOS, so the terminal is the only owner there.
+        // No menu bar exists off macOS — the terminal (or the service manager) owns it.
         #[cfg(not(target_os = "macos"))]
         let outcome = {
             let _ = icon;
-            let _ = foreground;
-            relay::run_foreground(opts).await
+            relay::run_attended(opts).await
         };
         if let Err(e) = outcome {
             eprintln!("relay failed: {e:#}");

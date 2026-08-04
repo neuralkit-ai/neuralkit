@@ -1,19 +1,21 @@
-//! `neuralkit relay` — the local MoQ relay, owned by its own menu-bar icon.
+//! `neuralkit relay` — a MoQ relay of your own: loopback for dev, LAN for a lab.
 //!
-//! THE LAUNCHER SHAPE. `neuralkit relay` is idempotent "make the relay exist": it spawns
-//! the real process detached (the hidden `--icon` mode), says where it lives, and gives
-//! the terminal back. The icon IS the lifetime — its Quit is the stop button — the same
-//! contract the status tray set: one icon, one process, one truth. Running it again
-//! reports "already running" instead of a second relay.
+//! WHO THIS IS FOR. The hosted default is Cloudflare's relay; this command is the
+//! ON-PREMISE story — a research lab or partner running the relay on their own machine
+//! so the EEG pipeline (rigs publish, viewers subscribe) never leaves their network.
+//! Dev's loopback relay is just the smallest deployment of the same thing.
 //!
-//! `--foreground` keeps terminal ownership for the two citizens an icon cannot serve:
-//! debugging (live logs on stdout) and SSH/headless, where no GUI exists to hold an icon
-//! — the same bottom-row rule the sign-in paths follow. One flock covers every mode, so
-//! there is exactly one relay however it was started.
+//! NO MODES, NO FLAGS — where you run it decides its face:
+//!   terminal   → the live relay dashboard (the same one the standalone binary draws),
+//!                and the terminal visibly owns the lifetime: q stops the relay.
+//!   REPL/tray  → detached under its own ring icon; the icon is the truth, its Quit is
+//!                the stop. One icon, one process — the status-tray contract.
+//!   piped      → headless IN-PROCESS — the systemd/launchd/service shape a lab runs;
+//!                a service manager owns its process, so no self-detaching here.
 //!
-//! This is deliberately NOT a child of the status tray. Each icon owns exactly its own
-//! process; the status tray stays a read-only card. Folding the fleet under one icon is
-//! the desktop app's job, when it exists.
+//! One flock covers every face, so there is exactly one relay however it was started.
+//! Deliberately NOT a child of the status tray; folding the fleet under one icon is the
+//! desktop app's job, when it exists.
 
 use anyhow::{Context, Result};
 
@@ -21,6 +23,18 @@ pub struct Opts {
     pub bind: std::net::SocketAddr,
     pub cert_listen: std::net::SocketAddr,
     pub tls_generate: String,
+}
+
+impl Default for Opts {
+    /// Mirrors the clap defaults on the `relay` subcommand (main.rs), which stay the
+    /// authority — this exists for spawn sites (the REPL) that never touch clap.
+    fn default() -> Self {
+        Self {
+            bind: "[::]:4443".parse().expect("static addr"),
+            cert_listen: "[::]:4444".parse().expect("static addr"),
+            tls_generate: "localhost".into(),
+        }
+    }
 }
 
 fn dir() -> Result<String> {
@@ -55,8 +69,9 @@ pub fn is_running() -> bool {
 fn config(o: &Opts) -> phaze_relay::RelayConfig {
     phaze_relay::RelayConfig {
         bind: Some(o.bind),
-        // `tls::Args` derives Default (all-empty PEM lists), which is exactly "no real
-        // certs" — tls_generate below is what makes local TLS exist.
+        // `tls::Args` derives Default (all-empty PEM lists) — "no real certs"; the
+        // self-signed `tls_generate` below is what makes local TLS exist. Real-cert
+        // flags for on-premise relays arrive when a lab actually needs them.
         tls: Default::default(),
         tls_generate: Some(o.tls_generate.clone()),
         cert_listen: Some(o.cert_listen),
@@ -64,26 +79,120 @@ fn config(o: &Opts) -> phaze_relay::RelayConfig {
     }
 }
 
-/// `--foreground`: the terminal owns it, Ctrl-C stops it. The only shape on platforms
-/// with no menu bar, and the debugging shape everywhere.
-pub async fn run_foreground(o: Opts) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let _lock = match instance_lock()? {
-        Some(l) => l,
-        None => {
-            println!("  the relay is already running");
-            return Ok(());
-        }
-    };
-    println!(
-        "  {} {}",
-        crate::style::bold("neuralkit"),
-        crate::style::dim(&format!("· relay on {} · cert hash on {} · Ctrl-C to stop", o.bind, o.cert_listen)),
-    );
-    phaze_relay::run(config(&o)).await.map_err(|e| anyhow::anyhow!("{e:#}"))
+#[cfg(target_os = "macos")]
+fn sock_path() -> Result<String> {
+    Ok(format!("{}/relay.sock", dir()?))
 }
 
-/// The launcher: spawn the icon-owned relay detached and come straight back.
+/// `neuralkit relay`, attended — THE MODEL: the icon owns, the terminal is a LENS.
+///
+/// In a terminal: make sure the icon-owned relay exists (start it if absent), then
+/// attach the live dashboard to its event socket. q / Ctrl-C / closing the terminal
+/// closes the LENS ONLY — the relay and its icon do not notice. Run the command again
+/// any time to look again. The icon's Quit is the one real stop.
+///
+/// Piped (systemd/launchd/CI): headless IN-PROCESS — a service manager expects to own
+/// its process, and a self-detaching service reads as died.
+pub async fn run_attended(o: Opts) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            if !is_running() {
+                launch(&o)?;
+            }
+            return match attach(&o).await {
+                Ok(()) => Ok(()),
+                Err(attach_err) => {
+                    // No GUI to hold an icon (SSH), or a relay predating the socket:
+                    // fall back to OWNING it in this terminal — but only if nothing
+                    // else holds the relay.
+                    match instance_lock()? {
+                        Some(_lock) => {
+                            eprintln!(
+                                "  {}",
+                                crate::style::dim(&format!("no attachable relay ({attach_err:#}) — owning it in this terminal instead")),
+                            );
+                            phaze_relay::tui::run(config(&o)).await.map_err(|e| anyhow::anyhow!("{e:#}"))
+                        }
+                        None => Err(attach_err),
+                    }
+                }
+            };
+        }
+        let _lock = match instance_lock()? {
+            Some(l) => l,
+            None => {
+                println!("  the relay is already running");
+                return Ok(());
+            }
+        };
+        println!(
+            "  {} {}",
+            crate::style::bold("neuralkit"),
+            crate::style::dim(&format!("· relay on {} · cert hash on {} · Ctrl-C to stop", o.bind, o.cert_listen)),
+        );
+        return phaze_relay::run(config(&o)).await.map_err(|e| anyhow::anyhow!("{e:#}"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return phaze_relay::tui::run(config(&o)).await.map_err(|e| anyhow::anyhow!("{e:#}"));
+        }
+        println!(
+            "  {} {}",
+            crate::style::bold("neuralkit"),
+            crate::style::dim(&format!("· relay on {} · cert hash on {} · Ctrl-C to stop", o.bind, o.cert_listen)),
+        );
+        phaze_relay::run(config(&o)).await.map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
+}
+
+/// Attach the dashboard lens to the running icon-owned relay: connect its event
+/// socket, deserialize the stream, and hand it to the SAME renderer the standalone
+/// binary uses. Retries briefly because the icon process may still be booting.
+#[cfg(target_os = "macos")]
+async fn attach(o: &Opts) -> Result<()> {
+    use tokio::io::AsyncBufReadExt as _;
+    let sock = sock_path()?;
+    let mut tries = 0u32;
+    let stream = loop {
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(s) => break s,
+            Err(_) if tries < 30 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("could not reach the relay's event socket: {e}")),
+        }
+    };
+    let (vtx, vrx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if let Ok(ev) = serde_json::from_str::<phaze_relay::RelayEvent>(&l) {
+                if vtx.send(ev).is_err() {
+                    break;
+                }
+            }
+        }
+        // Sender drops here: the view sees the stream end (relay quit) and exits
+        // cleanly instead of rendering a corpse.
+    });
+    phaze_relay::tui::view(o.bind.to_string(), Some(o.cert_listen), vrx)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    println!(
+        "  {} {}",
+        crate::style::green("✓"),
+        crate::style::dim("view closed — the relay keeps running under its icon (`neuralkit relay` to look again)"),
+    );
+    Ok(())
+}
+
+/// The launcher: spawn the icon-owned relay detached and come straight back. The
+/// REPL's `relay` command and the status tray are its callers — always the LOCAL
+/// self-signed shape (no PEM forwarding): an on-premise relay with real certs is a
+/// service or an attended terminal, not a click.
 #[cfg(target_os = "macos")]
 pub fn launch(o: &Opts) -> Result<()> {
     if is_running() {
@@ -126,20 +235,116 @@ pub fn launch(o: &Opts) -> Result<()> {
     Ok(())
 }
 
-/// The spawned process: run the relay as a task, stand in the menu bar for its lifetime.
+/// The spawned process: run the relay as a task, stand in the menu bar for its
+/// lifetime, and serve the event stream to any attached lens.
 #[cfg(target_os = "macos")]
 pub async fn run_icon(o: Opts) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     // Silent when beaten to the lock — the launcher already told the human.
     let Some(lock) = instance_lock()? else { return Ok(()) };
-    let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The event tap: the relay reports lifecycle on this channel; we keep a snapshot
+    // and rebroadcast to every connected lens as JSON lines.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<phaze_relay::RelayEvent>();
+    let mut cfg = config(&o);
+    cfg.events = Some(tx);
+
+    // The flock is held, so a stale socket file from a crash is ours to clear.
+    let sock = sock_path()?;
+    let _ = std::fs::remove_file(&sock);
+    let listener = tokio::net::UnixListener::bind(&sock).context("bind relay.sock")?;
+    let (fan, _) = tokio::sync::broadcast::channel::<String>(512);
+
+    // A lens can attach at ANY time, so events alone are not enough — a viewer joining
+    // an hour in would see an empty dashboard over a busy relay. Keep the truth
+    // (ready + live sessions + last traffic) and replay it as synthetic events first.
+    #[derive(Default, Clone)]
+    struct Snap {
+        ready: Option<String>,
+        sessions: std::collections::BTreeSet<u64>,
+        traffic: Option<(u64, u64)>,
+    }
+    let snap = Arc::new(Mutex::new(Snap::default()));
+    {
+        let fan = fan.clone();
+        let snap = snap.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                {
+                    let mut s = snap.lock().expect("snap");
+                    match &ev {
+                        phaze_relay::RelayEvent::Ready { fingerprint } => s.ready = Some(fingerprint.clone()),
+                        phaze_relay::RelayEvent::SessionUp { id } => {
+                            s.sessions.insert(*id);
+                        }
+                        phaze_relay::RelayEvent::SessionDown { id } => {
+                            s.sessions.remove(id);
+                        }
+                        phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions } => {
+                            s.traffic = Some((*broadcasts, *subscriptions))
+                        }
+                    }
+                }
+                if let Ok(line) = serde_json::to_string(&ev) {
+                    let _ = fan.send(line);
+                }
+            }
+        });
+    }
+    {
+        let snap = snap.clone();
+        let fan = fan.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let mut live = fan.subscribe();
+                let replay = snap.lock().expect("snap").clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    let mut w = stream;
+                    let mut lines: Vec<String> = Vec::new();
+                    if let Some(fp) = &replay.ready {
+                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Ready { fingerprint: fp.clone() }).expect("json"));
+                    }
+                    for id in &replay.sessions {
+                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::SessionUp { id: *id }).expect("json"));
+                    }
+                    if let Some((broadcasts, subscriptions)) = replay.traffic {
+                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions }).expect("json"));
+                    }
+                    for l in lines {
+                        if w.write_all(l.as_bytes()).await.is_err() || w.write_all(b"\n").await.is_err() {
+                            return;
+                        }
+                    }
+                    loop {
+                        match live.recv().await {
+                            Ok(l) => {
+                                if w.write_all(l.as_bytes()).await.is_err() || w.write_all(b"\n").await.is_err() {
+                                    return;
+                                }
+                            }
+                            // A slow lens that lagged the ring just misses a few
+                            // frames — the next Traffic tick corrects the picture.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let dead = Arc::new(AtomicBool::new(false));
     let flag = dead.clone();
-    let cfg = config(&o);
     tokio::spawn(async move {
         if let Err(e) = phaze_relay::run(cfg).await {
             // The log file is this process's only voice — say why before the icon goes.
             eprintln!("relay died: {e:#}");
         }
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        flag.store(true, Ordering::Relaxed);
     });
     crate::tray::relay_icon(o.bind.to_string(), lock, dead)
 }
