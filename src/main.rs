@@ -10,6 +10,8 @@ mod session;
 mod style;
 mod signal_processing;
 mod streaming;
+#[cfg(target_os = "macos")]
+mod tray;
 mod tui;
 
 use signal_processing::{BandData, SLIDING_WINDOW_STEP, WINDOW_SIZE};
@@ -106,6 +108,15 @@ enum Command {
     /// Authentication — sign in and manage credentials.
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// A menu-bar icon for this machine — status at a glance. Runs until quit.
+    ///
+    /// v0 is read-only: who is signed in, which tier of key this machine holds, and the
+    /// site a click away. It starts no ceremonies — those arrive with the desktop app.
+    Tray {
+        /// The site the "Open" item points at.
+        #[arg(long, default_value = "https://neuralkit.ai")]
+        url: String,
+    },
 }
 
 /// The two halves of a native passkey. Separate verbs because they are separate acts: one
@@ -754,6 +765,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // `neuralkit tray` — hands the main thread to the menu-bar event loop and never
+    // comes back (AppKit requires thread 0, which block_on happens to be running on).
+    if let Some(Command::Tray { url }) = &args.command {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = tray::run(url) {
+                eprintln!("tray failed: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = url;
+            eprintln!("the tray is macOS-only for now");
+            std::process::exit(1);
+        }
+    }
 
     // `neuralkit auth login` — the passkey QR device flow owns stdout until the
     // token lands, then enters the interactive session (session.rs: the sealed
