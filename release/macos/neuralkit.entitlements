@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Every entitlement claimed here must be authorized by the embedded provisioning
+	     profile, or AMFI kills the process at launch (measured: exit 137 — see
+	     phaze-auth/src/enclave.rs header). Both profiles ("Neuralkit CLI Dev" and
+	     "Neuralkit CLI Developer ID") grant all three; verified by decoding the files
+	     with `security cms -D -i`. -->
+	<key>com.apple.application-identifier</key>
+	<string>SBG7YFF24U.ai.neuralkit.cli</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>SBG7YFF24U</string>
+	<!-- The one that matters: what lets a persisted Secure Enclave key carry an access
+	     control (Watch / Touch ID / PIN). Team-prefixed, and it must match the App ID —
+	     a bare `ai.neuralkit.cli` here is the -34018 trap. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>SBG7YFF24U.ai.neuralkit.cli</string>
+	</array>
+</dict>
+</plist>
