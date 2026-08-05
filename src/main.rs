@@ -75,6 +75,12 @@ pub enum Menu {
     Transport,
 }
 
+/// Clap defaults, as consts so the bare-invocation check compares against the
+/// SAME strings the parser fills in — a drifted literal would silently kill the menu.
+const DEFAULT_PORT: &str = "/dev/cu.usbmodem8D762F6448571";
+const DEFAULT_RELAY_URL: &str = "https://127.0.0.1:4443";
+const DEFAULT_STREAM_PATH: &str = "neuralkit";
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -83,7 +89,7 @@ struct Args {
     command: Option<Command>,
 
     /// Serial port to connect to
-    #[arg(default_value = "/dev/cu.usbmodem8D762F6448571")]
+    #[arg(default_value = DEFAULT_PORT)]
     port: String,
 
     /// Run in synthetic data mode
@@ -92,11 +98,11 @@ struct Args {
 
     /// MoQ Relay URL (defaults to the local phaze-relay; pass a public relay
     /// like https://relay.cloudflare.mediaoverquic.com to go remote)
-    #[arg(short = 'u', long, default_value = "https://127.0.0.1:4443")]
+    #[arg(short = 'u', long, default_value = DEFAULT_RELAY_URL)]
     stream_url: String,
 
     /// MoQ Broadcast Path (e.g. neuralkit)
-    #[arg(long, default_value = "neuralkit")]
+    #[arg(long, default_value = DEFAULT_STREAM_PATH)]
     stream_path: String,
 
     /// Run as a subscriber to view the stream
@@ -113,11 +119,7 @@ enum Command {
     ///
     /// v0 is read-only: who is signed in, which tier of key this machine holds, and the
     /// site a click away. It starts no ceremonies — those arrive with the desktop app.
-    Tray {
-        /// The site the "Open" item points at.
-        #[arg(long, default_value = "https://neuralkit.ai")]
-        url: String,
-    },
+    Tray,
     /// A MoQ relay of your own — loopback for dev, LAN for a lab; Cloudflare's is the
     /// hosted default.
     ///
@@ -803,10 +805,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `neuralkit tray` — hands the main thread to the menu-bar event loop and never
     // comes back (AppKit requires thread 0, which block_on happens to be running on).
-    if let Some(Command::Tray { url }) = &args.command {
+    if let Some(Command::Tray) = &args.command {
         #[cfg(target_os = "macos")]
         {
-            if let Err(e) = tray::run(url) {
+            if let Err(e) = tray::run() {
                 eprintln!("tray failed: {e:#}");
                 std::process::exit(1);
             }
@@ -814,7 +816,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = url;
             eprintln!("the tray is macOS-only for now");
             std::process::exit(1);
         }
@@ -868,62 +869,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        if let Err(e) = login::run(url, method).await {
-            eprintln!("login failed: {e:#}");
-            std::process::exit(1);
-        }
-        // OFFERED ONCE, WHERE BOTH PATHS MEET. `login::run` returns the same way whether it
-        // took the four-call flow or the one-call one, so asking here covers both without the
-        // question living in two places. Only when the account has no authenticator — an
-        // account that already has one has nothing to answer.
-        //
-        // This replaces a printed pointer (`setup authenticator? neuralkit auth totp setup`).
-        // The pointer was deliberate — it kept a question out of a flow that ends cleanly — but
-        // a line of dim text is a path only someone already looking will find, and setup is the
-        // one thing a fresh machine most wants next.
-        if io::stdout().is_terminal() && io::stdin().is_terminal() && login::totp_enabled() == Some(false) {
-            // The SAME picker the sign-in menu uses — arrow keys, one highlighted row — so the
-            // two questions this command asks look like one thing. It runs OFF the async
-            // runtime for the same reason it does there: crossterm's event::read blocks.
-            let header = format!("  {} {}", style::bold("neuralkit"), style::dim("· one more thing"));
-            let picked = tokio::task::spawn_blocking(move || {
-                login::select(&header, &["set up an authenticator app", "skip — go to the terminal"])
-            })
-            .await;
-            if let Ok(Ok(Some(0))) = picked {
-                if let Err(e) = totp::setup(url).await {
-                    // Not fatal: the sign-in already succeeded, and setup can be run again by
-                    // name. Ending the session over a declined or mistyped code would throw
-                    // away the thing that worked.
-                    eprintln!("  totp setup failed: {e:#}");
-                }
-            }
-        }
-
-        if io::stdout().is_terminal() && io::stdin().is_terminal() {
-            // The REPL and the dashboard take turns owning the terminal: `dash` returns
-            // rather than launching, the dashboard runs with the REPL fully out of the
-            // way, and quitting it (Q) lands back at a fresh prompt — reconnected, since
-            // the sealed channel was closed on the way out.
-            loop {
-                match session::run().await {
-                    Ok(session::Next::Dash) => {
-                        if let Err(e) = run_dashboard(&args).await {
-                            // The dashboard restores the terminal on its own error paths;
-                            // this is insurance so a failure can't strand the REPL in raw
-                            // mode with no prompt.
-                            let _ = disable_raw_mode();
-                            eprintln!("  dashboard error: {e:#}");
-                        }
-                    }
-                    Ok(session::Next::Done) => break,
-                    Err(e) => {
-                        eprintln!("session error: {e:#}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
+        sign_in_flow(&args, url, method).await?;
         return Ok(());
     }
 
@@ -960,7 +906,229 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // BARE `neuralkit` = the front door, not the EEG dashboard. A fresh install
+    // typing the bare word must not land in a wave view (or a serial error) with
+    // zero orientation — the menu says what exists, and `dashboard` is one row
+    // away. Any EXPLICIT choice skips it — flags, a port, a subcommand — and so
+    // does a pipe: scripts keep the old direct-to-dashboard behavior exactly.
+    let bare = args.command.is_none()
+        && !args.synthetic
+        && !args.sub
+        && args.port == DEFAULT_PORT
+        && args.stream_url == DEFAULT_RELAY_URL
+        && args.stream_path == DEFAULT_STREAM_PATH;
+    if bare && io::stdout().is_terminal() && io::stdin().is_terminal() {
+        // The EXISTING auto sign-in path runs first — a bootstrapped machine passes
+        // through with zero questions (token reuse, or the registered passkey tried
+        // rather than offered), and login::run's own output IS the status display.
+        // The menu only adds what auth never had: the tray row.
+        login_and_offer("https://neuralkit.ai", None).await?;
+        match tokio::task::spawn_blocking(front_door).await? {
+            Ok(Some(FrontDoor::Dashboard)) => {} // falls through to the dashboard below
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                eprintln!("menu error: {e:#}");
+                return Ok(());
+            }
+        }
+    }
+
     run_dashboard(&args).await
+}
+
+/// What the front door hands back to main — only the rows that TAKE OVER the
+/// terminal leave the menu; `relay` and `tray` act in place and stay.
+enum FrontDoor {
+    Dashboard,
+}
+
+/// What each visible menu row DOES — Enter dispatches on the row's own tag,
+/// never its position.
+#[derive(Clone, Copy)]
+enum Row {
+    Dashboard,
+    Tray,
+    Quit,
+}
+
+/// The bare-`neuralkit` menu: ONE crossterm session, rows redrawn IN PLACE
+/// (`MoveUp` + `Clear(FromCursorDown)`, the same idiom `login::select` uses) —
+/// never re-entered, so acting on a row can't stack a second copy of the menu
+/// into the scrollback. The tray row is live state, styled by it: dim when off,
+/// bright with a ✓ when on — and the label is truthful immediately because the
+/// quiet spawns confirm the flock before returning.
+fn front_door() -> anyhow::Result<Option<FrontDoor>> {
+    use crossterm::{
+        cursor,
+        event::{self, Event as CtEvent, KeyCode as CtKey, KeyEventKind, KeyModifiers},
+        execute,
+        terminal::{disable_raw_mode as raw_off, enable_raw_mode as raw_on, Clear, ClearType},
+    };
+    use std::io::Write as _;
+
+    let mut out = io::stdout();
+    println!();
+    println!("  {} {}", style::bold("neuralkit"), style::dim("· what do you want to run?"));
+    println!();
+
+    let mut sel = 0usize;
+    let mut status = String::new();
+    raw_on()?;
+    execute!(out, cursor::Hide)?;
+    let outcome = (|| -> anyhow::Result<Option<FrontDoor>> {
+        loop {
+            // Labels are rebuilt EVERY frame — the tray row reads the flock each time,
+            // so a toggle redraws its truth in place instead of printing a fresh menu.
+            #[cfg(target_os = "macos")]
+            let tray_on = tray::is_running();
+            #[cfg(not(target_os = "macos"))]
+            let tray_on = false;
+            let tray_label = if tray_on { "tray ✓ — enabled" } else { "tray — select to turn on" };
+            // Auth already happened (the auto sign-in ran before this menu), so the
+            // rows are just the destinations. Tags rather than positions, so a
+            // future hidden row can never shift what Enter means.
+            let rows: Vec<(&str, bool, Row)> = vec![
+                ("dashboard", false, Row::Dashboard),
+                (tray_label, tray_on, Row::Tray),
+                ("quit", false, Row::Quit),
+            ];
+            sel = sel.min(rows.len() - 1);
+
+            // Raw mode means the terminal no longer translates \n, so rows need \r\n.
+            for (i, (label, bright, _)) in rows.iter().enumerate() {
+                if i == sel {
+                    print!("  {} {}\r\n", style::cyan("❯"), style::bold(label));
+                } else if *bright {
+                    print!("    {label}\r\n");
+                } else {
+                    print!("    {}\r\n", style::dim(label));
+                }
+            }
+            // One status row, always drawn (maybe empty) — keeps the frame height
+            // constant so the MoveUp count below never drifts.
+            print!("\r\n    {}\r\n", style::dim(&status));
+            out.flush()?;
+
+            let key = loop {
+                if let CtEvent::Key(k) = event::read()? {
+                    if k.kind != KeyEventKind::Release {
+                        break k;
+                    }
+                }
+            };
+            match key.code {
+                CtKey::Up | CtKey::Char('k') => sel = (sel + rows.len() - 1) % rows.len(),
+                CtKey::Down | CtKey::Char('j') => sel = (sel + 1) % rows.len(),
+                CtKey::Enter => match rows[sel].2 {
+                    Row::Dashboard => return Ok(Some(FrontDoor::Dashboard)),
+                    Row::Tray => {
+                        // The row's own state IS the feedback — ✓ appears or vanishes
+                        // on the very next frame. The status line speaks only when
+                        // something went WRONG.
+                        #[cfg(target_os = "macos")]
+                        {
+                            status = if tray_on {
+                                if tray::stop_running() {
+                                    String::new()
+                                } else {
+                                    "could not stop the tray — quit it from its menu".into()
+                                }
+                            } else {
+                                match tray::spawn_detached_quiet() {
+                                    tray::SpawnOutcome::Started | tray::SpawnOutcome::AlreadyRunning => String::new(),
+                                    tray::SpawnOutcome::Unconfirmed => "tray starting — give it a moment".into(),
+                                    tray::SpawnOutcome::Failed(e) => format!("tray failed: {e}"),
+                                }
+                            };
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            status = "the tray is macOS-only for now".into();
+                        }
+                    }
+                    Row::Quit => return Ok(None),
+                },
+                CtKey::Esc | CtKey::Char('q') => return Ok(None),
+                CtKey::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                _ => {}
+            }
+            // rows + the blank line + the status line.
+            execute!(out, cursor::MoveUp(rows.len() as u16 + 2), Clear(ClearType::FromCursorDown))?;
+        }
+    })();
+
+    execute!(out, cursor::Show)?;
+    raw_off()?;
+    println!();
+    outcome
+}
+
+/// Sign in + the one-time authenticator offer — the shared front half. The menu
+/// stops HERE and falls through to the dashboard (that's what the person came
+/// for); `neuralkit auth login` continues into the sealed REPL below.
+async fn login_and_offer(url: &str, method: Option<login::Method>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = login::run(url, method).await {
+        eprintln!("login failed: {e:#}");
+        std::process::exit(1);
+    }
+    // OFFERED ONCE, WHERE BOTH PATHS MEET. `login::run` returns the same way whether it
+    // took the four-call flow or the one-call one, so asking here covers both without the
+    // question living in two places. Only when the account has no authenticator — an
+    // account that already has one has nothing to answer.
+    if io::stdout().is_terminal() && io::stdin().is_terminal() && login::totp_enabled() == Some(false) {
+        // The SAME picker the sign-in menu uses — arrow keys, one highlighted row. It runs
+        // OFF the async runtime: crossterm's event::read blocks.
+        let header = format!("  {} {}", style::bold("neuralkit"), style::dim("· one more thing"));
+        let picked = tokio::task::spawn_blocking(move || {
+            login::select(&header, &["set up an authenticator app", "skip"])
+        })
+        .await;
+        if let Ok(Ok(Some(0))) = picked {
+            if let Err(e) = totp::setup(url).await {
+                // Not fatal: the sign-in already succeeded, and setup can be run again by
+                // name. Ending the session over a declined or mistyped code would throw
+                // away the thing that worked.
+                eprintln!("  totp setup failed: {e:#}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The whole sign-in arc — `login_and_offer`, then the sealed REPL with its
+/// dashboard hand-offs. Extracted from the `auth login` branch UNCHANGED so the
+/// menu's paths and the subcommand stay the same tested code, not flows that drift.
+async fn sign_in_flow(
+    args: &Args,
+    url: &str,
+    method: Option<login::Method>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    login_and_offer(url, method).await?;
+    if io::stdout().is_terminal() && io::stdin().is_terminal() {
+        // The REPL and the dashboard take turns owning the terminal: `dash` returns
+        // rather than launching, the dashboard runs with the REPL fully out of the
+        // way, and quitting it (Q) lands back at a fresh prompt — reconnected, since
+        // the sealed channel was closed on the way out.
+        loop {
+            match session::run().await {
+                Ok(session::Next::Dash) => {
+                    if let Err(e) = run_dashboard(args).await {
+                        // The dashboard restores the terminal on its own error paths;
+                        // this is insurance so a failure can't strand the REPL in raw
+                        // mode with no prompt.
+                        let _ = disable_raw_mode();
+                        eprintln!("  dashboard error: {e:#}");
+                    }
+                }
+                Ok(session::Next::Done) => break,
+                Err(e) => {
+                    eprintln!("session error: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The TUI dashboard — extracted from `main`'s tail so the REPL's `dash` command opens
@@ -1020,12 +1188,31 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Serial Port Setup (only for Publisher, non-synthetic)
     let mut port = if !args.sub && !parser.synthetic {
         let port_name = args.port.clone();
-        Some(
-            serialport::new(&port_name, 57600)
-                .timeout(Duration::from_millis(100))
-                .open()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-        )
+        match serialport::new(&port_name, 57600)
+            .timeout(Duration::from_millis(100))
+            .open()
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // The raw io::Error Debug-dump named neither the port nor a way out.
+                // Say WHICH device failed, keep the OS's reason, and hand over the
+                // two no-hardware paths instead of a struct.
+                println!();
+                println!("  {} no headset at {} — {}", style::red("✗"), style::bold(&port_name), e);
+                println!();
+                println!(
+                    "    plug in the NeuroSky, or name your device:  {}",
+                    style::bold("neuralkit /dev/cu.<your-headset>"),
+                );
+                println!(
+                    "    no hardware?  {} publishes a generated signal · {} views a live stream",
+                    style::bold("neuralkit --synthetic"),
+                    style::bold("neuralkit --sub"),
+                );
+                println!();
+                std::process::exit(1);
+            }
+        }
     } else {
         None
     };

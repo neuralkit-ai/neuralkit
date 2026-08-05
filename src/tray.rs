@@ -142,6 +142,102 @@ pub fn is_running() -> bool {
     matches!(instance_lock(), Ok(None))
 }
 
+/// Turn OFF a running tray from outside: the pid lives in the lock file (written
+/// by the holder at startup), SIGTERM asks it to leave, and the flock releasing is
+/// the proof it did — kernel truth, not a guess. False = nothing was running, or
+/// it didn't die within the grace window.
+pub fn stop_running() -> bool {
+    if !is_running() {
+        return false;
+    }
+    let Ok(home) = std::env::var("HOME") else { return false };
+    let Some(pid) = std::fs::read_to_string(format!("{home}/.config/neuralkit/tray.lock"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..20 {
+        if !is_running() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// What a detached spawn actually did — callers render it their own way (the REPL
+/// prints lines; the front-door menu writes an in-place status row).
+pub enum SpawnOutcome {
+    AlreadyRunning,
+    /// The child HOLDS THE LOCK — confirmed, not assumed. This is what makes a
+    /// menu label drawn immediately afterwards truthful (the naive version raced
+    /// the child's startup and redrew "off" over a tray that was coming up).
+    Started,
+    /// Spawned, but the lock didn't appear within the grace window.
+    Unconfirmed,
+    Failed(String),
+}
+
+/// Spawn the status tray detached and wait for the flock to CONFIRM it's up.
+pub fn spawn_detached_quiet() -> SpawnOutcome {
+    if is_running() {
+        return SpawnOutcome::AlreadyRunning;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return SpawnOutcome::Failed(e.to_string()),
+    };
+    use std::os::unix::process::CommandExt as _;
+    match std::process::Command::new(exe)
+        .arg("tray")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap on a throwaway thread so a menu-Quit before the parent exits
+            // doesn't leave a zombie at the table.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            for _ in 0..30 {
+                if is_running() {
+                    return SpawnOutcome::Started;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            SpawnOutcome::Unconfirmed
+        }
+        Err(e) => SpawnOutcome::Failed(e.to_string()),
+    }
+}
+
+/// The printing wrapper — the REPL's `tray` verb.
+pub fn spawn_detached() {
+    match spawn_detached_quiet() {
+        SpawnOutcome::AlreadyRunning => println!(
+            "  {} {}",
+            crate::style::green("✓"),
+            crate::style::dim("the tray is already in the menu bar"),
+        ),
+        SpawnOutcome::Started => println!(
+            "  {} {}",
+            crate::style::green("✓"),
+            crate::style::dim("tray is up — quit it from its menu"),
+        ),
+        SpawnOutcome::Unconfirmed => println!(
+            "  {} {}",
+            crate::style::green("✓"),
+            crate::style::dim("tray starting — icon should appear momentarily"),
+        ),
+        SpawnOutcome::Failed(e) => println!("  {} could not start the tray: {e}", crate::style::red("✗")),
+    }
+}
+
 /// The relay's glyph — a ring, distinct from the status card's waveform at a glance:
 /// two icons, two processes, two shapes.
 fn icon_ring() -> Result<Icon> {
@@ -229,13 +325,21 @@ pub fn relay_icon(
 
 /// Runs the menu bar item until Quit. Never returns on success — the event loop owns the
 /// process from here, which is what a menu-bar agent is.
-pub fn run(url: &str) -> Result<()> {
+pub fn run() -> Result<()> {
     // One tray per machine, enforced before anything touches the menu bar.
     let Some(lock) = instance_lock()? else {
         println!("  the tray is already in the menu bar");
         return Ok(());
     };
-    let url = url.trim_end_matches('/').to_string();
+    // The holder's PID goes INTO the lock file — that's what lets the front-door
+    // menu's toggle turn a tray OFF that it didn't spawn: read pid, SIGTERM, and
+    // confirm by the flock releasing (kernel truth). Always current: whoever holds
+    // the lock wrote it.
+    {
+        use std::io::Write as _;
+        let _ = lock.set_len(0);
+        let _ = write!(&lock, "{}", std::process::id());
+    }
     let s = snapshot();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
     let expired = s.expires_ms.is_some_and(|ms| ms <= now_ms);
@@ -297,12 +401,9 @@ pub fn run(url: &str) -> Result<()> {
 
     // ── actions ───────────────────────────────────────────────────────────
     menu.append(&PredefinedMenuItem::separator()).context("menu")?;
-    let open = MenuItem::new("Open neuralkit.ai", true, None);
     let quit = MenuItem::new("Quit", true, None);
-    menu.append(&open).context("menu")?;
     menu.append(&quit).context("menu")?;
 
-    let open_id = open.id().clone();
     let quit_id = quit.id().clone();
     let gate_id = gate_toggle.id().clone();
     let icon = icon()?;
@@ -344,9 +445,6 @@ pub fn run(url: &str) -> Result<()> {
                     eprintln!("could not store the gate choice: {err:#}");
                     gate_toggle.set_checked(!on);
                 }
-            } else if e.id() == &open_id {
-                // Same shape login.rs uses for the browser path — macOS's `open`, no crate.
-                let _ = std::process::Command::new("open").arg(&url).spawn();
             } else if e.id() == &quit_id {
                 // Dropping the TrayIcon is what removes it from the bar — exiting with it
                 // alive leaves a ghost icon until the system notices the process died.

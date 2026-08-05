@@ -193,6 +193,42 @@ async fn attach(o: &Opts) -> Result<()> {
 /// REPL's `relay` command and the status tray are its callers — always the LOCAL
 /// self-signed shape (no PEM forwarding): an on-premise relay with real certs is a
 /// service or an attended terminal, not a click.
+// The quiet launcher pair below lost its caller when the front-door menu dropped
+// its relay row (user call, 2026-08-05) — kept because it's the flock-CONFIRMED
+// spawn primitive any future silent surface (REPL, desktop app) wants, and
+// re-deriving the confirm-loop reasoning costs more than the dead bytes.
+#[allow(dead_code)]
+#[cfg(target_os = "macos")]
+pub enum LaunchOutcome {
+    AlreadyRunning,
+    /// The child holds the relay flock — confirmed up, safe to label immediately.
+    Started,
+    Unconfirmed,
+    Failed(String),
+}
+
+/// The silent core of `launch` — for surfaces where a println would tear a
+/// raw-mode frame; renders nothing, reports what CONFIRMED.
+#[allow(dead_code)]
+#[cfg(target_os = "macos")]
+pub fn launch_quiet(o: &Opts) -> LaunchOutcome {
+    if is_running() {
+        return LaunchOutcome::AlreadyRunning;
+    }
+    match spawn_icon_process(o) {
+        Ok(()) => {
+            for _ in 0..30 {
+                if is_running() {
+                    return LaunchOutcome::Started;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            LaunchOutcome::Unconfirmed
+        }
+        Err(e) => LaunchOutcome::Failed(format!("{e:#}")),
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn launch(o: &Opts) -> Result<()> {
     if is_running() {
@@ -203,6 +239,18 @@ pub fn launch(o: &Opts) -> Result<()> {
         );
         return Ok(());
     }
+    spawn_icon_process(o)?;
+    println!(
+        "  {} {}",
+        crate::style::green("✓"),
+        crate::style::dim(&format!("relay is up on {} — the ring icon owns it · logs: {}", o.bind, log_path()?)),
+    );
+    Ok(())
+}
+
+/// The bare spawn: detached icon-owned relay, stdio into the log file.
+#[cfg(target_os = "macos")]
+fn spawn_icon_process(o: &Opts) -> Result<()> {
     let exe = std::env::current_exe()?;
     // Logs survive the terminal that launched them — the icon has no stdout, so the file
     // IS the relay's voice. Append, so restarts tell one continuous story.
@@ -227,11 +275,6 @@ pub fn launch(o: &Opts) -> Result<()> {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    println!(
-        "  {} {}",
-        crate::style::green("✓"),
-        crate::style::dim(&format!("relay is up on {} — the ring icon owns it · logs: {}", o.bind, log_path()?)),
-    );
     Ok(())
 }
 
