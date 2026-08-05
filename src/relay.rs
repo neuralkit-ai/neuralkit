@@ -281,6 +281,10 @@ pub async fn run_icon(o: Opts) -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(move || FanWriter(fan_tx.clone()))
         .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,web_transport_quinn=error")),
+        )
         .try_init();
 
     // The flock is held, so a stale socket file from a crash is ours to clear.
@@ -299,7 +303,7 @@ pub async fn run_icon(o: Opts) -> Result<()> {
         // shows — a late lens must learn HOW each live session arrived, not just that
         // it exists.
         sessions: std::collections::BTreeMap<u64, String>,
-        traffic: Option<(u64, u64)>,
+        traffic: Option<(u64, u64, Vec<String>, Vec<String>)>,
         // The pane's recent history — the standalone binary shows its ring from boot,
         // and a lens deserves the same: boot lines are most of what a quiet relay ever
         // says. Bounded well under the renderer's own 1000-line cap.
@@ -321,8 +325,8 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                         phaze_relay::RelayEvent::SessionDown { id } => {
                             s.sessions.remove(id);
                         }
-                        phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions } => {
-                            s.traffic = Some((*broadcasts, *subscriptions))
+                        phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions, namespaces, tracks } => {
+                            s.traffic = Some((*broadcasts, *subscriptions, namespaces.clone(), tracks.clone()))
                         }
                         // Synthesized by US into the replay, never received from the relay.
                         phaze_relay::RelayEvent::Started { .. } => {}
@@ -366,8 +370,16 @@ pub async fn run_icon(o: Opts) -> Result<()> {
                             .expect("json"),
                         );
                     }
-                    if let Some((broadcasts, subscriptions)) = replay.traffic {
-                        lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Traffic { broadcasts, subscriptions }).expect("json"));
+                    if let Some((broadcasts, subscriptions, namespaces, tracks)) = replay.traffic {
+                        lines.push(
+                            serde_json::to_string(&phaze_relay::RelayEvent::Traffic {
+                                broadcasts,
+                                subscriptions,
+                                namespaces,
+                                tracks,
+                            })
+                            .expect("json"),
+                        );
                     }
                     for l in &replay.logs {
                         lines.push(serde_json::to_string(&phaze_relay::RelayEvent::Log { line: l.clone() }).expect("json"));

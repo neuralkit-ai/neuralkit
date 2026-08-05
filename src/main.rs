@@ -787,9 +787,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .append(true)
             .open("neuralkit_debug.log")
             .expect("open neuralkit_debug.log");
+        // A FILE surface — full RFC3339 stays (machine-parseable, timezone-
+        // explicit). The compact 12-hour LogTime is for display panes only.
         tracing_subscriber::fmt()
             .with_writer(log_file)
             .with_ansi(false)
+            // web_transport_quinn WARNs "failed to read capsule" on every CLEAN
+            // peer close — demoted to error by default (RUST_LOG overrides).
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,web_transport_quinn=error")),
+            )
             .init();
     }
 
