@@ -451,13 +451,17 @@ async fn choose_method(
     // A refusal falls through instead of dead-ending: a credential can be revoked
     // server-side, or the account deleted from under it, and the machine cannot know that
     // until it asks. Dropping to the other paths is what turns that from a lockout into a
-    // slower sign-in. The failed path is then dropped from the menu — offering it again
-    // after it just refused would only invite the same failure.
+    // slower sign-in. An ungated key that was refused is dropped from the menu — offering
+    // it again would only invite the same failure — but a GATED key earns a retry row
+    // below: that refusal is usually the Watch situation of the moment, fixable on the
+    // spot, and the person decides when to stop trying.
+    let mut machine_key_refused = false;
     if can_passkey {
         if passkey_approve(client, base_url, user_code).await? {
             return Ok(true)
         }
         can_passkey = false;
+        machine_key_refused = true;
         println!("  {}", crate::style::dim("this machine's passkey was refused — other ways in:"));
     }
 
@@ -491,13 +495,23 @@ async fn choose_method(
         labels.push("use this machine's passkey");
         paths.push(Method::Passkey);
     }
-    // THE LOCKED PATH STAYS ON THE MENU AS A RETRY. Dropping it entirely told the truth — the
-    // key cannot sign right now — but it also removed the option the person most likely wants:
-    // fetch the Watch and carry on. Re-checking at the moment they pick is what makes it a
-    // retry rather than a stale entry, since availability changes minute to minute.
-    if blocked.is_some() && crate::passkey::is_registered() {
-        labels.push("try again with my Apple Watch");
-        paths.push(Method::Passkey);
+    // THE LOCKED PATH STAYS ON THE MENU AS A RETRY — and it LEADS the menu. One label for
+    // every situation that involves fetching the Watch: blocked before trying, refused
+    // mid-attempt, or the unregistered CATCH-22 (registration itself needs the key to
+    // sign, so hiding the wait left "put it on — then try again" with no way to try
+    // again). First and pre-selected, because reconnecting the Watch is the primary
+    // action whenever the row exists — the other doors wait below. Re-checking at the
+    // moment it is picked is what makes it a retry rather than a stale entry, since
+    // availability changes minute to minute; an unregistered pick hands over to the QR
+    // once the Watch is found, so the register step can finally land.
+    let watch_row = if crate::passkey::is_registered() {
+        blocked.is_some() || (machine_key_refused && crate::passkey::gate_armed())
+    } else {
+        blocked.is_some()
+    };
+    if watch_row {
+        labels.insert(0, "connect to Apple Watch");
+        paths.insert(0, Method::Passkey);
     }
     if paths.len() == 1 {
         return Ok(false)
@@ -505,40 +519,56 @@ async fn choose_method(
 
     // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
     // event::read blocks, and this task is holding the SSE connection open.
+    // A LOOP, because the Watch row is a RETRY: a failed attempt returns to this menu — the
+    // person keeps trying until it signs, or picks another door, or declines. Every other
+    // row still decides once.
     let header = format!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim(&format!("· {who}")));
     let owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
-    let picked = tokio::task::spawn_blocking(move || {
-        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-        select(&header, &refs)
-    })
-    .await??;
+    loop {
+        let (h, o) = (header.clone(), owned.clone());
+        let picked = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = o.iter().map(String::as_str).collect();
+            select(&h, &refs)
+        })
+        .await??;
 
-    match picked.map(|i| paths[i]) {
-        Some(Method::Totp) => match &user {
-            Some(u) => totp_approve(client, base_url, user_code, u).await,
-            None => Ok(false),
-        },
-        Some(Method::Passkey) => {
-            // Asked AGAIN here, not reused from above: the menu may have been on screen a
-            // while, and the whole point of that entry is that the answer can have changed.
-            // Keep asking for a few seconds rather than answering once — a wrist raise, a
-            // Bluetooth reconnect and an unlock all take a moment, and the person has just
-            // told us they are fetching it.
-            // Two minutes. The person has just walked off to fetch the Watch, and a wrist
-            // raise, a Bluetooth reconnect and an unlock stack up on top of the walk. Giving up
-            // while they are still on their way back is the wrong failure, and Ctrl-C is always
-            // there for someone who changed their mind.
-            if let Some(why) = crate::passkey::wait_for_presence(120) {
-                println!();
-                println!("  {} {}", crate::style::red("✗"), crate::style::dim(why.lines().next().unwrap_or("still unavailable")));
-                println!();
-                return Ok(false)
+        return match picked.map(|i| paths[i]) {
+            Some(Method::Totp) => match &user {
+                Some(u) => totp_approve(client, base_url, user_code, u).await,
+                None => Ok(false),
+            },
+            Some(Method::Passkey) => {
+                // Asked AGAIN here, not reused from above: the menu may have been on screen a
+                // while, and the whole point of that entry is that the answer can have changed.
+                // Keep asking for a few seconds rather than answering once — a wrist raise, a
+                // Bluetooth reconnect and an unlock all take a moment, and the person has just
+                // told us they are fetching it.
+                // Two minutes. The person has just walked off to fetch the Watch, and a wrist
+                // raise, a Bluetooth reconnect and an unlock stack up on top of the walk. Giving up
+                // while they are still on their way back is the wrong failure, and Ctrl-C is always
+                // there for someone who changed their mind.
+                if let Some(why) = crate::passkey::wait_for_presence(120) {
+                    println!();
+                    println!("  {} {}", crate::style::red("✗"), crate::style::dim(why.lines().next().unwrap_or("still unavailable")));
+                    continue
+                }
+                if !crate::passkey::is_registered() {
+                    // Watch found, but there is no credential to assert yet — Ok(false)
+                    // means "use the QR", and THAT flow registers this machine now that
+                    // the key can sign.
+                    return Ok(false)
+                }
+                if passkey_approve(client, base_url, user_code).await? {
+                    return Ok(true)
+                }
+                // The ✗ and its reason were just printed by the attempt itself — nothing to
+                // add; the reappearing menu IS the "again, or another way?" question.
+                continue
             }
-            passkey_approve(client, base_url, user_code).await
+            Some(Method::Email) => email_approve(client, base_url, user_code).await,
+            Some(Method::Browser) => browser_approve(base_url, user_code),
+            _ => Ok(false),
         }
-        Some(Method::Email) => email_approve(client, base_url, user_code).await,
-        Some(Method::Browser) => browser_approve(base_url, user_code),
-        _ => Ok(false),
     }
 }
 

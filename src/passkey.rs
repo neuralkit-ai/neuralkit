@@ -63,6 +63,22 @@ fn stored_gate() -> Option<phaze_auth::enclave::Gate> {
     }
 }
 
+/// Whether a hardware gate is CHOSEN on this machine — nothing about whether it can be
+/// satisfied right now. The sign-in menu reads this to decide if a refused machine key
+/// deserves a "connect to Apple Watch" retry row: a gated refusal is usually the Watch
+/// situation of the moment; an ungated one is a revoked credential, where retrying only
+/// invites the same failure.
+pub(crate) fn gate_armed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        stored_gate().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// The chosen factor, IF this Mac can still satisfy it right now. Asked at use — a Watch off
 /// the wrist is not available, and a gate that cannot be met would lock someone out of their
 /// own terminal rather than protect it.
