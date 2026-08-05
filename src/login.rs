@@ -86,7 +86,14 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.unwrap_or(user)));
             println!("  {}", crate::style::dim("cli registered"));
             if crate::passkey::is_registered() {
-                println!("  {}", crate::style::dim("passkey registered"));
+                println!(
+                "  {}",
+                crate::style::dim(if crate::passkey::gate_armed() {
+                    "passkey registered · Secure Enclave"
+                } else {
+                    "passkey registered"
+                }),
+            );
             }
             if totp == Some(true) {
                 println!("  {}", crate::style::dim("authenticator registered"));
@@ -248,7 +255,14 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                     // that has one from a machine that never got one. A sign-in should state
                     // where you stand, not just what happened in the last few seconds.
                     if crate::passkey::is_registered() {
-                        println!("  {}", crate::style::dim("passkey registered"));
+                        println!(
+                "  {}",
+                crate::style::dim(if crate::passkey::gate_armed() {
+                    "passkey registered · Secure Enclave"
+                } else {
+                    "passkey registered"
+                }),
+            );
                     }
                     if totp_enabled == Some(true) {
                         println!("  {}", crate::style::dim("authenticator registered"));
