@@ -39,6 +39,9 @@ cp "$BIN" "$APP/Contents/MacOS/neuralkit"
 # The bundle's own copy is what AMFI reads — nothing needs installing in Settings,
 # which also means a tester's Mac needs nothing pre-installed.
 cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+# The profile was downloaded by a browser, so its copy inherits com.apple.quarantine
+# (and friends) — strip them so the bit never rides inside a distributed bundle.
+xattr -c "$APP/Contents/embedded.provisionprofile" 2>/dev/null || true
 
 # Version from Cargo.toml, so the bundle never drifts from the crate.
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$HERE/../../Cargo.toml" | head -1)

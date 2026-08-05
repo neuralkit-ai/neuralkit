@@ -2,7 +2,7 @@
 name = "neuralkit"
 version = "0.1.0"
 edition = "2024"
-description = "A simple neural network toolkit / building blocks for neural networks in Rust"
+description = "The terminal client for the Neuralkit platform: real-time EEG acquisition, streaming and visualization — in one Rust binary"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/neuralkit-ai/neuralkit"
 readme = "README.md"
