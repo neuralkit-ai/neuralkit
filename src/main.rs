@@ -185,7 +185,7 @@ enum AuthCommand {
     /// sign-in mints a passkey. So a machine that has signed in once can later use an
     /// authenticator code or its own passkey, and is offered whichever actually work.
     Login {
-        /// The Neuralkit app origin (serves the QR.request stream + /passkey page).
+        /// The Neuralkit app origin (serves the QR.request stream + the /qr authorize page).
         #[arg(long, default_value = "https://neuralkit.ai")]
         url: String,
         /// Sign in by scanning a QR code with your phone. Works on any machine.

@@ -2,8 +2,8 @@
 //!
 //! The CLI generates a SECRET `device_code`, holds the `QR.request` SSE stream, and
 //! renders the returned `user_code` as a terminal QR. The phone scans it →
-//! `/passkey?code=…` → the passkey login (which signs the phone in) → `QR.approve`
-//! broadcasts a fresh session token to `cli:<device_code>`, which this held
+//! `/qr?code=…` → the passkey login (which signs the phone in) → `QR.approve`
+//! broadcasts a fresh session token to `qr:<device_code>`, which this held
 //! connection alone receives. The channel is plain over TLS (no per-frame seal) — the token is
 //! one-time + revocable, so a distributed `neuralkit auth login` needs nothing
 //! but the URL: no keys, no config.
