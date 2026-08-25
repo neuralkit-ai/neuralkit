@@ -494,7 +494,7 @@ fn render_users(reply: &Value) {
     println!("  {}  {}", style::dim(&format!("{:<width$}", "EMAIL")), style::dim("VERIFIED"));
     for u in users {
         let email = u.get("email").and_then(Value::as_str).unwrap_or("?");
-        let verified = u.get("verified").and_then(Value::as_i64).unwrap_or(0) == 1;
+        let verified = u.get("email_verified").and_then(Value::as_i64).unwrap_or(0) == 1;
         // ✓/· carries the state on its own, so the row text stays unstyled and readable.
         let mark = if verified { style::green("✓") } else { style::dim("·") };
         println!("  {email:<width$}  {mark}");
