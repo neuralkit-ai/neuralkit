@@ -24,9 +24,9 @@
 //! exists to observe. A person who genuinely wants it gone has the OS's own tool:
 //! `security delete-generic-password -s "neuralkit cli" -a "device"`.
 //!
-//! MACOS ONLY, and the column says so. Elsewhere nothing is stored and nothing is sent, which the
-//! server records as `fingerprint_type = 'none'` — the value 0018 keeps precisely so that absence
-//! is legible instead of invisible.
+//! MACOS ONLY. Elsewhere nothing is stored and nothing is sent, and the row's `fingerprint` is
+//! simply NULL — which is why 0022 made that column nullable rather than `NOT NULL DEFAULT ''`
+//! like its neighbours: absence has to stay distinguishable from a value.
 
 const SERVICE: &str = "neuralkit cli";
 const ACCOUNT: &str = "device";
