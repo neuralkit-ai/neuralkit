@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read};
 use std::time::{Duration, Instant};
 
+mod fingerprint;
 mod login;
 mod passkey;
 mod relay;

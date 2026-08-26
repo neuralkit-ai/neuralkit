@@ -172,6 +172,12 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                 if let Some(id) = &prior_device_id {
                     b["deviceId"] = Value::String(id.clone());
                 }
+                // Omitted when there is none — the field is nullish server-side and the gate fails
+                // open on it, so an offline or non-macOS terminal signs in exactly as before and
+                // the row records `fingerprint_type = 'none'`.
+                if let Some(fp) = crate::fingerprint::value(&client, base_url).await {
+                    b["fingerprint"] = Value::String(fp);
+                }
                 b.to_string()
             })
             .send()

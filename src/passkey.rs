@@ -857,7 +857,11 @@ pub(crate) async fn quick_login(
     let device_code: String = raw.iter().map(|b| format!("{b:02x}")).collect();
 
     let a = assert(&*key, &url_host(base_url)?, base_url, &challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
-    let res = http(base_url)?
+    // Bound rather than built inline, because the token fetch below rides the SAME client — a
+    // second one would negotiate its own TLS for one small GET.
+    let client = http(base_url)?;
+    let fp = crate::fingerprint::value(&client, base_url).await;
+    let res = client
         .post(format!("{base_url}/transport/action/Cli/login"))
         .header("content-type", "application/json")
         .body(serde_json::json!({
@@ -867,6 +871,9 @@ pub(crate) async fn quick_login(
             "label":    crate::login::hostname(),
             "os":       crate::login::os_label(),
             "terminal": crate::login::terminal_type(),
+            // The one-call path never stages, so without this a machine that only ever takes it
+            // would never record one. Null when absent — the fence is nullish and fails open.
+            "fingerprint": fp,
             "id":                b64(&cred_id),
             "authenticatorData": b64(&a.authenticator_data),
             "clientDataJSON":    b64(&a.client_data_json),
