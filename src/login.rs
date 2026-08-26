@@ -41,20 +41,22 @@ pub enum Method {
     Browser,
 }
 
+/// Only the email path can restart — it is the only one that can outlive the window.
+fn as_outcome(approved: bool) -> Outcome {
+    if approved { Outcome::Approved } else { Outcome::UseQr }
+}
+
+/// What a self-approval decided. `Restart` carries the address so the next attempt never
+/// asks for it twice.
+enum Outcome {
+    Approved,
+    UseQr,
+    Restart(String),
+    Quit,
+}
+
 pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     let base_url = base_url.trim_end_matches('/');
-
-    // The CLI's secret device_code (32 random bytes → 64 hex) — only ever in this
-    // connection URL. `cli:<device_code>` is the tag the token broadcasts to.
-    let mut dc = [0u8; 32];
-    getrandom::getrandom(&mut dc).map_err(|e| anyhow!("rng: {e}"))?;
-    let device_code = to_hex(&dc);
-
-    // This install's ML-KEM-768 keypair, minted HERE so the secret never travels. The public
-    // half rides the device flow and QR.approve binds it to the session it mints; the
-    // session channel's per-connection DEK is then encapsulated to it, so only this machine
-    // can open those frames. Nothing is shared between installs and nothing is in the binary.
-    let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
 
     // THE ONE-CALL PATH, TRIED FIRST. A machine the server already knows has nothing to be
     // approved — it is authenticating and enrolling itself, so the device flow below (stage a
@@ -71,7 +73,10 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
     // shortcut that overrode them would make the flag silently do nothing — the machine would
     // answer a question the caller did not ask. `None` means "decide at runtime", which is the
     // only case where deciding is ours to do.
-    match if method.is_some() { Ok(None) } else { crate::passkey::quick_login(base_url, &kem_pk.to_hex()).await } {
+    // For the one-call path only. Minted here so the secret never travels; the DEK is
+    // encapsulated to the public half, so only this machine can open those frames.
+    let (qk_pk, qk_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
+    match if method.is_some() { Ok(None) } else { crate::passkey::quick_login(base_url, &qk_pk.to_hex()).await } {
         Ok(Some((token, d))) => {
             let user = d.get("user").and_then(Value::as_str).unwrap_or("");
             let email = d.get("email").and_then(Value::as_str);
@@ -79,7 +84,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             let totp = d.get("totpEnabled").and_then(Value::as_bool);
             let device_id = d.get("deviceId").and_then(Value::as_str);
             let sign_key = d.get("signKey").and_then(Value::as_str);
-            save_credentials(base_url, &token, user, email, expires, &kem_sk.to_hex(), sign_key, device_id, totp)?;
+            save_credentials(base_url, &token, user, email, expires, &qk_sk.to_hex(), sign_key, device_id, totp)?;
             if let Some(id) = device_id {
                 crate::passkey::save_device_id(id)?;
             }
@@ -110,6 +115,19 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             }
         }
     }
+
+    // One attempt per iteration: a lapsed window is recoverable only by minting a NEW
+    // device_code. Nothing above repeats — the quick path already decided.
+    let mut resume_email: Option<String> = None;
+    'flow: loop {
+
+    // The CLI's secret device_code (32 random bytes → 64 hex) — only ever in this
+    // connection URL. `qr:<device_code>` is the tag the token broadcasts to.
+    let mut dc = [0u8; 32];
+    getrandom::getrandom(&mut dc).map_err(|e| anyhow!("rng: {e}"))?;
+    let device_code = to_hex(&dc);
+    // Fresh per attempt: `registerKey` stages the public half against THIS device_code.
+    let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
 
     // The registration this machine already holds, if any. A fresh keypair every login
     // means the row's key must be replaced, not duplicated — so the id travels with it.
@@ -206,8 +224,16 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                         // here rather than a passkey on a second screen. Anything that
                         // does not complete falls through to the QR, so a fresh machine
                         // and a declined menu land in the same place.
-                        if !choose_method(&client, base_url, code, method).await? {
-                            render_qr(base_url, code);
+                        // The frame carrying the code IS the moment the window opened.
+                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+                        match choose_method(&client, base_url, code, method, deadline, resume_email.take()).await? {
+                            Outcome::Approved => {}
+                            Outcome::UseQr => render_qr(base_url, code),
+                            Outcome::Restart(email) => {
+                                resume_email = Some(email);
+                                continue 'flow
+                            }
+                            Outcome::Quit => return Ok(()),
                         }
                     }
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
@@ -288,7 +314,8 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             }
         }
     }
-    Err(anyhow!("the stream closed before sign-in completed"))
+    return Err(anyhow!("the stream closed before sign-in completed"))
+    }
 }
 
 /// `neuralkit auth unregister` — end this machine's session AND forget the registration.
@@ -416,9 +443,17 @@ async fn choose_method(
     base_url: &str,
     user_code: &str,
     method: Option<Method>,
-) -> Result<bool> {
+    deadline: tokio::time::Instant,
+    resume_email: Option<String>,
+) -> Result<Outcome> {
+    // A RESTART RE-ENTERS THE EMAIL PATH DIRECTLY — the person already chose it. An EMPTY
+    // string means they had not reached the address prompt yet, so there is nothing to prefill.
+    if let Some(email) = resume_email {
+        let prefill = (!email.is_empty()).then_some(email);
+        return email_approve(client, base_url, user_code, deadline, prefill).await
+    }
     if matches!(method, Some(Method::Qr)) {
-        return Ok(false)
+        return Ok(Outcome::UseQr)
     }
 
     // WHAT THIS MACHINE CAN ACTUALLY OFFER, asked separately for each path — they do not
@@ -448,14 +483,14 @@ async fn choose_method(
     }
 
     if matches!(method, Some(Method::Passkey)) {
-        return passkey_approve(client, base_url, user_code).await
+        return Ok(as_outcome(passkey_approve(client, base_url, user_code).await?))
     }
     if matches!(method, Some(Method::Email)) {
-        return email_approve(client, base_url, user_code).await
+        return email_approve(client, base_url, user_code, deadline, None).await
     }
     if matches!(method, Some(Method::Totp)) {
-        let Some(user) = &user else { return Ok(false) };
-        return totp_approve(client, base_url, user_code, user).await
+        let Some(user) = &user else { return Ok(Outcome::UseQr) };
+        return Ok(as_outcome(totp_approve(client, base_url, user_code, user).await?))
     }
 
     // A REGISTERED MACHINE JUST SIGNS IN. Holding a credential the server already knows is
@@ -472,7 +507,7 @@ async fn choose_method(
     let mut machine_key_refused = false;
     if can_passkey {
         if passkey_approve(client, base_url, user_code).await? {
-            return Ok(true)
+            return Ok(Outcome::Approved)
         }
         can_passkey = false;
         machine_key_refused = true;
@@ -528,7 +563,7 @@ async fn choose_method(
         paths.insert(0, Method::Passkey);
     }
     if paths.len() == 1 {
-        return Ok(false)
+        return Ok(Outcome::UseQr)
     }
 
     // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
@@ -548,8 +583,8 @@ async fn choose_method(
 
         return match picked.map(|i| paths[i]) {
             Some(Method::Totp) => match &user {
-                Some(u) => totp_approve(client, base_url, user_code, u).await,
-                None => Ok(false),
+                Some(u) => Ok(as_outcome(totp_approve(client, base_url, user_code, u).await?)),
+                None => Ok(Outcome::UseQr),
             },
             Some(Method::Passkey) => {
                 // Asked AGAIN here, not reused from above: the menu may have been on screen a
@@ -567,21 +602,24 @@ async fn choose_method(
                     continue
                 }
                 if !crate::passkey::is_registered() {
-                    // Watch found, but there is no credential to assert yet — Ok(false)
-                    // means "use the QR", and THAT flow registers this machine now that
-                    // the key can sign.
-                    return Ok(false)
+                    // Watch found, but there is no credential to assert yet — UseQr means
+                    // exactly that, and THAT flow registers this machine now that the key
+                    // can sign.
+                    return Ok(Outcome::UseQr)
                 }
                 if passkey_approve(client, base_url, user_code).await? {
-                    return Ok(true)
+                    return Ok(Outcome::Approved)
                 }
                 // The ✗ and its reason were just printed by the attempt itself — nothing to
                 // add; the reappearing menu IS the "again, or another way?" question.
                 continue
             }
-            Some(Method::Email) => email_approve(client, base_url, user_code).await,
-            Some(Method::Browser) => browser_approve(base_url, user_code),
-            _ => Ok(false),
+            // MINT A FRESH WINDOW FIRST. The five minutes started when QR.request issued this
+            // user_code, before this menu was drawn — so deciding here spends them, and the wait
+            // on an inbox is the only one that can outlive what is left.
+            Some(Method::Email) => Ok(Outcome::Restart(String::new())),
+            Some(Method::Browser) => Ok(as_outcome(browser_approve(base_url, user_code)?)),
+            _ => Ok(Outcome::UseQr),
         }
     }
 }
@@ -719,6 +757,154 @@ async fn totp_approve(client: &reqwest::Client, base_url: &str, user_code: &str,
     approve_and_release(client, base_url, user_code, &token, "totp").await
 }
 
+fn fmt_left(left: u64) -> String {
+    if left == 0 { "expired".to_string() } else { format!("expires in {}:{:02}", left / 60, left % 60) }
+}
+
+/// What the code prompt produced.
+enum Code {
+    Entered(String),
+    Expired,
+    Quit,
+}
+
+/// Leaving raw mode is the one thing that must happen on EVERY path out — an early return that
+/// skipped it would hand back a shell with no echo.
+struct RawGuard;
+impl RawGuard {
+    /// `None` when nothing is attached — the piped path draws no line and must not touch termios.
+    /// Held by the RETRY LOOP, not by one read: the line survives a rejection, so the trailing
+    /// newline fires once, when the prompt is finished with.
+    fn enter() -> Result<Option<Self>> {
+        use crossterm::{event::EnableBracketedPaste, execute, terminal::enable_raw_mode};
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return Ok(None)
+        }
+        enable_raw_mode()?;
+        execute!(std::io::stdout(), EnableBracketedPaste)?;
+        Ok(Some(Self))
+    }
+}
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        use crossterm::{event::DisableBracketedPaste, execute, terminal::disable_raw_mode};
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+        println!();
+    }
+}
+
+/// Six digits, read key by key, on ONE line this owns.
+///
+/// Raw mode is what makes the six cells a CONSTRAINT rather than a hint: a seventh digit is
+/// never accepted, so what is drawn is always what will be sent. Bracketed paste is enabled
+/// because the code arrives in an email and pasting it is the common case — `Event::Paste`
+/// hands over the whole string at once, which a canonical read cannot do better.
+///
+/// `poll(ZERO)` + an awaited sleep rather than `read()`, so this never blocks the task holding
+/// the SSE. The same loop redraws the clock and watches the deadline, which is why there is no
+/// separate ticker, no cursor save/restore, and no race to lose.
+/// The one line, redrawn whole. A rejection takes the CLOCK's slot rather than a row of its own —
+/// which is what lets the six cells be cleared and reused instead of a fresh line per attempt.
+fn draw(buf: &str, secs: u64, err: Option<&str>) -> Result<()> {
+    use std::io::Write as _;
+    const LABEL: &str = "code";
+    let cells: String = buf.chars().chain(std::iter::repeat('\u{25ae}')).take(6).collect();
+    let tail = match err {
+        Some(m) => format!("{} {}", crate::style::red("\u{2717}"), m),
+        None => crate::style::dim(&fmt_left(secs)),
+    };
+    print!("\r\x1b[2K  {} {}  {}", crate::style::dim(LABEL), cells, tail);
+    // Park the cursor on the cell about to be filled. Drawing the whole line leaves it after the
+    // tail, so without this it sits at the end of the row while the digits land to its left.
+    // Counted in VISIBLE columns — the dim() escapes occupy none — and re-derived from the label
+    // so it cannot drift if that changes.
+    print!("\r\x1b[{}C", 2 + LABEL.chars().count() + 1 + buf.chars().count());
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<Code> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::io::{IsTerminal, Write as _};
+
+    let left = |d: tokio::time::Instant| d.saturating_duration_since(tokio::time::Instant::now()).as_secs();
+
+    // Not a terminal — nobody is typing and nothing can be drawn. A plain line keeps the headless
+    // E2E reading what it always read.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        if let Some(m) = err {
+            println!("  {} {}", crate::style::red("\u{2717}"), m);
+        }
+        print!("  {} ", crate::style::dim("code:"));
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
+            return Ok(Code::Quit)
+        }
+        return Ok(Code::Entered(line.chars().filter(char::is_ascii_digit).collect()))
+    }
+
+    let mut buf = String::new();
+    // A rejection stands until the first keystroke — the moment they retype it is stale, so the
+    // clock takes its slot back and the six cells are theirs again.
+    let mut err = err;
+
+    loop {
+        let secs = left(deadline);
+        // The whole line, every time — `wait_for_presence`'s idiom. One line means nothing else
+        // can print between the anchor and the redraw.
+        draw(&buf, secs, err)?;
+        if secs == 0 {
+            return Ok(Code::Expired)
+        }
+
+        if event::poll(std::time::Duration::ZERO)? {
+            match event::read()? {
+                // Windows reports press AND release; acting on both types twice.
+                Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(Code::Quit),
+                    KeyCode::Esc => return Ok(Code::Quit),
+                    // The seventh digit is simply never accepted — that is the constraint.
+                    KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 6 => { buf.push(c); err = None }
+                    KeyCode::Backspace => { buf.pop(); err = None }
+                    KeyCode::Enter if buf.len() == 6 => return Ok(Code::Entered(buf)),
+                    _ => {}
+                },
+                // One event carrying the whole pasted string, so `482 910` out of the email
+                // lands as six digits rather than as eight keystrokes.
+                Event::Paste(text) => {
+                    for c in text.chars().filter(char::is_ascii_digit) {
+                        if buf.len() == 6 { break }
+                        buf.push(c);
+                    }
+                    err = None
+                }
+                _ => {}
+            }
+            continue // redraw immediately rather than waiting out the tick
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The window is gone, so the QR would be dead too — only a fresh user_code helps. The code in
+/// the inbox usually still stands: OTP_TTL is twice this window.
+async fn offer_restart(email: String) -> Result<Outcome> {
+    let header = format!(
+        "  {} {}",
+        crate::style::bold("neuralkit"),
+        crate::style::dim(&format!("\u{b7} {email}")),
+    );
+    let picked = tokio::task::spawn_blocking(move || select(&header, &["send a new code", "quit"])).await??;
+    Ok(match picked {
+        Some(0) => Outcome::Restart(email),
+        _ => Outcome::Quit,
+    })
+}
+
 /// Approve this device flow with an emailed code — the path that needs nothing but an inbox.
 ///
 /// THE ONE THAT BOOTSTRAPS. Every other path is downstream of a session that already existed:
@@ -731,26 +917,41 @@ async fn totp_approve(client: &reqwest::Client, base_url: &str, user_code: &str,
 /// find-or-creates by address, so the session is the approved account's rather than a fresh
 /// anonymous one. Everything downstream — the device row, the passkey registered afterwards —
 /// then belongs to the person who owns that inbox.
-async fn email_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<bool> {
+async fn email_approve(
+    client: &reqwest::Client,
+    base_url: &str,
+    user_code: &str,
+    deadline: tokio::time::Instant,
+    prefill: Option<String>,
+) -> Result<Outcome> {
     println!();
-    // THE ONE PATH WITH AN UNBOUNDED WAIT IN IT. Both the staged key and the user code are
-    // held for five minutes from the moment this command started, and every other path
-    // finishes in seconds — a scan, six digits, a signature. Waiting on an inbox is the only
-    // way to overrun it, so the deadline is said out loud rather than discovered.
-    println!("  {}", crate::style::dim("finish within 5 minutes — the sign-in window is already open"));
-    print!("  {} ", crate::style::dim("email address:"));
-    std::io::stdout().flush()?;
-    let mut line = String::new();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
-        return Ok(false)
-    }
-    let email = line.trim().to_string();
-    if email.is_empty() {
-        println!();
-        return Ok(false)
-    }
 
+    // A restart never asks twice — the address is not a control, the emailed code is.
+    let email = match prefill {
+        Some(e) => {
+            println!("  {} {}", crate::style::dim("email address:"), e);
+            e
+        }
+        None => {
+            print!("  {} ", crate::style::dim("email address:"));
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
+                return Ok(Outcome::UseQr)
+            }
+            let e = line.trim().to_string();
+            if e.is_empty() {
+                println!();
+                return Ok(Outcome::UseQr)
+            }
+            e
+        }
+    };
+
+    // ALWAYS through the fence, restart included: both rate limiters and the resend grace live
+    // there. Inside the grace nothing is mailed and the inbox's code still stands.
+    //
     // The SUCCESS answer is deliberately the same whether or not an address has access — the
     // server will not say which, so neither does this. A REFUSAL is a different thing and must
     // be shown: rate limiting describes the caller, not the address, so surfacing it leaks
@@ -764,47 +965,72 @@ async fn email_approve(client: &reqwest::Client, base_url: &str, user_code: &str
         .await?;
     let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
     if let Some(m) = body.pointer("/error/message").and_then(Value::as_str) {
-        println!("  {} {}\n", crate::style::red("✗"), m);
-        return Ok(false)
+        println!("  {} {}\n", crate::style::red("\u{2717}"), m);
+        return Ok(Outcome::UseQr)
     }
     println!("  {}", crate::style::dim("if that address has access, a code is on its way"));
 
-    print!("  {} ", crate::style::dim("code:"));
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    if tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line).await? == 0 {
-        return Ok(false)
-    }
-    let code = line.trim().to_string();
-    if code.is_empty() {
-        println!();
-        return Ok(false)
-    }
+    // The only unbounded wait in the flow — every other path finishes in seconds. So this is
+    // the one prompt that carries the clock and must lose a race with it.
+    //
+    // A LOOP, because the server allows five attempts before it invalidates the code. One shot
+    // then falling through to a QR spends four of them and changes the method under someone who
+    // simply mistyped.
+    //
+    // The loop owns the LINE, not each read: the guard lives for all five attempts, so a rejection
+    // redraws in place and the trailing newline lands once, at the end. Breaking out of a block
+    // (rather than returning) is what keeps that single drop point.
+    enum Done { Token(String), Restart, Quit }
 
-    let res = client
-        .post(format!("{base_url}/transport/action/EmailCode/login"))
-        .header("content-type", "application/json")
-        .body(serde_json::json!({ "email": email, "code": code }).to_string())
-        .send()
-        .await?;
-    let token = res
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find_map(|c| {
-            let (name, rest) = c.split_once('=')?;
-            matches!(name.trim(), "session" | "__Secure-session")
-                .then(|| rest.split(';').next().unwrap_or("").to_string())
-        });
-    let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        let msg = body.pointer("/error/message").and_then(Value::as_str).unwrap_or("that code was not accepted");
-        println!("  {} {}\n", crate::style::red("✗"), msg);
-        return Ok(false)
+    let done = {
+        let _raw = RawGuard::enter()?;
+        let mut err: Option<String> = None;
+        loop {
+            let code = match read_code(deadline, err.as_deref()).await? {
+                Code::Entered(c) => c,
+                Code::Quit => break Done::Quit,
+                Code::Expired => break Done::Restart,
+            };
+
+            let res = client
+                .post(format!("{base_url}/transport/action/EmailCode/login"))
+                .header("content-type", "application/json")
+                .body(serde_json::json!({ "email": email, "code": code }).to_string())
+                .send()
+                .await?;
+            let token = res
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .find_map(|c| {
+                    let (name, rest) = c.split_once('=')?;
+                    matches!(name.trim(), "session" | "__Secure-session")
+                        .then(|| rest.split(';').next().unwrap_or("").to_string())
+                });
+            if let Some(token) = token.filter(|t| !t.is_empty()) {
+                break Done::Token(token)
+            }
+
+            // EVERY rejection reads the same, and the server's own message is deliberately not
+            // shown. `Cli.requestCode` already dropped an address with no access silently, so a
+            // code was never minted for it — but KV cannot tell "never minted" from "expired", and
+            // surfacing that difference here would answer "does this address have access?" to
+            // anyone who types one. Sharing the wording with a genuine wrong guess is the point.
+            // Nothing ends this loop early: the countdown does, for both, identically.
+            err = Some("Incorrect code.".to_string());
+        }
     };
 
-    approve_and_release(client, base_url, user_code, &token, "email").await
+    match done {
+        Done::Token(token) => Ok(if approve_and_release(client, base_url, user_code, &token, "email").await? {
+            Outcome::Approved
+        } else {
+            Outcome::UseQr
+        }),
+        Done::Restart => offer_restart(email).await,
+        Done::Quit => Ok(Outcome::Quit),
+    }
 }
 
 /// Approve this device flow with THIS machine's own passkey.
