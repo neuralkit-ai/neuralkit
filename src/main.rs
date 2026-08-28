@@ -923,7 +923,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // through with zero questions (token reuse, or the registered passkey tried
         // rather than offered), and login::run's own output IS the status display.
         // The menu only adds what auth never had: the tray row.
-        login_and_offer("https://neuralkit.ai", None).await?;
+        if !login_and_offer("https://neuralkit.ai", None).await? {
+            return Ok(())
+        }
         match tokio::task::spawn_blocking(front_door).await? {
             Ok(Some(FrontDoor::Dashboard)) => {} // falls through to the dashboard below
             Ok(None) => return Ok(()),
@@ -1067,10 +1069,19 @@ fn front_door() -> anyhow::Result<Option<FrontDoor>> {
 /// Sign in + the one-time authenticator offer — the shared front half. The menu
 /// stops HERE and falls through to the dashboard (that's what the person came
 /// for); `neuralkit auth login` continues into the sealed REPL below.
-async fn login_and_offer(url: &str, method: Option<login::Method>) -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = login::run(url, method).await {
-        eprintln!("login failed: {e:#}");
-        std::process::exit(1);
+async fn login_and_offer(url: &str, method: Option<login::Method>) -> Result<bool, Box<dyn std::error::Error>> {
+    // DECLINED IS NOT SUCCESS, and telling them apart is the whole point of the bool. Quitting the
+    // restart picker, or Ctrl-C at the code prompt, leaves no session — so there is nothing to
+    // offer an authenticator for and nothing for a caller to enter. Returning `Ok` for both is what
+    // sent `auth login` on into the sealed REPL after a quit, to fail reading a credentials.json
+    // that was never written.
+    match login::run(url, method).await {
+        Err(e) => {
+            eprintln!("login failed: {e:#}");
+            std::process::exit(1);
+        }
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
     }
     // OFFERED ONCE, WHERE BOTH PATHS MEET. `login::run` returns the same way whether it
     // took the four-call flow or the one-call one, so asking here covers both without the
@@ -1093,7 +1104,7 @@ async fn login_and_offer(url: &str, method: Option<login::Method>) -> Result<(),
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The whole sign-in arc — `login_and_offer`, then the sealed REPL with its
@@ -1104,7 +1115,10 @@ async fn sign_in_flow(
     url: &str,
     method: Option<login::Method>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    login_and_offer(url, method).await?;
+    // Nothing to enter without a session — a declined sign-in returns to the shell, status 0.
+    if !login_and_offer(url, method).await? {
+        return Ok(())
+    }
     if io::stdout().is_terminal() && io::stdin().is_terminal() {
         // The REPL and the dashboard take turns owning the terminal: `dash` returns
         // rather than launching, the dashboard runs with the REPL fully out of the

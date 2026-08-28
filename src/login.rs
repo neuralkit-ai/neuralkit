@@ -55,7 +55,11 @@ enum Outcome {
     Quit,
 }
 
-pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
+/// `Ok(true)` when a session was obtained, `Ok(false)` when the person declined — quitting the
+/// picker, or Ctrl-C at the code prompt. The caller MUST distinguish them: returning the same value
+/// for both is what once sent `auth login` on into the sealed REPL after a quit, where it failed
+/// reading a `credentials.json` that was never written.
+pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
     let base_url = base_url.trim_end_matches('/');
 
     // THE ONE-CALL PATH, TRIED FIRST. A machine the server already knows has nothing to be
@@ -103,7 +107,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
             if totp == Some(true) {
                 println!("  {}", crate::style::dim("authenticator registered"));
             }
-            return Ok(())
+            return Ok(true)
         }
         Ok(None) => {}
         // The gate refusing is not a failure to report as one — it is the machine saying the
@@ -172,11 +176,11 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                 if let Some(id) = &prior_device_id {
                     b["deviceId"] = Value::String(id.clone());
                 }
-                // Omitted when there is none — the field is nullish server-side and every read
-                // fails open on it, so an offline or non-macOS terminal signs in exactly as
-                // before and its row simply carries a NULL `fingerprint`.
-                if let Some(fp) = crate::fingerprint::value(&client, base_url).await {
+                // Omitted when there is none — the fence accepts absence and every read fails
+                // open, so a host with neither axis signs in exactly as before.
+                if let Some((fp, axes)) = crate::fingerprint::value() {
                     b["fingerprint"] = Value::String(fp);
+                    b["fingerprintAxes"] = Value::String(axes.into());
                 }
                 b.to_string()
             })
@@ -239,7 +243,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                                 resume_email = Some(email);
                                 continue 'flow
                             }
-                            Outcome::Quit => return Ok(()),
+                            Outcome::Quit => return Ok(false),
                         }
                     }
                 } else if let Some(token) = v.get("token").and_then(Value::as_str) {
@@ -315,7 +319,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<()> {
                         let _ = crate::passkey::save_next_challenge(next);
                     }
 
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -854,11 +858,19 @@ async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<
     }
 
     let mut buf = String::new();
-    // A rejection stands until the first keystroke — the moment they retype it is stale, so the
-    // clock takes its slot back and the six cells are theirs again.
+    // A rejection stands for FIVE SECONDS, then the clock takes its slot back on its own — long
+    // enough to read, short enough that the line is not left saying something about an attempt
+    // that is over. A keystroke clears it sooner, because typing means it has been read.
+    //
+    // Timed from HERE rather than from when the message was produced: `read_code` is entered fresh
+    // after each rejection, so entry is the moment it reached the screen.
     let mut err = err;
+    let shown = std::time::Instant::now();
 
     loop {
+        if err.is_some() && shown.elapsed() >= std::time::Duration::from_secs(5) {
+            err = None
+        }
         let secs = left(deadline);
         // The whole line, every time — `wait_for_presence`'s idiom. One line means nothing else
         // can print between the anchor and the redraw.
@@ -874,9 +886,20 @@ async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(Code::Quit),
                     KeyCode::Esc => return Ok(Code::Quit),
                     // The seventh digit is simply never accepted — that is the constraint.
-                    KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 6 => { buf.push(c); err = None }
+                    //
+                    // AND THE SIXTH IS THE SUBMIT. A fixed-length code has nothing left to confirm,
+                    // so asking for Enter afterwards is a keystroke that can only be forgotten.
+                    // Drawn once more BEFORE returning, or the completed code never reaches the
+                    // screen — the line would still show five digits and a cell as the request goes.
+                    KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 6 => {
+                        buf.push(c);
+                        err = None;
+                        if buf.len() == 6 {
+                            draw(&buf, left(deadline), None)?;
+                            return Ok(Code::Entered(buf))
+                        }
+                    }
                     KeyCode::Backspace => { buf.pop(); err = None }
-                    KeyCode::Enter if buf.len() == 6 => return Ok(Code::Entered(buf)),
                     _ => {}
                 },
                 // One event carrying the whole pasted string, so `482 910` out of the email
@@ -886,7 +909,12 @@ async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<
                         if buf.len() == 6 { break }
                         buf.push(c);
                     }
-                    err = None
+                    err = None;
+                    // A pasted code is complete on arrival — the same rule, reached in one event.
+                    if buf.len() == 6 {
+                        draw(&buf, left(deadline), None)?;
+                        return Ok(Code::Entered(buf))
+                    }
                 }
                 _ => {}
             }
