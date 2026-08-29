@@ -987,10 +987,14 @@ async fn email_approve(
     // there. Inside the grace nothing is mailed and the inbox's code still stands.
     //
     // The SUCCESS answer is deliberately the same whether or not an address has access — the
-    // server will not say which, so neither does this. A REFUSAL is a different thing and must
-    // be shown: rate limiting describes the caller, not the address, so surfacing it leaks
-    // nothing and hiding it turns "you have used your five attempts this hour" into "the mail
-    // never arrived", which sends someone looking in the wrong place entirely.
+    // server will not say which, so neither does this. A REFUSAL is a different thing and is
+    // shown anyway, with the leak accounted for rather than denied: the per-IP cap describes the
+    // CALLER and gives nothing away, but the per-address cap sits below the fence's eligibility
+    // check, so only an approved address can ever reach it — a refusal does disclose that the
+    // address is on the list. Shown regardless, because hiding it turns "you have used your ten
+    // requests this hour" into "the mail never arrived", which sends someone looking in the wrong
+    // place entirely, and the disclosure needs ~11 IPs to read while this costs every honest user
+    // who trips a cap. The trade is recorded at the fence.
     let res = client
         .post(format!("{base_url}/transport/action/Cli/requestCode"))
         .header("content-type", "application/json")
