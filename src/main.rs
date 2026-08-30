@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 mod fingerprint;
 mod login;
+#[cfg(target_os = "macos")]
+mod panel;
 mod passkey;
 mod relay;
 mod totp;
@@ -75,6 +77,16 @@ pub enum Menu {
     Relay,
     Transport,
 }
+
+/// ⚠ TEMPORARY — pointed at the dev tunnel, not prod (2026-08-29, user call). Every `--url`
+/// default and the bare front door read this one const, so flipping it back to
+/// `https://neuralkit.ai` before any release is a ONE-LINE change rather than seven.
+///
+/// It matters more than a convenience: passkeys are scoped to the host that served the ceremony
+/// (`rpId` is `new URL(request.url).hostname`), so a credential minted against this host does NOT
+/// work against the apex. Shipping with this default would strand every install in the wrong
+/// passkey world.
+const DEFAULT_URL: &str = "https://dev.labs.tokyo.jp";
 
 /// Clap defaults, as consts so the bare-invocation check compares against the
 /// SAME strings the parser fills in — a drifted literal would silently kill the menu.
@@ -150,12 +162,12 @@ enum Command {
 enum PasskeyAction {
     /// Bind this machine's key to the account you are signed in as. Needs a session.
     Register {
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
     },
     /// Sign in using this machine's key — no browser, no phone, no code.
     Login {
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
     },
     /// Ask macOS for the ACCOUNT's own passkey — the bootstrap path that needs no email.
@@ -164,7 +176,7 @@ enum PasskeyAction {
     /// through iCloud Keychain) rather than a key this machine holds. Needs the signed build,
     /// an associated domain, and a GUI session — it cannot work over SSH.
     System {
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
     },
 }
@@ -173,7 +185,7 @@ enum PasskeyAction {
 enum TotpAction {
     /// Set up an authenticator app against the account you are signed in as.
     Setup {
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
     },
 }
@@ -187,7 +199,7 @@ enum AuthCommand {
     /// authenticator code or its own passkey, and is offered whichever actually work.
     Login {
         /// The Neuralkit app origin (serves the QR.request stream + the /qr authorize page).
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
         /// Sign in by scanning a QR code with your phone. Works on any machine.
         #[arg(long, conflicts_with_all = ["totp", "passkey", "email"])]
@@ -216,7 +228,7 @@ enum AuthCommand {
         action: Option<PasskeyAction>,
         /// The origin the assertion is bound to — WebAuthn signs the host, so this decides
         /// which server would accept it.
-        #[arg(long, default_value = "https://neuralkit.ai")]
+        #[arg(long, default_value = DEFAULT_URL)]
         url: String,
     },
     /// Authenticator app — the one path that cannot register itself.
@@ -785,23 +797,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // attached lenses as RelayEvent::Log, so their log pane is as alive as an owner's.
     let icon_relay = matches!(&args.command, Some(Command::Relay { icon: true, .. }));
     if !icon_relay {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("neuralkit_debug.log")
-            .expect("open neuralkit_debug.log");
+        // THE PATH IS RELATIVE, AND A GUI LAUNCH HAS NO USABLE CWD. LaunchServices starts a
+        // double-clicked `.app` with the working directory at `/`, which is not writable — so
+        // `.expect` here PANICKED before `main` reached any of its routing, and the app appeared
+        // to do nothing when opened. Measured: `cd / && …/Contents/MacOS/neuralkit` panics at
+        // this line.
+        //
+        // A debug log must never be the reason the program fails to start. So: the CWD file when
+        // it works (convenient beside a terminal run), `~/Library/Logs` when it does not — where
+        // macOS expects an app's log to be anyway — and no file logging at all rather than an
+        // exit if neither can be opened.
+        let open_log = |p: &str| std::fs::OpenOptions::new().create(true).append(true).open(p);
+        let log_file = open_log("neuralkit_debug.log").or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let dir = format!("{home}/Library/Logs");
+            let _ = std::fs::create_dir_all(&dir);
+            open_log(&format!("{dir}/neuralkit.log"))
+        });
         // A FILE surface — full RFC3339 stays (machine-parseable, timezone-
         // explicit). The compact 12-hour LogTime is for display panes only.
-        tracing_subscriber::fmt()
-            .with_writer(log_file)
-            .with_ansi(false)
-            // web_transport_quinn WARNs "failed to read capsule" on every CLEAN
-            // peer close — demoted to error by default (RUST_LOG overrides).
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,web_transport_quinn=error")),
-            )
-            .init();
+        if let Ok(log_file) = log_file {
+            tracing_subscriber::fmt()
+                .with_writer(log_file)
+                .with_ansi(false)
+                // web_transport_quinn WARNs "failed to read capsule" on every CLEAN
+                // peer close — demoted to error by default (RUST_LOG overrides).
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,web_transport_quinn=error")),
+                )
+                .init();
+        }
     }
 
     // `neuralkit tray` — hands the main thread to the menu-bar event loop and never
@@ -923,7 +949,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // through with zero questions (token reuse, or the registered passkey tried
         // rather than offered), and login::run's own output IS the status display.
         // The menu only adds what auth never had: the tray row.
-        if !login_and_offer("https://neuralkit.ai", None).await? {
+        if !login_and_offer(DEFAULT_URL, None).await? {
             return Ok(())
         }
         match tokio::task::spawn_blocking(front_door).await? {
@@ -934,6 +960,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+
+    // DOUBLE-CLICKED FROM FINDER — bare, no terminal, and inside our own bundle.
+    //
+    // LaunchServices starts the binary with no arguments and no tty, so without this it falls
+    // straight into `run_dashboard` and dies inside `enable_raw_mode()` on a terminal that does
+    // not exist. A `.app` that appears to do nothing when opened is the wrong first impression
+    // for the channel that carries the enclave gate.
+    //
+    // `running_bundle()` IS THE DISCRIMINATOR, and `__CFBundleIdentifier` is NOT. That variable
+    // is inherited: a shell inside VS Code already reads `com.microsoft.VSCodeInsiders`, so
+    // testing for its presence would misread every PIPED run as a double-click and regress the
+    // headless E2E. `running_bundle()` asks the OS what THIS process is, so nothing upstream can
+    // fake it.
+    //
+    // The one other thing this matches is a piped run of the BUNDLED binary, which nothing does:
+    // npm and cargo both ship bare binaries, and the E2E passes `auth login` rather than running
+    // bare. The bundle only exists on the download channel.
+    #[cfg(target_os = "macos")]
+    if bare
+        && !io::stdout().is_terminal()
+        && !io::stdin().is_terminal()
+        && phaze_auth::system_passkey::running_bundle().0 == "ai.neuralkit.cli"
+    {
+        // The tray hands the main thread to AppKit and never returns — which is correct here,
+        // because a GUI launch has nowhere else to go.
+        if let Err(e) = tray::run() {
+            eprintln!("tray failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     run_dashboard(&args).await

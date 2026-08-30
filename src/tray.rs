@@ -13,12 +13,16 @@
 //! file). Blurring these is how "signed in but expired" confusion happens, so the menu
 //! keeps the same boundary the files do.
 //!
-//! NOISE BUDGET. One line per fact-cluster, and the exception rather than the norm: an
-//! authenticator that IS set up says nothing — only the actionable absence gets a row.
+//! NOISE BUDGET. One line per fact-cluster. Each line states a FACT rather than only a lack —
+//! an authenticator says whether it is set up or not, because silence and "the tray has no
+//! opinion" are indistinguishable in a menu. Only genuine ignorance stays silent.
 //!
-//! THE ONE WRITE: the hardware-gate toggle. A local file edit (`passkey::set_gate`) — no
-//! server, no session, no NSWindow — so it fits the "no ceremonies" boundary, and it is
-//! the surface the dropped `auth passkey presence` subcommand was waiting for.
+//! TWO WRITES, BOTH LOCAL FILE EDITS, and that is the boundary this file keeps: no server, no
+//! session, no NSWindow. The hardware-gate toggle (`passkey::set_gate`) — the surface the
+//! dropped `auth passkey presence` subcommand was waiting for — and the `neuralkit` symlink into
+//! `~/.local/bin` (`publish_command`, at startup). The symlink is the tray's because only a
+//! BUNDLED copy can hold an enclave key, so the app that owns the privileged binary is the one
+//! that should publish the command name.
 //!
 //! Status is read ONCE at launch. A tray that watches files needs fsevents and a refresh
 //! story; this one would rather be honestly static than subtly stale.
@@ -39,12 +43,13 @@ struct Snapshot {
     /// deadline uses, so the tray and the session agree about when the end is.
     expires_ms: Option<i64>,
     totp: Option<bool>,
-    /// Who the credential was REGISTERED to — written at registration time, because the
-    /// session file only knows who is signed in now, which is a different question.
-    account: Option<String>,
     has_software_key: bool,
     registered: bool,
     gated: bool,
+    /// WHICH SLOT holds a registration — the machine can have both, one per key. `gated` is the
+    /// CHOICE; these two are what is actually registered, and the tier line needs the difference.
+    software_registered: bool,
+    enclave_registered: bool,
 }
 
 fn read_json(path: &str) -> Option<Value> {
@@ -67,19 +72,15 @@ fn snapshot() -> Snapshot {
         signed_in: field(&creds, "email").or_else(|| field(&creds, "user")),
         expires_ms: creds.as_ref().and_then(|v| v.get("expires")).and_then(Value::as_i64),
         totp: creds.as_ref().and_then(|v| v.get("totp_enabled")).and_then(Value::as_bool),
-        // Owner precedence: an `account` field beside the credential would win — none is
-        // written today (the registration path is tested and frozen), so the identity the
-        // bootstrap left in credentials.json stands in. It survives expiry (only logout /
-        // the REPL deadline remove the file), which is exactly the residue this reads.
-        // Known edge, accepted: a machine registered as A whose last sign-in was B would
-        // caption A's credential with B — the true fix is writing the owner at
-        // registration time, and that waits for the auth freeze to lift.
-        account: field(&pk, "account")
-            .or_else(|| field(&creds, "email"))
-            .or_else(|| field(&creds, "user")),
         has_software_key: field(&pk, "key").is_some(),
-        registered: field(&pk, "credential_id").is_some(),
+        // EITHER registration counts. The machine can hold both — one per key — so asking
+        // only about the software slot would report "no passkey yet" on a machine whose
+        // enclave key is registered.
+        registered: field(&pk, "credential_id").is_some()
+            || field(&pk, "enclave_credential_id").is_some(),
         gated: field(&pk, "gate").is_some(),
+        software_registered: field(&pk, "credential_id").is_some(),
+        enclave_registered: field(&pk, "enclave_credential_id").is_some(),
     }
 }
 
@@ -90,6 +91,34 @@ fn left(expires_ms: i64, now_ms: i64) -> String {
         m if m >= 2880 => format!("{}d", m / 1440),
         m if m >= 60 => format!("{}h {:02}m", m / 60, m % 60),
         m => format!("{m}m"),
+    }
+}
+
+/// The session line, rebuilt from the clock.
+///
+/// THE ONE LINE THAT TICKS, and the reason it can is that it needs no file watch. `expires_ms` is
+/// captured once at launch and never changes; only `now` moves. The module's "read ONCE at launch"
+/// rule is about noticing that a FILE changed — which identity and registration genuinely need and
+/// still do not get — and it does not reach a countdown, which is arithmetic on a stamp the tray
+/// already holds.
+///
+/// Left static it was actively WRONG rather than merely stale: with `SESSION_TTL` at ten minutes
+/// while the flows are being exercised, "9 min left" is false sixty seconds later and stays false
+/// for as long as the icon lives.
+///
+/// "Expired" carries WHEN, not just that it did — a bare "expired" reads as an accusation, a
+/// timestamp reads as a fact. Local time, coarse to the minute, because menus are glances.
+fn session_line(signed_in: Option<&str>, expires_ms: Option<i64>, now_ms: i64) -> String {
+    let expired = expires_ms.is_some_and(|ms| ms <= now_ms);
+    let expired_at = expires_ms
+        .filter(|_| expired)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string());
+    match (signed_in, &expired_at, expires_ms) {
+        (Some(w), Some(when), _) => format!("session expired {when} · {w}"),
+        (Some(w), None, Some(ms)) => format!("signed in as {w} · {} left", left(ms, now_ms)),
+        (Some(w), None, None) => format!("signed in as {w}"),
+        (None, ..) => "signed out".into(),
     }
 }
 
@@ -140,6 +169,66 @@ fn instance_lock() -> Result<Option<std::fs::File>> {
 /// the momentary acquisition is invisible to anyone else.
 pub fn is_running() -> bool {
     matches!(instance_lock(), Ok(None))
+}
+
+/// Put `neuralkit` on PATH — the Docker Desktop move, and it belongs to the tray because the app
+/// that OWNS the privileged copy is the one that should publish the command: only a bundled copy
+/// can hold an enclave key.
+///
+/// `~/.local/bin`, never `/usr/local/bin`. The latter is root-owned, and a drag-install that
+/// stops to ask for an admin password is not a drag-install. Measured 2026-08-29 on this machine:
+/// `~/.local/bin` is PATH position 39 and user-writable, `/usr/local/bin` is 25 and is not. It
+/// also lands ABOVE `~/Library/pnpm` (40), so a bundled install wins over an npm one rather than
+/// racing it.
+///
+/// ONLY FROM THE BUNDLE. `running_bundle()` reports what the SYSTEM thinks is running rather than
+/// what signed it — a bare npm binary answers `<no bundleIdentifier>` and is skipped. Handing the
+/// name to the copy that CANNOT gate on hardware is worse than not publishing it at all.
+///
+/// REPLACES ONLY ITS OWN LINK. A regular file at that path belongs to some other install, and
+/// taking the name from it silently is the behaviour Docker gets criticised for.
+///
+/// Best-effort and silent: the icon must appear whether or not this works.
+///
+/// RETURNS WHETHER IT PUBLISHED, and that bool is the first-run signal. No flag file is needed —
+/// the link ALREADY POINTING AT US is the durable record that this has happened before, and it
+/// lives exactly as long as the thing it describes. A flag in `passkey.json` could say "shown"
+/// while the link was gone, which is the state where someone most needs to be told again.
+fn publish_command() -> bool {
+    if phaze_auth::system_passkey::running_bundle().0 != "ai.neuralkit.cli" {
+        return false
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    // NEVER LINK TO A TRANSLOCATED COPY. Since Sierra, macOS runs a QUARANTINED app opened from
+    // a dmg or Downloads — without being moved first — from a randomised read-only path under
+    // `/AppTranslocation/`, silently. That path is destroyed when the app quits, so a symlink
+    // into it would be dead the moment the panel it advertised disappeared.
+    //
+    // There is no public API for this: `SecTranslocateIsTranslocatedURL` is not in the SDK
+    // headers, so the path is the test. Someone in this state has not installed the app yet;
+    // the honest answer is to publish nothing rather than a link that breaks later.
+    if exe.to_string_lossy().contains("/AppTranslocation/") {
+        return false
+    }
+    let Ok(home) = std::env::var("HOME") else { return false };
+    let dir = std::path::Path::new(&home).join(".local/bin");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false
+    }
+    let link = dir.join("neuralkit");
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Already ours and already correct — a re-launch must not churn the link, and must
+            // not announce itself again.
+            if std::fs::read_link(&link).ok().as_deref() == Some(exe.as_path()) {
+                return false
+            }
+            let _ = std::fs::remove_file(&link);
+        }
+        Ok(_) => return false, // a real file — someone else's install, leave it
+        Err(_) => {}           // absent
+    }
+    std::os::unix::fs::symlink(&exe, &link).is_ok()
 }
 
 /// Turn OFF a running tray from outside: the pid lives in the lock file (written
@@ -340,9 +429,13 @@ pub fn run() -> Result<()> {
         let _ = lock.set_len(0);
         let _ = write!(&lock, "{}", std::process::id());
     }
+    // After the lock, so only the instance that actually came up claims the command name.
+    // The panel is SHOWN LATER, in StartCause::Init — a window ordered front before the loop
+    // runs has nothing driving it yet.
+    let first_run = publish_command();
+
     let s = snapshot();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    let expired = s.expires_ms.is_some_and(|ms| ms <= now_ms);
 
     let menu = Menu::new();
 
@@ -353,36 +446,53 @@ pub fn run() -> Result<()> {
     // in" for days after the session died.
     // When it died, not just that it died — "expired" alone reads as an accusation; a
     // timestamp reads as a fact. Local time, coarse to the minute: menus are glances.
-    let expired_at = s
-        .expires_ms
-        .filter(|_| expired)
-        .and_then(chrono::DateTime::from_timestamp_millis)
-        .map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string());
-    menu.append(&MenuItem::new(
-        match (&s.signed_in, &expired_at, s.expires_ms) {
-            (Some(w), Some(when), _) => format!("session expired {when} — was {w}"),
-            (Some(w), None, Some(ms)) => format!("signed in as {w} · {} left", left(ms, now_ms)),
-            (Some(w), None, None) => format!("signed in as {w}"),
-            (None, ..) => "signed out".into(),
-        },
-        false,
-        None,
-    ))
-    .context("menu")?;
-    // The exception, not the norm: set up = silence, absence = the one actionable line.
-    if s.totp == Some(false) {
-        menu.append(&MenuItem::new("authenticator app: not set up", false, None)).context("menu")?;
+    let session_item = MenuItem::new(session_line(s.signed_in.as_deref(), s.expires_ms, now_ms), false, None);
+    menu.append(&session_item).context("menu")?;
+    // SAYS IT EITHER WAY. This used to print only the absence, on the reasoning that a working
+    // thing needs no row — but silence and "no opinion" look identical in a menu, so a person who
+    // HAD set one up could not tell the tray knew. The line beside it ("registered · Secure
+    // Enclave") states a fact rather than a lack, and this now matches.
+    //
+    // `None` still says nothing, and that is a different case: it means credentials.json carries
+    // no `totp_enabled` at all, so the tray genuinely does not know.
+    if let Some(on) = s.totp {
+        menu.append(&MenuItem::new(
+            if on { "authenticator app: enabled" } else { "authenticator app: not enabled" },
+            false,
+            None,
+        ))
+        .context("menu")?;
     }
 
     // ── this machine — the registration, which outlives sessions ─────────
     menu.append(&PredefinedMenuItem::separator()).context("menu")?;
-    let tier = if s.gated { "Secure Enclave" } else { "software key" };
+    // "on device (P-256)" rather than "software key": the curve is the SAME on both tiers, so
+    // naming it software says only what it is not. The real difference is where the private half
+    // lives — a file this machine can copy, versus a key that cannot leave the chip.
+    //
+    // THE TIER IS WHAT IS REGISTERED, not what is chosen. Reading the `gate` field alone made
+    // this claim "Secure Enclave" the moment the checkbox was ticked — before any enclave key
+    // existed, while the only registration was still the software one. The choice and the
+    // reality diverge for exactly one sign-in, and this is the line that used to hide it.
+    let tier = match (s.gated, s.enclave_registered, s.software_registered) {
+        (true, true, _) => "Secure Enclave",
+        // Chosen but not yet minted — say so rather than claim a key that does not exist.
+        (true, false, _) => "Secure Enclave at next sign-in",
+        (false, _, true) => "on device (P-256)",
+        // Gate off with only an enclave registration: the software key will be minted and
+        // registered on the next run, so no tier is true yet.
+        (false, _, false) => "on device (P-256) at next sign-in",
+    };
     menu.append(&MenuItem::new(
-        match (&s.account, s.registered, s.has_software_key) {
-            (Some(a), true, _) => format!("registered to {a} · {tier}"),
-            (None, true, _) => format!("registered · {tier}"),
-            (_, false, true) => "passkey created, not registered".into(),
-            (_, false, false) => "no passkey yet".into(),
+        // NO OWNER HERE. The session line directly above already names who this is, and
+        // repeating it spent a whole line on a word the eye had just read. It was also the
+        // weaker of the two: `account` has no source of its own, so it fell back to the
+        // session's email — meaning a machine registered as A whose last sign-in was B would
+        // have captioned A's credential with B.
+        match (s.registered, s.has_software_key) {
+            (true, _) => format!("registered · {tier}"),
+            (false, true) => "passkey created, not registered".into(),
+            (false, false) => "no passkey yet".into(),
         },
         false,
         None,
@@ -408,6 +518,14 @@ pub fn run() -> Result<()> {
     let gate_id = gate_toggle.id().clone();
     let icon = icon()?;
 
+    // Carried into the loop so the countdown can be rebuilt: who it belongs to and when it
+    // dies never change, only the clock does. `last_second` starts at the second the menu was
+    // first rendered, so the first redraw is a real tick rather than a duplicate of what is
+    // already on screen.
+    let sess_who = s.signed_in.clone();
+    let sess_expires = s.expires_ms;
+    let mut last_second = now_ms / 1000;
+
     // The icon must be created AFTER the event loop starts on macOS — tray-icon's own
     // documented ordering — so it is built inside StartCause::Init rather than here.
     let mut tray = None;
@@ -423,6 +541,25 @@ pub fn run() -> Result<()> {
         // happened by. A 150ms poll is imperceptible for a menu and free for the battery.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(150));
 
+        // THE COUNTDOWN, and only the countdown. Rebuilt when the wall SECOND changes rather
+        // than on every 150ms wake, so a menu measured in minutes redraws at most once a second
+        // — and not at all when there is no deadline to count, which is the signed-out case.
+        //
+        // Everything else here stays as it was at launch: identity, registration and the gate
+        // all describe FILES, and noticing those change needs the fsevents and refresh story
+        // this module deliberately does not have. A stamp already in hand is a different
+        // problem, and leaving it frozen made the line actively wrong rather than merely stale.
+        if sess_expires.is_some() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if now / 1000 != last_second {
+                last_second = now / 1000;
+                session_item.set_text(session_line(sess_who.as_deref(), sess_expires, now));
+            }
+        }
+
         if let Event::NewEvents(StartCause::Init) = event {
             tray = Some(
                 TrayIconBuilder::new()
@@ -433,6 +570,12 @@ pub fn run() -> Result<()> {
                     .build()
                     .expect("create the menu-bar item"),
             );
+            // FIRST RUN ONLY — the run that actually published the command is the run that has
+            // something new to say. `NEURALKIT_PANEL=1` forces it for a look without having to
+            // delete the symlink first.
+            if first_run || std::env::var_os("NEURALKIT_PANEL").is_some() {
+                let _ = crate::panel::welcome(None);
+            }
         }
 
         if let Ok(e) = menu_events.try_recv() {

@@ -231,9 +231,15 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
                         // flow itself is untouched — same device_code, same held stream,
                         // same QR.approve doing the mint and the key promotion. Only
                         // WHERE the approving session comes from changes: a code typed
-                        // here rather than a passkey on a second screen. Anything that
-                        // does not complete falls through to the QR, so a fresh machine
-                        // and a declined menu land in the same place.
+                        // here rather than a passkey on a second screen. A path that
+                        // FAILS falls through to the QR, so a fresh machine and a failed
+                        // attempt land in the same place.
+                        //
+                        // DECLINING IS NOT FAILING, and this used to conflate them
+                        // (2026-08-29). Esc, `q` and Ctrl-C returned the same `None` the
+                        // wildcard swallowed, so asking to leave drew a QR code — the
+                        // loudest possible answer to "no thanks". The picker now maps
+                        // that to `Outcome::Quit`.
                         // The frame carrying the code IS the moment the window opened.
                         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
                         match choose_method(&client, base_url, code, method, deadline, resume_email.take()).await? {
@@ -629,6 +635,14 @@ async fn choose_method(
             // on an inbox is the only one that can outlive what is left.
             Some(Method::Email) => Ok(Outcome::Restart(String::new())),
             Some(Method::Browser) => Ok(as_outcome(browser_approve(base_url, user_code)?)),
+            // DECLINING LEAVES. `select` returns `None` for Esc, `q` and Ctrl-C, and folding
+            // that into the wildcard below meant asking to quit drew a QR code instead.
+            // `Outcome::Quit` already existed for the same act at the code prompt (6532570,
+            // "quitting stops meaning success") — this is the picker's half of it, and it
+            // reaches `run`'s `Ok(false)` so the caller never enters the sealed REPL.
+            None => Ok(Outcome::Quit),
+            // `Method::Qr` — the one variant with no arm of its own, and the QR is exactly
+            // what it asks for.
             _ => Ok(Outcome::UseQr),
         }
     }

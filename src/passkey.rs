@@ -226,10 +226,17 @@ fn save(key: &SoftwareKey) -> Result<()> {
     // registration and its one-call shortcut. Truncating would silently unregister the machine:
     // the next login would find no id to claim and enrol a SECOND device row beside the live one.
     //
-    // AND DROP credential_id, because this function only runs when a key was just MINTED. The
-    // credential registered against the previous key cannot be signed for any more, so keeping
-    // its id would leave `is_registered()` true, the login skipping re-registration, and every
-    // assertion failing verification server-side with nothing to say why.
+    // AND DROP THE SOFTWARE credential_id, because this function only runs when a SOFTWARE key
+    // was just minted. The credential registered against the previous software key cannot be
+    // signed for any more, so keeping its id would leave `is_registered()` true, the login
+    // skipping re-registration, and every assertion failing verification server-side with
+    // nothing to say why.
+    //
+    // `enclave_credential_id` IS LEFT ALONE — it belongs to a key in the keychain that this
+    // function never touched. Dropping it too is what stranded a credential every time the gate
+    // was unticked: unreachable locally, unrevokable, and holding one of the twenty slots
+    // `Passkey.loginStart` publishes. Toggling the gate now switches between two live
+    // registrations instead of destroying one.
     let mut v: Value = std::fs::read_to_string(path()?)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
@@ -806,12 +813,28 @@ pub async fn login(base_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// ONE SLOT PER KEY, not one slot per machine.
+///
+/// This machine can hold TWO registrations at once — the software key's and the enclave key's —
+/// because they are different keypairs and the server already stores them as separate rows.
+/// Only this file ever forced a choice between them, and that choice was expensive: unticking
+/// the gate made `load_or_create` mint a software key, `save` dropped the single
+/// `credential_id`, and the enclave registration became unreachable AND unrevokable — a dead row
+/// consuming one of the twenty slots `Passkey.loginStart` publishes.
+///
+/// Keyed off the GATE rather than off the loaded key, because the gate is what decides which key
+/// `load_or_create` returns. The two cannot disagree in a way that matters: an armed gate that
+/// cannot be satisfied makes `enclave_gate()` refuse, and then nothing signs at all.
+fn cred_field() -> &'static str {
+    if gate_armed() { "enclave_credential_id" } else { "credential_id" }
+}
+
 /// The credential id the server knows this machine by. Kept beside the key: without it, the
 /// key cannot be looked up at login even though it would still verify.
 fn save_credential_id(cred_id: &[u8]) -> Result<()> {
     let path = path()?;
     let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    v["credential_id"] = Value::String(encode_hex(cred_id));
+    v[cred_field()] = Value::String(encode_hex(cred_id));
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     Ok(())
 }
@@ -819,11 +842,12 @@ fn save_credential_id(cred_id: &[u8]) -> Result<()> {
 fn read_credential_id() -> Result<Option<Vec<u8>>> {
     let Ok(raw) = std::fs::read_to_string(path()?) else { return Ok(None) };
     let v: Value = serde_json::from_str(&raw)?;
-    match v.get("credential_id").and_then(Value::as_str) {
+    match v.get(cred_field()).and_then(Value::as_str) {
         Some(h) => Ok(Some(decode_hex(h)?)),
         None => Ok(None),
     }
 }
+
 
 /// `Cli.login` — the whole sign-in in ONE request, for a machine the server already knows.
 ///
