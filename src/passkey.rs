@@ -642,14 +642,38 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
 /// code is. Everything downstream — the mint, the key promotion, the sealed channel — stays
 /// the path that already works.
 pub async fn assert_session(base_url: &str) -> Result<String> {
+    assert_session_slot(base_url, Slot::Active).await
+}
+
+/// WHICH KEY SIGNS, said explicitly instead of inferred from the gate.
+///
+/// `Active` follows the gate and is what every ordinary caller wants. `Software` names the
+/// on-disk key and its own slot WHATEVER the gate says — the menu's "use your on device passkey"
+/// row, where asking for the gated key would raise the very Watch prompt the row exists to avoid.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Slot {
+    Active,
+    Software,
+}
+
+pub(crate) async fn assert_session_slot(base_url: &str, slot: Slot) -> Result<String> {
     let base_url = base_url.trim_end_matches('/');
     let origin = base_url.to_string();
     let client = http(base_url)?;
-    let (key, created) = load_or_create()?;
+    let (key, created, field): (Box<dyn Signer>, bool, &str) = match slot {
+        Slot::Active => {
+            let (k, c) = load_or_create()?;
+            (k, c, cred_field())
+        }
+        Slot::Software => {
+            let (k, c) = load_or_create_software()?;
+            (Box::new(k), c, "credential_id")
+        }
+    };
     if created {
         return Err(anyhow!("this machine has no passkey yet"))
     }
-    let cred_id = read_credential_id()?.ok_or_else(|| anyhow!("this machine's passkey is not registered"))?;
+    let cred_id = read_slot(field)?.ok_or_else(|| anyhow!("this machine's passkey is not registered"))?;
 
     let start: Value = serde_json::from_str(
         &client
@@ -839,13 +863,17 @@ fn save_credential_id(cred_id: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_credential_id() -> Result<Option<Vec<u8>>> {
+fn read_slot(field: &str) -> Result<Option<Vec<u8>>> {
     let Ok(raw) = std::fs::read_to_string(path()?) else { return Ok(None) };
     let v: Value = serde_json::from_str(&raw)?;
-    match v.get(cred_field()).and_then(Value::as_str) {
+    match v.get(field).and_then(Value::as_str) {
         Some(h) => Ok(Some(decode_hex(h)?)),
         None => Ok(None),
     }
+}
+
+fn read_credential_id() -> Result<Option<Vec<u8>>> {
+    read_slot(cred_field())
 }
 
 

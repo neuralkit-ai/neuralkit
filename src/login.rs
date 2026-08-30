@@ -499,7 +499,7 @@ async fn choose_method(
     }
 
     if matches!(method, Some(Method::Passkey)) {
-        return Ok(as_outcome(passkey_approve(client, base_url, user_code).await?))
+        return Ok(as_outcome(passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await?))
     }
     if matches!(method, Some(Method::Email)) {
         return email_approve(client, base_url, user_code, deadline, None).await
@@ -522,7 +522,7 @@ async fn choose_method(
     // spot, and the person decides when to stop trying.
     let mut machine_key_refused = false;
     if can_passkey {
-        if passkey_approve(client, base_url, user_code).await? {
+        if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
             return Ok(Outcome::Approved)
         }
         can_passkey = false;
@@ -539,12 +539,6 @@ async fn choose_method(
     // travels by eye. When the browser is on THIS machine there is nothing to bridge: the code
     // goes straight there. Same code, same held stream, same QR.approve; only how the code
     // reaches the page changes.
-    let mut labels: Vec<&str> = vec![
-        "scan a QR code with your phone",
-        "use your passkey",
-        "email me a sign-in code",
-    ];
-    let mut paths: Vec<Method> = vec![Method::Qr, Method::Browser, Method::Email];
     // Absent means an older credentials.json that predates the field — offer it rather than
     // hide a path that may well work.
     let has_totp = prev
@@ -552,100 +546,256 @@ async fn choose_method(
         .and_then(|v| v.get("totp_enabled"))
         .map(|t| t.as_bool().unwrap_or(true))
         .unwrap_or(true);
-    if user.is_some() && has_totp {
-        labels.push("use your authenticator app");
-        paths.push(Method::Totp);
-    }
-    if can_passkey {
-        labels.push("use this machine's passkey");
-        paths.push(Method::Passkey);
-    }
     // THE LOCKED PATH STAYS ON THE MENU AS A RETRY — and it LEADS the menu. One label for
     // every situation that involves fetching the Watch: blocked before trying, refused
-    // mid-attempt, or the unregistered CATCH-22 (registration itself needs the key to
-    // sign, so hiding the wait left "put it on — then try again" with no way to try
-    // again). First and pre-selected, because reconnecting the Watch is the primary
-    // action whenever the row exists — the other doors wait below. Re-checking at the
-    // moment it is picked is what makes it a retry rather than a stale entry, since
-    // availability changes minute to minute; an unregistered pick hands over to the QR
-    // once the Watch is found, so the register step can finally land.
+    // mid-attempt, or the unregistered CATCH-22 (registration itself needs the key to sign).
+    // First and pre-selected, because reconnecting the Watch is the primary action whenever
+    // the row exists. Re-checking at the moment it is picked is what makes it a retry rather
+    // than a stale entry, since availability changes minute to minute.
     let watch_row = if crate::passkey::is_registered() {
         blocked.is_some() || (machine_key_refused && crate::passkey::gate_armed())
     } else {
         blocked.is_some()
     };
-    if watch_row {
-        labels.insert(0, "connect to Apple Watch");
-        paths.insert(0, Method::Passkey);
-    }
-    if paths.len() == 1 {
+
+    // ITS OWN PICKER, not `select`, for the same reason `front_door` has one: a row here can
+    // change WHAT THE MENU SHOWS rather than decide anything. `other ways in` sets the flag and
+    // falls through to the redraw, so the fuller list replaces the shorter one IN PLACE. Two
+    // `select` calls drew a second menu under the first and read as the whole sign-in re-running.
+    let shape = MenuShape {
+        watch_row,
+        can_passkey,
+        has_totp,
+        has_user: user.is_some(),
+    };
+    // A machine with nothing to choose between never sees a menu, which keeps a first run to
+    // one path.
+    if rows_for(false, shape).len() == 1 {
         return Ok(Outcome::UseQr)
     }
 
-    // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
-    // event::read blocks, and this task is holding the SSE connection open.
-    // A LOOP, because the Watch row is a RETRY: a failed attempt returns to this menu — the
-    // person keeps trying until it signs, or picks another door, or declines. Every other
-    // row still decides once.
     let header = format!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim(&format!("· {who}")));
-    let owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    let mut expanded = false;
     loop {
-        let (h, o) = (header.clone(), owned.clone());
-        let picked = tokio::task::spawn_blocking(move || {
-            let refs: Vec<&str> = o.iter().map(String::as_str).collect();
-            select(&h, &refs)
+        // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
+        // event::read blocks, and this task is holding the SSE connection open.
+        let (h, was) = (header.clone(), expanded);
+        let (picked, now) = tokio::task::spawn_blocking(move || {
+            let mut e = was;
+            pick(&h, &mut e, shape).map(|p| (p, e))
         })
         .await??;
+        expanded = now;
 
-        return match picked.map(|i| paths[i]) {
-            Some(Method::Totp) => match &user {
-                Some(u) => Ok(as_outcome(totp_approve(client, base_url, user_code, u).await?)),
-                None => Ok(Outcome::UseQr),
-            },
-            Some(Method::Passkey) => {
+        return match picked {
+            // NOT A WAY IN. The rest REPLACES this menu — nothing has printed since `select`
+            // returned, so erasing its rows leaves the cursor exactly where it started and the
+            // expanded list lands in the same place. Without this the second draw stacks under
+            // the first and reads as the whole sign-in running again.
+            Some(Row::More) => {
+                expanded = true;
+                continue
+            }
+            Some(Row::Watch) => {
                 // Asked AGAIN here, not reused from above: the menu may have been on screen a
-                // while, and the whole point of that entry is that the answer can have changed.
-                // Keep asking for a few seconds rather than answering once — a wrist raise, a
-                // Bluetooth reconnect and an unlock all take a moment, and the person has just
-                // told us they are fetching it.
-                // Two minutes. The person has just walked off to fetch the Watch, and a wrist
-                // raise, a Bluetooth reconnect and an unlock stack up on top of the walk. Giving up
-                // while they are still on their way back is the wrong failure, and Ctrl-C is always
-                // there for someone who changed their mind.
+                // while, and the whole point of this entry is that the answer can have changed.
+                // Two minutes, because a wrist raise, a Bluetooth reconnect and an unlock stack
+                // up on top of the walk to fetch it.
                 if let Some(why) = crate::passkey::wait_for_presence(120) {
                     println!();
                     println!("  {} {}", crate::style::red("✗"), crate::style::dim(why.lines().next().unwrap_or("still unavailable")));
+                    expanded = true;
                     continue
                 }
                 if !crate::passkey::is_registered() {
-                    // Watch found, but there is no credential to assert yet — UseQr means
-                    // exactly that, and THAT flow registers this machine now that the key
-                    // can sign.
+                    // Watch found, but there is no credential in the gated slot to assert with.
                     return Ok(Outcome::UseQr)
                 }
-                if passkey_approve(client, base_url, user_code).await? {
+                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
                     return Ok(Outcome::Approved)
                 }
                 // The ✗ and its reason were just printed by the attempt itself — nothing to
                 // add; the reappearing menu IS the "again, or another way?" question.
+                expanded = true;
                 continue
             }
+            Some(Row::OnDevice) => {
+                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Software).await? {
+                    return Ok(Outcome::Approved)
+                }
+                continue
+            }
+            Some(Row::Go(Method::Totp)) => match &user {
+                Some(u) => Ok(as_outcome(totp_approve(client, base_url, user_code, u).await?)),
+                None => Ok(Outcome::UseQr),
+            },
             // MINT A FRESH WINDOW FIRST. The five minutes started when QR.request issued this
             // user_code, before this menu was drawn — so deciding here spends them, and the wait
             // on an inbox is the only one that can outlive what is left.
-            Some(Method::Email) => Ok(Outcome::Restart(String::new())),
-            Some(Method::Browser) => Ok(as_outcome(browser_approve(base_url, user_code)?)),
+            Some(Row::Go(Method::Email)) => Ok(Outcome::Restart(String::new())),
+            Some(Row::Go(Method::Browser)) => Ok(as_outcome(browser_approve(base_url, user_code)?)),
+            Some(Row::Go(Method::Passkey)) => {
+                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
+                    return Ok(Outcome::Approved)
+                }
+                continue
+            }
             // DECLINING LEAVES. `select` returns `None` for Esc, `q` and Ctrl-C, and folding
-            // that into the wildcard below meant asking to quit drew a QR code instead.
-            // `Outcome::Quit` already existed for the same act at the code prompt (6532570,
-            // "quitting stops meaning success") — this is the picker's half of it, and it
-            // reaches `run`'s `Ok(false)` so the caller never enters the sealed REPL.
+            // that into a wildcard meant asking to quit drew a QR code instead.
             None => Ok(Outcome::Quit),
             // `Method::Qr` — the one variant with no arm of its own, and the QR is exactly
             // what it asks for.
             _ => Ok(Outcome::UseQr),
         }
     }
+}
+
+/// One menu line. NOT `Method`: two rows mean `Method::Passkey` with different KEYS, and `More`
+/// is not a way in at all — it asks to SEE them. `Method` is public and drives
+/// `--qr`/`--totp`/`--email`/`--passkey`, so a variant added for a menu affair would leak into
+/// the flag surface.
+#[derive(Clone, Copy)]
+enum Row {
+    Watch,
+    OnDevice,
+    Go(Method),
+    More,
+}
+
+/// What this machine is allowed to offer — settled before the picker takes the terminal, so the
+/// frame builder is pure and can run on every redraw without touching disk or the network.
+#[derive(Clone, Copy)]
+struct MenuShape {
+    watch_row: bool,
+    can_passkey: bool,
+    has_totp: bool,
+    has_user: bool,
+}
+
+/// TWO MENUS, and the gate decides which draws.
+///
+/// Someone who armed the Watch and left it upstairs has ONE thing they mean to do, and four
+/// alternatives stacked under it is a list to read rather than an action to take. So the gated
+/// menu leads with the Watch and holds the rest behind a single row. Every other case — a first
+/// run above all — keeps the flat menu it has always had, because there the paths are genuine
+/// peers and none of them is the obvious first move.
+fn rows_for(expanded: bool, s: MenuShape) -> Vec<(&'static str, Row)> {
+    let mut rows: Vec<(&'static str, Row)> = Vec::new();
+    if s.watch_row {
+        rows.push(("connect to Apple Watch", Row::Watch));
+        if expanded {
+            // Named for WHERE THE KEY IS, and asserted against its OWN slot — asking for the
+            // gated key here would raise the very Watch prompt this row steps around.
+            rows.push(("use your on device passkey", Row::OnDevice));
+            if s.has_user && s.has_totp {
+                rows.push(("use your authenticator app", Row::Go(Method::Totp)));
+            }
+            rows.push(("scan a QR code with your phone", Row::Go(Method::Qr)));
+            // No email and no browser row. Both are bootstrap paths — high friction, and aimed
+            // at a machine that holds no key yet. This menu belongs to one that does, and that
+            // has just said which key it wants to use.
+        } else {
+            rows.push(("other ways in", Row::More));
+        }
+    } else {
+        // The email path needs NOTHING on this machine — just an address someone can read mail
+        // at — which is what makes it the only option that works on a machine that has never
+        // signed in. Every other path is downstream of a session that already happened. The QR's
+        // job is bridging TWO devices — the terminal cannot show a browser, so the code travels
+        // by eye. When the browser is on THIS machine there is nothing to bridge: same code,
+        // same held stream, same QR.approve; only how the code reaches the page changes.
+        rows.push(("scan a QR code with your phone", Row::Go(Method::Qr)));
+        rows.push(("use your passkey", Row::Go(Method::Browser)));
+        rows.push(("email me a sign-in code", Row::Go(Method::Email)));
+        if s.has_user && s.has_totp {
+            rows.push(("use your authenticator app", Row::Go(Method::Totp)));
+        }
+        if s.can_passkey {
+            rows.push(("use this machine's passkey", Row::Go(Method::Passkey)));
+        }
+    }
+    rows
+}
+
+/// The sign-in picker — `front_door`'s shape, for `front_door`'s reason.
+///
+/// ONE raw-mode session, rows rebuilt EVERY frame, and a row that only changes state sets it and
+/// falls through to the redraw instead of returning. That is what makes `other ways in` replace
+/// the menu in place: `MoveUp` is counted from the frame just DRAWN, so a list that grows on the
+/// next frame still erases exactly what is on screen.
+///
+/// `select` cannot do this — its options are fixed for the life of the call, so expanding meant
+/// calling it twice, and the second menu drew UNDER the first.
+fn pick(header: &str, expanded: &mut bool, s: MenuShape) -> Result<Option<Row>> {
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    };
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None)
+    }
+
+    let mut out = std::io::stdout();
+    println!();
+    println!("{header}");
+    println!();
+
+    let mut sel = 0usize;
+    enable_raw_mode()?;
+    execute!(out, cursor::Hide)?;
+    let outcome = (|| -> Result<Option<Row>> {
+        loop {
+            let rows = rows_for(*expanded, s);
+            sel = sel.min(rows.len() - 1);
+            // Raw mode means the terminal no longer translates \n, so rows need \r\n.
+            for (i, (label, _)) in rows.iter().enumerate() {
+                if i == sel {
+                    print!("  {} {}\r\n", crate::style::cyan("❯"), crate::style::bold(label));
+                } else {
+                    print!("    {}\r\n", crate::style::dim(label));
+                }
+            }
+            out.flush()?;
+
+            let key = loop {
+                if let Event::Key(k) = event::read()? {
+                    // Windows reports press AND release; acting on both moves twice.
+                    if k.kind != KeyEventKind::Release {
+                        break k
+                    }
+                }
+            };
+            let drawn = rows.len();
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => sel = (sel + drawn - 1) % drawn,
+                KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % drawn,
+                KeyCode::Enter => match rows[sel].1 {
+                    // CHANGES WHAT IS SHOWN, decides nothing — set it and fall through to the
+                    // redraw, exactly as front_door's tray row does. Selection returns to the
+                    // Watch, which is still the action this menu is about.
+                    Row::More => {
+                        *expanded = true;
+                        sel = 0;
+                    }
+                    row => return Ok(Some(row)),
+                },
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                _ => {}
+            }
+            // Counted from the frame just drawn, never from the one about to be.
+            execute!(out, cursor::MoveUp(drawn as u16), Clear(ClearType::FromCursorDown))?;
+        }
+    })();
+
+    execute!(out, cursor::Show)?;
+    disable_raw_mode()?;
+    println!();
+    outcome
 }
 
 /// A one-of-N picker on the arrow keys. `None` = declined, or no terminal to draw on.
@@ -1131,10 +1281,15 @@ fn browser_approve(base_url: &str, user_code: &str) -> Result<bool> {
     }
 }
 
-async fn passkey_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<bool> {
+async fn passkey_approve(
+    client: &reqwest::Client,
+    base_url: &str,
+    user_code: &str,
+    slot: crate::passkey::Slot,
+) -> Result<bool> {
     println!();
-    println!("  {}", crate::style::dim("signing in with this machine's passkey…"));
-    let token = match crate::passkey::assert_session(base_url).await {
+    println!("  {}", crate::style::dim("signing in with this machine\u{2019}s passkey…"));
+    let token = match crate::passkey::assert_session_slot(base_url, slot).await {
         Ok(t) => t,
         Err(e) => {
             println!("  {} {}\n", crate::style::red("✗"), e);
