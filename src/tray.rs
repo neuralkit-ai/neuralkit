@@ -529,6 +529,9 @@ pub fn run() -> Result<()> {
     // The icon must be created AFTER the event loop starts on macOS — tray-icon's own
     // documented ordering — so it is built inside StartCause::Init rather than here.
     let mut tray = None;
+    // The welcome panel's owner — see the assignment below; a dropped `Retained` closes it.
+    #[cfg(target_os = "macos")]
+    let mut panel: Option<objc2::rc::Retained<objc2_app_kit::NSPanel>> = None;
     let event_loop = EventLoopBuilder::new().build();
     let menu_events = MenuEvent::receiver();
 
@@ -573,8 +576,11 @@ pub fn run() -> Result<()> {
             // FIRST RUN ONLY — the run that actually published the command is the run that has
             // something new to say. `NEURALKIT_PANEL=1` forces it for a look without having to
             // delete the symlink first.
+            // HELD, NOT DISCARDED. `welcome` hands back a `Retained` — ARC — so letting it drop
+            // releases the panel and it vanishes on the same frame it appeared. Parking it beside
+            // the icon gives it the icon's lifetime, which is the lifetime it should have.
             if first_run || std::env::var_os("NEURALKIT_PANEL").is_some() {
-                let _ = crate::panel::welcome(None);
+                panel = crate::panel::welcome(None);
             }
         }
 
@@ -590,7 +596,11 @@ pub fn run() -> Result<()> {
                 }
             } else if e.id() == &quit_id {
                 // Dropping the TrayIcon is what removes it from the bar — exiting with it
-                // alive leaves a ghost icon until the system notices the process died.
+                // alive leaves a ghost icon until the system notices the process died. The
+                // welcome panel goes the same way: releasing the last `Retained` closes it,
+                // so quitting takes the card with the icon it introduced.
+                #[cfg(target_os = "macos")]
+                panel.take();
                 tray.take();
                 *control_flow = ControlFlow::Exit;
             }

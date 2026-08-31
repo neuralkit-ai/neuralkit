@@ -48,6 +48,10 @@ phaze-crypto = { path = "../phaze/crates/phaze-crypto", features = ["pqc-kem"] }
 # The authenticator half — producing WebAuthn assertions natively (passkey.rs). Same crate the
 # SERVER verifies with, which is the point: the bytes this CLI makes are bytes it already reads.
 phaze-auth = { path = "../phaze/crates/phaze-auth" }
+
+# ALREADY IN THE BUILD — `tao` resolves all three for the tray, so naming them here downloads
+# nothing and compiles nothing new; it only makes what the panel uses reachable by name. The
+# feature list is explicit because objc2-app-kit gates every class behind one.
 # Session expiry is stored as an absolute ms timestamp and shown in the DEVICE's local
 # time, which needs a tz-aware conversion. Already in the tree transitively, so making it
 # direct costs no extra build; `clock` is the feature that provides `Local`.
@@ -87,3 +91,13 @@ strip = true      # Ensures debug symbols are removed.
 libc = "0.2.189"
 tao = "0.36.0"
 tray-icon = "0.24.2"
+# ALREADY IN THE BUILD — `tao` resolves all three for the tray, so naming them here downloads and
+# compiles nothing new; it only makes what the panel uses reachable by name. The feature list is
+# explicit because objc2-app-kit gates every class behind one.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = [
+    "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
+    "NSTextField", "NSControl", "NSButton", "NSCell",
+    "NSImage", "NSColor", "NSFont", "NSGlassEffectView",
+] }
