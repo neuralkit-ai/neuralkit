@@ -26,15 +26,21 @@
 //! EVERY STEP IS BEST-EFFORT. A panel that fails to draw must never stop the icon appearing, so
 //! nothing here returns an error — the worst case is no panel.
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::AnyObject;
 use objc2::{sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSCellImagePosition, NSColor, NSFloatingWindowLevel, NSFont,
+    NSApplication, NSBackingStoreType, NSButton, NSCellImagePosition, NSColor, NSFloatingWindowLevel, NSFont,
     NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSTextField, NSView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use raw_window_handle::{
+    AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
+};
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use wry::{dpi, Rect, WebView, WebViewBuilder};
 
 /// One factor so the panel scales as a whole. Doubling W and H alone would stretch the box and
 /// leave the type marooned in it — every inset and radius is derived from this instead. Type is
@@ -43,11 +49,11 @@ const SCALE: f64 = 2.0;
 /// macOS 26 rounds windows noticeably more than Big Sur–Sequoia did, and a 10pt panel next to a
 /// system window reads as the odd one out. There is no public API for the system value, so this
 /// is tuned by eye against a real window rather than derived.
-const RADIUS: f64 = 16.0 * SCALE;
+const RADIUS: f64 = 12.0 * SCALE;
 const W: f64 = 360.0 * SCALE;
 const H: f64 = 140.0 * SCALE;
 /// The left/right inset, and the width every label gets.
-const PAD: f64 = 20.0 * SCALE;
+const PAD: f64 = 12.0 * SCALE;
 
 /// AppKit's frame: origin bottom-left, y counted UP.
 fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
@@ -104,6 +110,108 @@ fn close_button(parent: &NSView, panel: &NSPanel, frame: NSRect, mtm: MainThread
     parent.addSubview(&button);
 }
 
+/// A `HasWindowHandle` over an `NSView` WE own.
+///
+/// `build_as_child` wants that trait and objc2's `NSView` does not implement it — the two crates
+/// have no knowledge of each other. `AppKitWindowHandle` is just a pointer to a view, which is
+/// exactly what we are holding, so the bridge is a newtype rather than a conversion.
+struct ViewHandle(NonNull<c_void>);
+
+impl HasWindowHandle for ViewHandle {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(self.0));
+        // SAFETY: the view outlives this handle — `welcome` holds the panel, the panel holds the
+        // glass, and the glass holds this view, all for as long as the caller keeps the panel.
+        Ok(unsafe { WindowHandle::borrow_raw(raw) })
+    }
+}
+
+/// The card, as markup. Inline rather than a file or a local server: it ships in the binary, has
+/// no path to get wrong, and `with_html` is the whole delivery mechanism.
+///
+/// `background: transparent` on both html and body is what lets the Liquid Glass behind the
+/// webview show through — WKWebView paints opaque white otherwise, which would hide the material
+/// the panel exists to show. `-apple-system` is the same system font the NSTextField path asks
+/// for, and `color-scheme` plus `color: canvastext` is the CSS spelling of `labelColor`: it
+/// follows light and dark rather than picking one.
+const CARD: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; color-scheme: light dark; }
+  body {
+    font: 15px -apple-system, BlinkMacSystemFont, sans-serif;
+    color: canvastext;
+    padding: 24px 24px 20px;
+    box-sizing: border-box;
+    display: flex; flex-direction: column; gap: 6px;
+    -webkit-user-select: none; user-select: none;
+  }
+  /* THE WHOLE CARD IS THE HANDLE, the way the NSTextField path had the window background be
+     one. `-webkit-app-region` is a CHROMIUM property — WebKit ignores it — so the drag is
+     driven from JS below instead, and this class only marks what counts. */
+  body { --drag: 1; }
+  h1 { font: 600 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; }
+  p  { font-size: 12px; margin: 0; opacity: .8; }
+  ul { list-style: none; margin: auto 0 0; padding: 0; font-size: 11.5px; opacity: .7; }
+  li { display: flex; gap: 12px; padding: 2px 0; }
+  code { font: 11.5px ui-monospace, SFMono-Regular, monospace; }
+  li span { opacity: .75; }
+</style>
+<script>
+  // WKWebView SWALLOWS THE MOUSE, which is why `setMovableByWindowBackground:` stopped working
+  // the moment a webview filled the panel: AppKit only drags when the click reaches a view that
+  // does not handle it. So the page reports the press and AppKit does the drag —
+  // `performWindowDragWithEvent:` runs the real thing, including the screen-edge behaviour.
+  // Anything interactive can opt out with `data-no-drag`.
+  addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || e.target.closest('[data-no-drag]')) return
+    window.ipc.postMessage('drag')
+  })
+</script>
+<h1>Neuralkit CLI is installed</h1>
+<p>The neuralkit command is now on your PATH.</p>
+<ul>
+  <li><code>neuralkit auth login</code><span>sign in</span></li>
+  <li><code>neuralkit --help</code><span>everything else</span></li>
+</ul>
+"#;
+
+/// Fill `parent` with a `WKWebView` rendering `CARD`.
+///
+/// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
+/// stay exactly as they were so the two can be compared side by side. What it is testing is
+/// whether HTML over `NSGlassEffectView` keeps the material, since a webview that paints its own
+/// background would defeat the panel's whole appearance.
+fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -> Option<WebView> {
+    let view = NonNull::new(parent as *const NSView as *mut c_void)?;
+    // WEAK, NOT RETAINED. The webview lives inside the panel's view tree, so a handler holding
+    // the panel strongly would close the loop — panel → glass → view → webview → handler →
+    // panel — and neither refcount would ever reach zero. `load()` returning None is the honest
+    // answer once the panel is gone.
+    let weak = Weak::from_retained(panel);
+    WebViewBuilder::new()
+        .with_transparent(true)
+        .with_ipc_handler(move |req| {
+            if req.body() != "drag" {
+                return
+            }
+            // The event AppKit is dispatching right now IS the mousedown the page just saw, which
+            // is exactly what `performWindowDragWithEvent:` wants.
+            let (Some(panel), Some(event)) = (weak.load(), NSApplication::sharedApplication(mtm).currentEvent())
+            else {
+                return
+            };
+            panel.performWindowDragWithEvent(&event);
+        })
+        .with_html(CARD)
+        .with_bounds(Rect {
+            position: dpi::LogicalPosition::new(0.0, 0.0).into(),
+            size: dpi::LogicalSize::new(W, H).into(),
+        })
+        .build_as_child(&ViewHandle(view))
+        .ok()
+}
+
 /// Show the panel, handing back the owner.
 ///
 /// THE CALLER MUST HOLD IT. `Retained` is ARC, so dropping the returned value releases the panel
@@ -113,7 +221,7 @@ fn close_button(parent: &NSView, panel: &NSPanel, frame: NSRect, mtm: MainThread
 /// `anchor` is the tray icon's screen position when it is known; the panel hangs below it,
 /// centred on the icon. Without one it lands centred-ish, which is the honest fallback for a
 /// tray that has not drawn yet.
-pub fn welcome(anchor: Option<(f64, f64)>) -> Option<Retained<NSPanel>> {
+pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<WebView>)> {
     // AppKit is main-thread-only, and this is the proof of it rather than the assumption. The
     // tray's event loop runs here, so it always succeeds; asking is what makes the rest safe.
     let mtm = MainThreadMarker::new()?;
@@ -201,15 +309,26 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<Retained<NSPanel>> {
     // TYPE STAYS AT SYSTEM SIZE while the panel scales. Doubling the point size would make the
     // panel bigger without making it more readable — macOS text is sized against the system
     // font, not against its container.
-    let line = W - PAD * 2.0;
-    label(&inner, "Neuralkit CLI is installed", 15.0, true,
-        rect(PAD, H - 42.0 * SCALE, line, 22.0), mtm);
-    label(&inner, "The neuralkit command is now on your PATH.", 12.0, false,
-        rect(PAD, H - 66.0 * SCALE, line, 18.0), mtm);
-    label(&inner, "neuralkit auth login     sign in", 11.5, false,
-        rect(PAD, 36.0 * SCALE, line, 16.0), mtm);
-    label(&inner, "neuralkit --help         everything else", 11.5, false,
-        rect(PAD, 16.0 * SCALE, line, 16.0), mtm);
+    // TWO WAYS TO FILL THE SAME CARD, so they can be compared rather than argued about.
+    // `NEURALKIT_PANEL_WEB=1` renders the content as HTML in a WKWebView; without it the
+    // NSTextField labels run exactly as before. The window, the glass and the close button are
+    // shared by both — only what fills the middle differs.
+    let web = if std::env::var_os("NEURALKIT_PANEL_WEB").is_some() {
+        web_card(&inner, &panel, mtm)
+    } else {
+        let line = W - PAD * 2.0;
+        label(&inner, "Neuralkit CLI is installed", 15.0, true,
+            rect(PAD, H - 42.0 * SCALE, line, 22.0), mtm);
+        label(&inner, "The neuralkit command is now on your PATH.", 12.0, false,
+            rect(PAD, H - 66.0 * SCALE, line, 18.0), mtm);
+        label(&inner, "neuralkit auth login     sign in", 11.5, false,
+            rect(PAD, 36.0 * SCALE, line, 16.0), mtm);
+        label(&inner, "neuralkit --help         everything else", 11.5, false,
+            rect(PAD, 16.0 * SCALE, line, 16.0), mtm);
+        None
+    };
+    // ON TOP OF EITHER. Added after the webview so it stays above it in z-order — a subview added
+    // first would end up behind the WKWebView and be unclickable.
     // Top-right, inset by half the padding so it sits in the corner rather than in the text
     // column. y is measured UP, so the top edge is H minus the button's own height.
     const BTN: f64 = 22.0;
@@ -219,5 +338,5 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<Retained<NSPanel>> {
     // is the focus theft this whole panel style is arranged to avoid; this shows the card and
     // leaves the frontmost app frontmost.
     panel.orderFrontRegardless();
-    Some(panel)
+    Some((panel, web))
 }

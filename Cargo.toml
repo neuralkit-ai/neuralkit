@@ -96,6 +96,14 @@ tray-icon = "0.24.2"
 # explicit because objc2-app-kit gates every class behind one.
 objc2 = "0.6"
 objc2-foundation = "0.3"
+# A TEST, behind NEURALKIT_PANEL_WEB — see panel.rs. Wry is the only genuinely NEW dependency
+# here (unlike the objc2 family, which tao already resolved); it embeds the OS's own WKWebView
+# rather than shipping a browser, and raw-window-handle is how it is told which NSView to sit in.
+# `transparent` IS NOT A DEFAULT FEATURE, and without it `with_transparent(true)` compiles and
+# does nothing — the `drawsBackground = NO` that stops WKWebView painting white is behind that
+# cfg. A webview that paints its own background hides the Liquid Glass the panel exists to show.
+wry = { version = "0.53", features = ["transparent"] }
+raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
     "NSTextField", "NSControl", "NSButton", "NSCell",

@@ -531,7 +531,8 @@ pub fn run() -> Result<()> {
     let mut tray = None;
     // The welcome panel's owner — see the assignment below; a dropped `Retained` closes it.
     #[cfg(target_os = "macos")]
-    let mut panel: Option<objc2::rc::Retained<objc2_app_kit::NSPanel>> = None;
+    let mut panel: Option<(objc2::rc::Retained<objc2_app_kit::NSPanel>, Option<wry::WebView>)> =
+        None;
     let event_loop = EventLoopBuilder::new().build();
     let menu_events = MenuEvent::receiver();
 
