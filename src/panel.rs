@@ -238,9 +238,8 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<usize> {
         let init_frame: extern "C" fn(Id, Sel, [f64; 4]) -> Id = core::mem::transmute(objc_msgSend as *const ());
         let frame = [0.0, 0.0, W, H];
 
-        // The labels' container, on BOTH paths — inside the glass on 26, the contentView itself
-        // below that. Nothing can be drawn without it, so a failure here is the one case that
-        // genuinely means "no window" rather than an empty one.
+        // The labels' container — the glass's `contentView`. Nothing can be drawn without it, so
+        // a failure here is the one case that genuinely means "no window" rather than an empty one.
         let inner = init_frame(alloc(cls(c"NSView"), sel(c"alloc")), sel(c"initWithFrame:"), frame);
         if inner.is_null() {
             return None;
@@ -255,24 +254,9 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<usize> {
             set_f(glass, sel(c"setCornerRadius:"), RADIUS);
             set_obj(glass, sel(c"setContentView:"), inner);
             set_obj(w, sel(c"setContentView:"), glass);
-        } else {
-            // BEFORE macOS 26 THERE IS NO GLASS — and `NSGlassEffectView` is the ONLY thing above that
-            // ever called `setContentView:`. Without this arm `inner`, which carries every label and
-            // the close button, was never attached: the window still opened, borderless and clear, as
-            // an empty shadowed rectangle with nothing to click. Info.plist declares a 13.0 floor, so
-            // that is a shipped configuration and not a hypothetical.
-            //
-            // The window pays for its own background here, because a plain view over a clear window
-            // leaves the text floating on nothing. Square corners on old macOS is the honest trade for
-            // a panel that works — and it is the masking path this file avoids on 26, where the glass
-            // owns its radius and a layer mask would fight the window's shadow.
-            set_bool(w, sel(c"setOpaque:"), true);
-            set_obj(w, sel(c"setBackgroundColor:"), get(cls(c"NSColor"), sel(c"windowBackgroundColor")));
-            set_obj(w, sel(c"setContentView:"), inner);
         }
 
-        // The labels' parent is the plain view, never the glass itself — on 26 it lives inside the
-        // glass, below that it IS the contentView. Either way `inner` is what they attach to.
+        // The labels' parent is the plain view inside the glass, never the glass itself.
         {
             // y counts UP, so the title sits highest and the commands sit near the floor.
             // TYPE STAYS AT SYSTEM SIZE while the panel scales. Doubling the point size would make
