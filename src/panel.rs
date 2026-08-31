@@ -126,57 +126,27 @@ impl HasWindowHandle for ViewHandle {
     }
 }
 
-/// The card, as markup. Inline rather than a file or a local server: it ships in the binary, has
-/// no path to get wrong, and `with_html` is the whole delivery mechanism.
+/// The card, as markup — now BUILT rather than written here. `panel/` is a phaze app; this is its
+/// output. Inline rather than a file or a local server, for the same reasons as before: it ships
+/// in the binary, has no path to get wrong, and `with_html` is the whole delivery mechanism.
 ///
-/// `background: transparent` on both html and body is what lets the Liquid Glass behind the
-/// webview show through — WKWebView paints opaque white otherwise, which would hide the material
-/// the panel exists to show. `-apple-system` is the same system font the NSTextField path asks
-/// for, and `color-scheme` plus `color: canvastext` is the CSS spelling of `labelColor`: it
-/// follows light and dark rather than picking one.
-const CARD: &str = r#"<!doctype html>
-<meta charset="utf-8">
-<style>
-  html, body { margin: 0; height: 100%; background: transparent; color-scheme: light dark; }
-  body {
-    font: 15px -apple-system, BlinkMacSystemFont, sans-serif;
-    color: canvastext;
-    padding: 24px 24px 20px;
-    box-sizing: border-box;
-    display: flex; flex-direction: column; gap: 6px;
-    -webkit-user-select: none; user-select: none;
-  }
-  /* THE WHOLE CARD IS THE HANDLE, the way the NSTextField path had the window background be
-     one. `-webkit-app-region` is a CHROMIUM property — WebKit ignores it — so the drag is
-     driven from JS below instead, and this class only marks what counts. */
-  body { --drag: 1; }
-  h1 { font: 600 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; }
-  p  { font-size: 12px; margin: 0; opacity: .8; }
-  ul { list-style: none; margin: auto 0 0; padding: 0; font-size: 11.5px; opacity: .7; }
-  li { display: flex; gap: 12px; padding: 2px 0; }
-  code { font: 11.5px ui-monospace, SFMono-Regular, monospace; }
-  li span { opacity: .75; }
-</style>
-<script>
-  // WKWebView SWALLOWS THE MOUSE, which is why `setMovableByWindowBackground:` stopped working
-  // the moment a webview filled the panel: AppKit only drags when the click reaches a view that
-  // does not handle it. So the page reports the press and AppKit does the drag —
-  // `performWindowDragWithEvent:` runs the real thing, including the screen-edge behaviour.
-  // Anything interactive can opt out with `data-no-drag`.
-  addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || e.target.closest('[data-no-drag]')) return
-    window.ipc.postMessage('drag')
-  })
-</script>
-<h1>Neuralkit CLI is installed</h1>
-<p>The neuralkit command is now on your PATH.</p>
-<ul>
-  <li><code>neuralkit auth login</code><span>sign in</span></li>
-  <li><code>neuralkit --help</code><span>everything else</span></li>
-</ul>
-"#;
+/// `panel/dist/panel.html` is ONE self-contained file because `panel/inline.mjs` folds the module
+/// and the stylesheet back into the document after `vite build`. That is not tidiness — `with_html`
+/// hands WKWebView a string with NO BASE URL, so anything left as a `src`/`href` has nothing to
+/// resolve against and silently never loads. The file is committed (see `panel/.gitignore`)
+/// because `include_str!` reads it at COMPILE time; a fresh clone cannot build without it.
+///
+/// THE TRADE, from wry's own docs: a page loaded from a string has a **`null` origin** — no
+/// localStorage, no fetch, no relative URLs. This card needs none of them. A panel that grows to
+/// need any wants `with_custom_protocol` + `with_url("wry://localhost")` instead — the same build
+/// output, served under a real origin, which is what Tauri does.
+///
+/// What used to be written here moved INTO the app and is still doing the same job: the
+/// transparency and `canvastext` rules are in `panel/src/styles.css`, the drag handler in
+/// `panel/index.html`.
+const PANEL: &str = include_str!("../panel/dist/panel.html");
 
-/// Fill `parent` with a `WKWebView` rendering `CARD`.
+/// Fill `parent` with a `WKWebView` rendering `PANEL`.
 ///
 /// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
 /// stay exactly as they were so the two can be compared side by side. What it is testing is
@@ -203,7 +173,7 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
             };
             panel.performWindowDragWithEvent(&event);
         })
-        .with_html(CARD)
+        .with_html(PANEL)
         .with_bounds(Rect {
             position: dpi::LogicalPosition::new(0.0, 0.0).into(),
             size: dpi::LogicalSize::new(W, H).into(),

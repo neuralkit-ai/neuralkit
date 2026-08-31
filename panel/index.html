@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Neuralkit</title>
+<script>
+  // WKWebView SWALLOWS THE MOUSE, which is why `setMovableByWindowBackground:` stopped working
+  // the moment a webview filled the panel: AppKit only drags when the click reaches a view that
+  // does not handle it. So the page reports the press and AppKit does the drag —
+  // `performWindowDragWithEvent:` runs the real thing, including the screen-edge behaviour.
+  // Anything interactive can opt out with `data-no-drag`.
+  addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || e.target.closest('[data-no-drag]')) return
+    window.ipc.postMessage('drag')
+  })
+</script>
+<div id="app"></div>
+<script type="module" src="/src/main.tsx"></script>

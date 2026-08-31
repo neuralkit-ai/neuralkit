@@ -1,0 +1,76 @@
+import { For } from '@madenowhere/phaze'
+import { s, c, watch } from '@madenowhere/phaze/dsl'
+import { spring, photonProp } from '@madenowhere/photon/phaze'
+
+---props
+state      : any
+steps      : any
+className? : string = ''
+---
+
+const DOT = 10
+const SIZE = DOT
+const GAP = 10
+const STEP = DOT + GAP
+const FULL = DOT + STEP        // the capsule at rest: two slots
+
+const DOT_COLOR = '#000000'
+
+const SPRING = { stiffness: 350, damping: 50 }
+
+const MARK = { height: `${SIZE}px`, backgroundColor: DOT_COLOR, mixBlendMode: 'darken' }
+
+const count = () => steps().length
+
+// One slot per step, plus the one the resting capsule reaches into.
+const slots = c([...steps(), ''].map((_, i) => i))
+
+const target = s(0)
+const pos = spring(target, SPRING)
+
+// Shorter way round, and on a tie the way that stays inside the bar.
+const advance = (i: number) => {
+  const n = count()
+  const cur = target.current()
+  const here = ((cur % n) + n) % n
+  const fwd = (((i - here) % n) + n) % n
+  const back = fwd - n
+  target.set(cur + (fwd < -back ? fwd : fwd > -back ? back : i > here ? fwd : back))
+}
+
+watch(advance(steps().indexOf(state())))
+
+const at = (v: number) => {
+  const n = count()
+  const whole = Math.floor(v)
+  const base = ((whole % n) + n) % n
+  return { p: v - whole, base, last: base === n - 1 }
+}
+
+const Dot = ({ slot }: any) => {
+  const el = s<HTMLElement>()
+  photonProp(el, 'style:opacity', pos, (v: number) => (!at(v).last && slot === at(v).base + 1 ? '0' : '1'))
+  return <span ref={el} class="absolute left-0 top-0 rounded-full" style={{ ...MARK, width: `${DOT}px`, transform: `translateX(${slot * STEP}px)` }} />
+}
+
+// A capsule is a left edge and a width. It is drawn at its widest and scaled
+// down, so the radius is divided by that scale to come out round — one shape,
+// one outline, exact at every width.
+const capsule = (left: (v: number) => number, width: (v: number) => number) => {
+  const el = s<HTMLElement>()
+  const v0 = target.current()
+
+  photonProp(el, 'style:transform', pos, (v: number) => `translateX(${left(v)}px) scaleX(${width(v) / FULL})`)
+  photonProp(el, 'style:borderRadius', pos, (v: number) => `${(SIZE / 2) / (width(v) / FULL)}px / ${SIZE / 2}px`)
+
+  return <span ref={el} class="absolute left-0 top-0 rounded-full z-[1]" style={{ ...MARK, width: `${FULL}px`, transformOrigin: 'left center', transform: `translateX(${left(v0)}px) scaleX(${width(v0) / FULL})`, borderRadius: `${(SIZE / 2) / (width(v0) / FULL)}px / ${SIZE / 2}px` }} />
+}
+
+<div class={`relative ${className}`} phaze:style={{ width: `${count() * STEP + DOT}px`, height: `${SIZE}px`, isolation: 'isolate' }}>
+  <For for:slot={slots}>
+    <Dot slot={slot} />
+  </For>
+
+  {capsule((v) => (at(v).base + (at(v).last ? at(v).p : 0)) * STEP, (v) => DOT + (1 - at(v).p) * STEP)}
+  {capsule((v) => (at(v).last ? 0 : (at(v).base + 2 - at(v).p) * STEP), (v) => DOT + at(v).p * STEP)}
+</div>

@@ -1,0 +1,7 @@
+node_modules/
+
+# `dist/panel.html` is what `src/panel.rs` include_str!s, so it MUST be tracked —
+# a fresh clone cannot compile without it. The intermediates it is folded from
+# (index.html + the hashed chunk) are noise.
+dist/*
+!dist/panel.html

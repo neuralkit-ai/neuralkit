@@ -1,0 +1,30 @@
+{
+  "name": "neuralkit-panel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node inline.mjs",
+    "dev": "vite",
+    "check": "phaze-check --noEmit"
+  },
+  "dependencies": {
+    "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
+    "@madenowhere/photon": "link:/Users/r/Minilab/photon"
+  },
+  "devDependencies": {
+    "@madenowhere/phaze-check": "link:/Users/r/Minilab/phaze/packages/phaze-check",
+    "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
+    "@madenowhere/phaze-tsplugin": "link:/Users/r/Minilab/phaze/packages/phaze-tsplugin",
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.0.16"
+  },
+  "pnpm": {
+    "overrides": {
+      "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
+      "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
+      "@madenowhere/photon": "link:/Users/r/Minilab/photon"
+    }
+  }
+}

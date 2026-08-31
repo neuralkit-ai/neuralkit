@@ -1,0 +1,23 @@
+{
+  "include": ["src/**/*", "vite.config.ts"],
+  "exclude": ["dist"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "noImplicitAny": false,
+    "types": ["vite/client"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@madenowhere/phaze",
+    "plugins": [
+      // Suppresses TS6133/6192 false-positives for directive imports consumed
+      // only via JSX `use:NAME` namespaces. Same entry neuralkit-web carries.
+      { "name": "@madenowhere/phaze-tsplugin" }
+    ]
+  }
+}
