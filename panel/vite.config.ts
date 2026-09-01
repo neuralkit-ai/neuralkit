@@ -5,12 +5,26 @@ import tailwindcss from '@tailwindcss/vite'
 // Vite 8 (Rolldown + oxc). Config copied from phaze-cloudflare's own
 // `plugin.ts` — the `esbuild` key is deprecated on 8, and oxc wants the
 // nested JsxOptions shape rather than esbuild's flat strings.
+// THE UI COMPONENT IS NOT COPIED HERE. `@web/` points at neuralkit-web's `src/`,
+// so StepIndicator.phaze has exactly ONE definition and cannot drift — a copy
+// nearly shipped a broken panel already, when the web-side prop contract changed
+// to `data`-loaded steps while this app still passed a signal.
+const WEB = new URL('../../neuralkit-web/src/', import.meta.url).pathname
+
 export default defineConfig({
-  // StepIndicator.phaze is a verbatim copy of neuralkit-web's, and its layout IS
-  // Tailwind utilities (`relative` + `absolute left-0 top-0` positioning every dot).
-  // Without the plugin those classes generate nothing and every span collapses to
-  // width 0 in the same spot — measured, not assumed.
+  // StepIndicator.phaze's layout IS Tailwind utilities (`relative` + `absolute
+  // left-0 top-0` positioning every dot). Without the plugin those classes generate
+  // nothing and every span collapses to width 0 in the same spot — measured, not
+  // assumed. `src/styles.css` carries the `@source` that makes Tailwind scan the
+  // out-of-tree file — required, and verified against a COLD build.
   plugins: [phazeCompile(), tailwindcss()],
+  resolve: {
+    alias: [{ find: /^@web\//, replacement: WEB }],
+    // Both projects `link:` phaze and photon to the SAME realpath, so importing
+    // across the boundary does not fork the runtime. Stated explicitly because a
+    // second copy would not error — it would just break reactivity.
+    dedupe: ['@madenowhere/phaze', '@madenowhere/photon'],
+  },
   oxc: {
     jsx: { runtime: 'automatic', importSource: '@madenowhere/phaze' },
     include: /\.(m?ts|[jt]sx|phaze)$/,
@@ -18,7 +32,7 @@ export default defineConfig({
   // Workspace-link contract: excluded from pre-bundling + the roots allowed,
   // or the dev server 404s the symlinked packages.
   optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/photon'] },
-  server: { fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '.'] } },
+  server: { fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', WEB, '.'] } },
   // The polyfill is off because the page ships as ONE inlined module with no
   // imports — there is nothing to preload, and `with_html` gives it no base URL
   // to preload from.

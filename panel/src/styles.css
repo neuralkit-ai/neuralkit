@@ -1,5 +1,16 @@
 @import 'tailwindcss';
 
+/* REQUIRED. StepIndicator.phaze lives in neuralkit-web, outside this project root,
+   so Tailwind's automatic source detection never sees it — and its layout IS
+   utility classes (`relative` + `absolute left-0 top-0` per dot, `rounded-full`
+   for the shape). Without this line a COLD build emits 6 selectors instead of 14,
+   losing `rounded-full` and `z-[1]`, and every dot renders square.
+   Do not "simplify" it away on the theory that the Vite plugin scans the module
+   graph: a WARM build does appear to work, which is exactly how this was nearly
+   deleted — the cache had already seen the file. Verify with
+   `rm -rf dist node_modules/.vite` before believing any result here. */
+@source '../../../neuralkit-web/src/components/ui/StepIndicator.phaze';
+
 /* Everything below is the panel's own chrome, and it deliberately sits AFTER the
    import: Tailwind's preflight resets h1/p/ul, so source order is what lets these
    win. One stylesheet, one order, nothing depending on where Vite injects a link. */

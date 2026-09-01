@@ -3,7 +3,8 @@ import { render } from '@madenowhere/phaze'
 import { s } from '@madenowhere/phaze/dsl'
 import { inc } from '@madenowhere/phaze/numeric'
 import { interval, seconds } from '@madenowhere/phaze/time'
-import { StepIndicator } from './StepIndicator.phaze'
+// THE one definition — neuralkit-web's. `@web/` is aliased in vite.config.ts.
+import { StepIndicator } from '@web/components/ui/StepIndicator.phaze'
 
 // The welcome card, as a phaze app rather than a Rust string literal. The copy is
 // the same one `panel.rs` shipped inline; what is new is that it can hold live
