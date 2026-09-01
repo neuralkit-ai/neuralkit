@@ -93,10 +93,32 @@ const TINT_ALPHA: f64 = 0.10;  // "smooth warp" — tuned by eye, NOT Warp's 30
 /// THE VIBRANCY DIAL. `NSVisualEffectView` has no lightness/tint knob — the material IS the
 /// appearance, each one a fixed recipe of blur, saturation and tint that the system owns.
 ///
-/// Real variants (objc2's `NSVisualEffectMaterial`): `Titlebar` `Selection` `Menu` `Popover`
-/// `Sidebar` `HeaderView` `Sheet` `WindowBackground` `HUDWindow` `FullScreenUI` `ToolTip`
-/// `ContentBackground` `UnderWindowBackground` `UnderPageBackground`. The darkest are `HUDWindow`
-/// and `UnderWindowBackground`; `Popover` and `Menu` are lighter; `Sheet` is lightest.
+/// MEASURED, darkest to lightest — each material rendered in this panel and its centre sampled
+/// from a window-id capture (background-independent: that buffer carries the material's own colour,
+/// not the desktop, so position does not matter):
+///
+/// | material                | lightness | variation |
+/// |-------------------------|-----------|-----------|
+/// | `UnderPageBackground`   | 120.7     | 52.8      |
+/// | `ContentBackground`     | 122.6     | 49.1      |
+/// | `WindowBackground`      | 122.6     | 49.1      |
+/// | `ToolTip`               | 124.3     | 38.9      |
+/// | `Sheet`                 | 125.8     | 43.1      |
+/// | `HeaderView`            | 129.1     | 37.2      |
+/// | `Sidebar`               | 130.7     | 34.3      |
+/// | `UnderWindowBackground` | 130.7     | 34.3      |
+/// | `Menu`                  | 133.7     | 29.1      |
+/// | `Titlebar`              | 133.9     | 28.8      |
+/// | `Selection`             | 134.6     | 25.7      |
+/// | `Popover`               | 136.7     | 24.2      |
+/// | `FullScreenUI`          | 139.7     | 20.0      |
+/// | `HUDWindow`             | 142.7     | 15.5      |
+///
+/// Variation moves INVERSELY with lightness, and that is the useful half: the darker materials pass
+/// more of the desktop through, so lighter also means more obscuring. `HUDWindow` is the most
+/// opaque of the set, not the darkest — this comment previously claimed the opposite, written from
+/// assumption before anything was measured.
+///
 /// (`Light`/`Dark`/`MediumLight`/`UltraDark`/`AppearanceBased` also exist but are deprecated.)
 const MATERIAL: NSVisualEffectMaterial = NSVisualEffectMaterial::HUDWindow;
 
