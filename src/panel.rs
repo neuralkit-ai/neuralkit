@@ -56,6 +56,15 @@ const H: f64 = 400.0 * SCALE;
 /// The left/right inset, and the width every label gets.
 const PAD: f64 = 12.0 * SCALE;
 
+/// Glass tint — the ONLY appearance dial `NSGlassEffectView` exposes. There is no blur amount on
+/// it (or on `NSVisualEffectView`): blur is baked into the material, and the style enum has just
+/// two members. So darkness/lightness is this.
+///
+/// WHITE lightens the material, BLACK darkens it; alpha is the strength. `None` = untinted, the
+/// system material as-is.
+const TINT_WHITE: f64 = 0.0;   // 1.0 = white (lighten) · 0.0 = black (darken)
+const TINT_ALPHA: f64 = 0.0;  // 0.0 = no tint · ~0.5 is heavy
+
 /// AppKit's frame: origin bottom-left, y counted UP.
 fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
@@ -143,6 +152,7 @@ define_class!(
         fn can_become_key_window(&self) -> bool {
             true
         }
+
     }
 );
 
@@ -395,6 +405,7 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // NSView property. Without it the rounded material still paints its square bounds, which shows
     // as a thin dark box around the card under `Regular` (invisible under `Clear`).
     glass.setClipsToBounds(true);
+    glass.setTintColor(Some(&NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA)));
     // A window resizes its own contentView, so the glass follows for free. `inner` is the GLASS's
     // contentView, not the window's, so it needs the mask spelled out — otherwise the labels and
     // the webview keep the launch size inside a grown card.
