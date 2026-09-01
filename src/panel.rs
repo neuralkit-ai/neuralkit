@@ -32,8 +32,10 @@ use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSCellImagePosition, NSColor,
     NSFloatingWindowLevel, NSFont,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSTextField, NSView,
-    NSResponder, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBezierPath, NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSTextField, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSResponder, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{
@@ -47,23 +49,130 @@ use wry::{dpi, Rect, WebView, WebViewBuilder};
 /// leave the type marooned in it — every inset and radius is derived from this instead. Type is
 /// the deliberate exception: macOS sizes text against the system font, not against its container.
 const SCALE: f64 = 2.0;
-/// macOS 26 rounds windows noticeably more than Big Sur–Sequoia did, and a 10pt panel next to a
-/// system window reads as the odd one out. There is no public API for the system value, so this
-/// is tuned by eye against a real window rather than derived.
-const RADIUS: f64 = 12.0 * SCALE;
+/// MEASURED, NOT TUNED. Windows captured by id (`screencapture -l<id>` keeps the alpha), each
+/// corner's edge located to SUB-PIXEL precision by coverage (a row's uncovered width = its summed
+/// alpha), then least-squares fitted to a circle:
+///
+/// | window            | r     | rms  |
+/// |-------------------|-------|------|
+/// | Arc               | 15.85 | 0.24 |
+/// | VS Code           | 15.85 | 0.24 |
+/// | iTerm2            | 14.95 | 0.23 |
+/// | this panel        | 14.95 | 0.23 |
+/// | Warp              | 10.80 | 0.24 |
+///
+/// Ordinary document windows agree at 15.85; Warp rounds itself tighter. An earlier THRESHOLD fit
+/// gave 13.75/12.75/8.75 for the same windows — do not trust it, it reads where the antialiased
+/// ramp STARTS rather than where the edge is, and it called two visibly different corners equal.
+///
+/// The rendered corner is not this constant: 12 here measures 14.95.
+///
+/// NOT SCALED BY `SCALE`. A native window's corner is the same size on a 400pt window and a 1400pt
+/// one, so scaling this with the panel is what made it disagree with everything beside it.
+///
+/// Read by every arm: `Terminal` rounds its fill with it, `Vibrancy` and `Glass` pass it to their
+/// own `setCornerRadius:`.
+const RADIUS: f64 = 12.0;
 const W: f64 = 400.0 * SCALE;
 const H: f64 = 400.0 * SCALE;
 /// The left/right inset, and the width every label gets.
 const PAD: f64 = 12.0 * SCALE;
 
-/// Glass tint — the ONLY appearance dial `NSGlassEffectView` exposes. There is no blur amount on
-/// it (or on `NSVisualEffectView`): blur is baked into the material, and the style enum has just
-/// two members. So darkness/lightness is this.
+/// THE DARKNESS DIAL — live in `Backdrop::Terminal` and in `Backdrop::Glass`, inert in `Vibrancy`
+/// (a material owns its own colour and takes no tint).
 ///
-/// WHITE lightens the material, BLACK darkens it; alpha is the strength. `None` = untinted, the
-/// system material as-is.
+/// In Terminal mode this is not decoration, it IS the window's backdrop: the fill this paints is
+/// the only thing standing between the desktop and the page. **ALPHA MUST BE > 0** — the server
+/// blurs "non-fully-transparent pixels", so at alpha 0 there is nothing to blur and the panel goes
+/// clear. Terminal.app uses 0.01 for a near-invisible pane; a card wants more.
+///
+/// WHITE lightens, BLACK darkens; alpha is the strength.
 const TINT_WHITE: f64 = 0.0;   // 1.0 = white (lighten) · 0.0 = black (darken)
-const TINT_ALPHA: f64 = 0.0;  // 0.0 = no tint · ~0.5 is heavy
+const TINT_ALPHA: f64 = 0.10;  // "smooth warp" — tuned by eye, NOT Warp's 30
+
+/// THE VIBRANCY DIAL. `NSVisualEffectView` has no lightness/tint knob — the material IS the
+/// appearance, each one a fixed recipe of blur, saturation and tint that the system owns.
+///
+/// Real variants (objc2's `NSVisualEffectMaterial`): `Titlebar` `Selection` `Menu` `Popover`
+/// `Sidebar` `HeaderView` `Sheet` `WindowBackground` `HUDWindow` `FullScreenUI` `ToolTip`
+/// `ContentBackground` `UnderWindowBackground` `UnderPageBackground`. The darkest are `HUDWindow`
+/// and `UnderWindowBackground`; `Popover` and `Menu` are lighter; `Sheet` is lightest.
+/// (`Light`/`Dark`/`MediumLight`/`UltraDark`/`AppearanceBased` also exist but are deprecated.)
+const MATERIAL: NSVisualEffectMaterial = NSVisualEffectMaterial::HUDWindow;
+
+/// Backdrop blur radius, in points. 0 = off.
+///
+/// 64 IS WARP'S OWN NUMBER, read from its preferences: `OverrideBlur = 64`, `OverrideOpacity = 30`
+/// (`defaults read dev.warp.Warp-Stable`). This sat at 20 and was reported by eye as "the iTerm2
+/// blur" — which it was, to two decimal places: iTerm2's profile carries `Blur Radius = 20.294`.
+/// Warp and iTerm2 call the SAME private function (neither links it; both resolve it at runtime,
+/// and neither binary contains any other blur API); the whole difference between the two looks is
+/// this number and the opacity beside it.
+///
+/// LIVE IN `Backdrop::Terminal`, and MEASURED INERT IN `Vibrancy`. In vibrancy the call still
+/// succeeds (rc=0) but has nothing to do — the material already sampled the desktop, blurred it and
+/// painted it in, so no pixel is see-through for the server to blur behind. Radius 0 and radius 200
+/// were captured over the same desktop and came back pixel-identical inside the panel (2026-09-01).
+/// That is why `Terminal` is the default: it is the only mode where this number means anything.
+///
+/// This is the trade iTerm2/Terminal.app/Warp/Alacritty make — the PRIVATE SkyLight call INSTEAD
+/// OF a visual effect view, never alongside one.
+/// Private API, so: it can break on any macOS release, and it bars the Mac App Store — not a
+/// constraint here, since this ships via npm + Developer ID.
+const BLUR_RADIUS: i32 = 64;
+
+/// How the panel gets its backdrop. Three real implementations, not three settings — each is a
+/// different macOS mechanism with a different set of dials, and none of them is a superset.
+///
+/// · **`Terminal` — "SMOOTH WARP", the shipped configuration.** Warp's structure, reached in
+///   AppKit. The whole recipe, because every piece of it was paid for:
+///
+///   | piece | value | why |
+///   |---|---|---|
+///   | `BACKDROP` | `Terminal` | no material, so nothing samples focus |
+///   | window background | **alpha 0.01** | NOT `clearColor` — see `setBackgroundColor` below |
+///   | `BLUR_RADIUS` | 64 | Warp's own `OverrideBlur` |
+///   | `TINT_ALPHA` | **0.10** | tuned by eye. Warp's own is 30, which reads too heavy here |
+///   | style mask | `Titled` + `FullSizeContentView` | the system shadow, and its window shape |
+///   | fill | rounded `NSBezierPath` | no mask, no material, no CALayer |
+///
+///   MEASURED: focused vs unfocused delta **0.0** on every channel, the same as Warp itself.
+///   Corner r=14.95 rms=0.23, against Warp's 10.80 rms=0.24 — same curve quality, larger radius.
+///
+///   **what Warp, iTerm2, Terminal.app and Alacritty do.** The window paints
+///   its OWN low-alpha rounded fill and the WINDOW SERVER blurs whatever shows through it. The
+///   server blurs by ALPHA CHANNEL, so the rounded fill gives a rounded blur for free — no mask, no
+///   clip. Dials: `BLUR_RADIUS` (a real number, only here), `TINT_WHITE`/`TINT_ALPHA`, `RADIUS`.
+///   Colour cannot shift with focus because nothing is sampling focus — we drew it.
+///   Warp is not a webview and not Tauri: it paints via wgpu/Metal. This is the same STRUCTURE —
+///   own alpha, server blur — reached with AppKit drawing instead.
+///
+///
+/// · **`Vibrancy` — `NSVisualEffectView`, and exactly what Tauri does** (`window-vibrancy`'s
+///   `apply_vibrancy` is its only macOS entry point; that crate's `apply_blur` is Windows-ONLY, so
+///   Tauri has no macOS blur radius at all). The system material owns blur, saturation and colour
+///   as one recipe, so `MATERIAL` is the whole dial and `BLUR_RADIUS` is inert. `state = .active`
+///   pins the appearance; its own `setCornerRadius:` rounds the effect.
+///
+/// · **`Glass` — `NSGlassEffectView`, macOS 26.** The newest material, kept because it is the one
+///   Apple will keep developing. Its cost is the focus shift: it has NO state property to pin the
+///   appearance (Apple's forums carry that question unanswered), so it goes clear on focus and
+///   frosted off it, and no tint closes the gap — transmission differs, not brightness.
+#[derive(PartialEq)]
+#[allow(dead_code)] // the two non-selected arms are switchable configuration, not dead ends
+enum Backdrop {
+    Terminal,
+    Vibrancy,
+    Glass,
+}
+const BACKDROP: Backdrop = Backdrop::Terminal;
+
+// SAFETY: SkyLight's undocumented per-window blur, signature per the long-standing public
+// reverse-engineering of it. A wrong signature would be UB, so it is written once, here.
+unsafe extern "C" {
+    fn CGSDefaultConnectionForThread() -> *mut c_void;
+    fn CGSSetWindowBackgroundBlurRadius(conn: *mut c_void, window: isize, radius: i32) -> i32;
+}
 
 /// AppKit's frame: origin bottom-left, y counted UP.
 fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
@@ -126,6 +235,7 @@ fn close_button(parent: &NSView, panel: &NSPanel, frame: NSRect, mtm: MainThread
     parent.addSubview(&button);
 }
 
+define_class!(
 /// An `NSPanel` that will accept key status.
 ///
 /// A BORDERLESS WINDOW REFUSES TO BECOME KEY. `NSWindow.canBecomeKeyWindow` is documented as true
@@ -141,7 +251,6 @@ fn close_button(parent: &NSView, panel: &NSPanel, frame: NSRect, mtm: MainThread
 /// `NonactivatingPanel` is in the style mask: that bit exists so a panel can take key status
 /// WITHOUT activating its owning application — so the card can follow the cursor while the
 /// frontmost app keeps its focus.
-define_class!(
     #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "NKWelcomePanel"]
@@ -155,6 +264,59 @@ define_class!(
 
     }
 );
+
+/// The `Backdrop::Terminal` backdrop: one squircle fill, at the window's own alpha.
+///
+/// The window server blurs "non-fully-transparent pixels", so whatever alpha this paints IS the
+/// shape of the blur — rounding the fill rounds the blur, the shadow and the window together, with
+/// nothing clipped and nothing masked.
+///
+/// A SQUIRCLE, NOT A ROUNDED RECT, and that distinction is the whole reason this is a hand-built
+/// path instead of `cornerRadius`. Apple rounds a corner with a cubic whose control points sit at
+/// `0.1765 * R` from the corner; a circular arc puts them at `0.4477 * R`. The squircle's controls
+/// are far closer in, so it hugs the corner and eases out into a long near-straight tail, while a
+/// circle meets the edge at a visible break. NO value of `cornerRadius` produces this curve, and
+/// `cornerCurve = .continuous` is a different curve again — measured, it renders straighter than a
+/// native window, not smoother.
+///
+/// The constant is read off the path `tailwind-ios-corners` ships (`index.js`, the mask SVG):
+/// `M0 50 C0 8.825 8.825 0 50 0 …` — over a quadrant of 50, the controls sit at 8.825.
+define_class!(
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NKBackdropView"]
+    struct BackdropView;
+
+    impl BackdropView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            if TINT_ALPHA <= 0.0 { return }
+            // THE WARP METHOD: we paint the card ourselves and nothing else does. No material, so
+            // nothing samples window focus and the colour cannot shift — Warp measures a delta of
+            // exactly 0.0 between focused and unfocused for that reason.
+            //
+            // This only draws cleanly because the WINDOW's background carries alpha 0.01. With a
+            // truly clear background the server derived the blur region from THIS path's
+            // antialiased edge and treated any non-zero alpha as fully covered, so the corner came
+            // out ringed by full-strength backdrop under a fraction of the tint.
+            unsafe {
+                NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), RADIUS, RADIUS).fill();
+            }
+        }
+    }
+);
+
+#[allow(non_snake_case)]
+impl BackdropView {
+    /// `define_class!` does not inherit initialisers, so the superclass one is forwarded by hand —
+    /// the same shim Tauri's `window-vibrancy` writes for its own subclass. Dispatched on the
+    /// subclass rather than through `super(...)`: we do not override `initWithFrame:`, so the
+    /// message finds `NSView`'s implementation anyway.
+    fn initWithFrame(this: objc2::rc::Allocated<Self>, frame: NSRect) -> Retained<Self> {
+        unsafe { msg_send![this, initWithFrame: frame] }
+    }
+}
 
 /// A `HasWindowHandle` over an `NSView` WE own.
 ///
@@ -320,17 +482,34 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
         None => (0.0, 0.0),
     };
 
-    // Borderless is the EMPTY style set, so `NonactivatingPanel` alone is the whole mask: no
-    // titlebar, and no focus taken from the frontmost app when it appears.
-    // `Resizable` on a BORDERLESS panel: there is no titlebar or grip, but AppKit still gives the
-    // window's edges the resize hit-area and cursors once the bit is set. Everything below — the
-    // glass, its contentView, the webview — has to be told to follow, or the window grows while its
-    // contents stay the launch size.
+    // TITLED, AND THAT IS WHAT ROUNDS THE CORNERS. A borderless window has NO SHAPE as far as the
+    // window server is concerned — it is a square frame that happens to contain transparent pixels.
+    // That is fine for the shadow, which is derived from content alpha, but the server-side blur is
+    // composited over the FRAME, so it fills the corners straight back in no matter what shape the
+    // content paints. Measured: a squircle fill of extent 24 rendered a corner of 9 with the blur
+    // on, and the correct squircle with it off.
+    //
+    // iTerm2 is the proof by counter-example — with "No Title Bar" its corners go square, and that
+    // is a long-standing open issue there, not a bug we can out-draw. Every translucent terminal
+    // with round corners has a real titlebar; the SYSTEM shapes those windows, and the blur is
+    // clipped because the server knows the shape.
+    //
+    // So the titlebar is present and invisible: `FullSizeContentView` lets our content run under
+    // it, `titlebarAppearsTransparent` stops it painting, `TitleVisibility::Hidden` drops the text,
+    // and the three traffic lights are hidden — the panel already draws its own close button.
+    // `NonactivatingPanel` still keeps focus with the frontmost app.
+    //
+    // `Resizable` gives the window's edges the resize hit-area and cursors. Everything below — the
+    // backdrop, its contentView, the webview — has to be told to follow, or the window grows while
+    // its contents stay the launch size.
     let panel: Retained<KeyablePanel> = unsafe {
         msg_send![
             KeyablePanel::alloc(mtm),
             initWithContentRect: rect(x, y, W, H),
-            styleMask: NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::Resizable,
+            styleMask: NSWindowStyleMask::Titled
+                | NSWindowStyleMask::FullSizeContentView
+                | NSWindowStyleMask::NonactivatingPanel
+                | NSWindowStyleMask::Resizable,
             backing: NSBackingStoreType::Buffered,
             defer: false,
         ]
@@ -342,6 +521,25 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // `-close` today — every path here is `orderOut:` — but that is a property of the current
     // wiring, not a promise.
     unsafe { panel.setReleasedWhenClosed(false) };
+
+    // TITLED PURELY FOR THE SHADOW. A borderless window gets no shadow of its own — macOS derives
+    // one from whatever alpha the content paints, which for a translucent card is far weaker than
+    // every window beside it. A titled window gets the SYSTEM shadow, the same one Warp and every
+    // other app has. The titlebar itself never appears: `FullSizeContentView` puts our content
+    // under it, the bar is transparent, the title text hidden, and the traffic lights hidden
+    // because the panel draws its own close button.
+    panel.setTitlebarAppearsTransparent(true);
+    panel.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+    for kind in [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ] {
+        if let Some(b) = panel.standardWindowButton(kind) {
+            b.setHidden(true);
+        }
+    }
+
     // Above ordinary windows, below the menu bar. `setFloatingPanel:` is the panel-native way to
     // say it; the level is the blunt instrument underneath, set too so the intent is explicit.
     panel.setFloatingPanel(true);
@@ -364,7 +562,18 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // The glass view below is what carries the material and the shape.
     panel.setOpaque(false);
     panel.setHasShadow(true);
-    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    // ALPHA 0.01, NOT CLEAR — and that distinction is the whole CGS recipe. The server blurs
+    // "non-fully-transparent pixels", so with a truly clear background the only non-zero alpha in
+    // the window is our CONTENT, and the blur region gets derived from the content's antialiased
+    // edge. It treats any non-zero alpha as fully covered, so a 10%-covered edge pixel receives
+    // 100% of the blurred backdrop under 10% of the tint — measured as a bright rim, interior
+    // luminance 133 against 187-192 at the corner.
+    //
+    // A hair of alpha across the whole rect makes the blur uniform, and the SHAPE then comes from
+    // AppKit — here `NSGlassEffectView`'s own `cornerRadius` plus `clipsToBounds`. It has to: CGS
+    // has no window-shape call at all (CGSPrivate.h carries only `CGSSetWindowTransform`, which is
+    // affine). Terminal.app uses exactly 0.01, and it is the documented form of the recipe.
+    panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.01)));
     // DRAGGABLE BY ITS BODY. There is no titlebar to grab, so the background IS the handle —
     // AppKit does the whole drag, including the screen-edge behaviour, from this one flag.
     panel.setMovableByWindowBackground(true);
@@ -396,24 +605,61 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // regard to z-order".
     let frame = rect(0.0, 0.0, W, H);
     let inner = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
-    // Regular is the DENSE variant — Liquid Glass is designed to sit under content, so it reads
-    // as a dark slab rather than as glass. Clear is the one that stays transparent.
-    glass.setStyle(NSGlassEffectViewStyle::Regular);
-    glass.setCornerRadius(RADIUS);
-    // Part of the documented NSGlassEffectView setup, and NOT a layer mask — `clipsToBounds` is an
-    // NSView property. Without it the rounded material still paints its square bounds, which shows
-    // as a thin dark box around the card under `Regular` (invisible under `Clear`).
-    glass.setClipsToBounds(true);
-    glass.setTintColor(Some(&NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA)));
-    // A window resizes its own contentView, so the glass follows for free. `inner` is the GLASS's
-    // contentView, not the window's, so it needs the mask spelled out — otherwise the labels and
-    // the webview keep the launch size inside a grown card.
     inner.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
-    glass.setContentView(Some(&inner));
-    panel.setContentView(Some(&glass));
+
+    match BACKDROP {
+        // WARP / iTERM2 / TERMINAL.APP: we paint the backdrop, the server blurs behind it.
+        Backdrop::Terminal => {
+            let back = BackdropView::initWithFrame(BackdropView::alloc(mtm), frame);
+            back.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            back.addSubview(&inner);
+            panel.setContentView(Some(&back));
+        }
+        // TAURI'S ANSWER: a system material. No blur radius exists in this mode, by construction.
+        Backdrop::Vibrancy => {
+            let vev = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+            vev.setMaterial(MATERIAL);
+            // BEHIND the window — blend with what is on screen behind the panel, not with our own
+            // content, which is what makes it read as a translucent card rather than a tinted box.
+            vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            // Pin the appearance. The default is FollowsWindowActiveState, which is exactly the
+            // clear-on-focus / frosted-off-focus shift the glass cannot escape.
+            vev.setState(NSVisualEffectState::Active);
+            // NSVisualEffectView's OWN `setCornerRadius:` — undocumented, but it is what Tauri's
+            // `window-vibrancy` calls (macos/internal.rs:47). It rounds the EFFECT, so the blur and
+            // the window shadow follow the shape; a CALayer `cornerRadius` is view-local and frays.
+            unsafe { let _: () = msg_send![&*vev, setCornerRadius: RADIUS]; };
+            vev.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            // NSVisualEffectView has no `contentView` slot — content is an ordinary subview.
+            vev.addSubview(&inner);
+            panel.setContentView(Some(&vev));
+        }
+        // MACOS 26 LIQUID GLASS. Newest material; cannot pin its appearance.
+        Backdrop::Glass => {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+            // Regular is the DENSE variant — Liquid Glass is designed to sit under content, so it
+            // reads as a dark slab rather than as glass. Clear is the one that stays transparent.
+            glass.setStyle(NSGlassEffectViewStyle::Clear);
+            glass.setCornerRadius(RADIUS);
+            // NOT a layer mask — `clipsToBounds` is an NSView property. Without it the rounded
+            // material still paints its square bounds, showing as a thin dark box under `Regular`.
+            glass.setClipsToBounds(true);
+            glass.setTintColor(Some(&NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA)));
+            // The header is explicit that the contentView is the supported slot: it "only
+            // guarantees the `contentView` will be placed inside the glass effect; arbitrary
+            // subviews aren't guaranteed specific behavior with regard to z-order".
+            glass.setContentView(Some(&inner));
+            panel.setContentView(Some(&glass));
+        }
+    }
     // Small enough to still be a card, large enough that the glass corners never overlap.
     panel.setContentMinSize(NSSize::new(W / 2.0, H / 2.0));
 
@@ -456,6 +702,19 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // `makeKeyAndOrderFront:` activating the app is a property of a normal NSWindow.
     // `NonactivatingPanel` exists precisely so a panel can take key WITHOUT activating its owner,
     // which is the whole reason that bit is in the style mask.
+    if BLUR_RADIUS > 0 {
+        // Window must exist and be non-opaque before this lands.
+        unsafe {
+            CGSSetWindowBackgroundBlurRadius(
+                CGSDefaultConnectionForThread(),
+                panel.windowNumber(),
+                BLUR_RADIUS,
+            );
+        }
+    }
+
     panel.makeKeyAndOrderFront(None);
+
+
     Some((panel, web))
 }

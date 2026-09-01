@@ -111,6 +111,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
     "NSTextField", "NSControl", "NSButton", "NSCell",
     "NSImage", "NSColor", "NSFont", "NSGlassEffectView",
+    "NSVisualEffectView", "NSBezierPath",
 ] }
 
 [dev-dependencies]
