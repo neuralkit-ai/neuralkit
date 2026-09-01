@@ -193,10 +193,18 @@ const BLUR_RADIUS: i32 = 64;
 ///   as one recipe, so `MATERIAL` is the whole dial and `BLUR_RADIUS` is inert. `state = .active`
 ///   pins the appearance; its own `setCornerRadius:` rounds the effect.
 ///
-/// · **`Glass` — `NSGlassEffectView`, macOS 26.** The newest material, kept because it is the one
-///   Apple will keep developing. Its cost is the focus shift: it has NO state property to pin the
-///   appearance (Apple's forums carry that question unanswered), so it goes clear on focus and
-///   frosted off it, and no tint closes the gap — transmission differs, not brightness.
+/// · **`Glass` — `NSGlassEffectView`, macOS 26.** The newest material. It has NO state property to
+///   pin its appearance — Apple's Liquid Glass guide documents only `cornerRadius`, `tintColor` and
+///   `contentView`, and the forum thread asking exactly this (818901) is unanswered.
+///
+///   IT CAN STILL BE HELD AT ONE APPEARANCE, just not by an API. On `Clear` with no CGS blur the
+///   glass IS the whole appearance and the shift measures ~45; defocused it falls back to something
+///   close to a plain system material. On `Regular` WITH `BLUR_RADIUS` and the alpha-0.01 veil
+///   beneath it, the glass stops being most of what you see — the blur and the veil are constant
+///   and focus-independent — and the shift disappears. Confirmed by eye and measured at 0.0.
+///
+///   So the three pieces are load-bearing together: `Regular` (dense, not `Clear`), CGS blur on,
+///   and the veil that blur brings with it. Drop any one and the shift comes back.
 #[derive(PartialEq)]
 #[allow(dead_code)] // the two non-selected arms are switchable configuration, not dead ends
 enum Backdrop {
