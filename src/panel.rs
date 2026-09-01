@@ -88,7 +88,7 @@ const PAD: f64 = 12.0 * SCALE;
 ///
 /// WHITE lightens, BLACK darkens; alpha is the strength.
 const TINT_WHITE: f64 = 0.0;   // 1.0 = white (lighten) · 0.0 = black (darken)
-const TINT_ALPHA: f64 = 0.10;  // "smooth warp" — tuned by eye, NOT Warp's 30
+const TINT_ALPHA: f64 = 0.0;  // "smooth warp" — tuned by eye, NOT Warp's 30
 
 /// THE VIBRANCY DIAL. `NSVisualEffectView` has no lightness/tint knob — the material IS the
 /// appearance, each one a fixed recipe of blur, saturation and tint that the system owns.
@@ -601,7 +601,9 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // The glass view below is what carries the material and the shape.
     panel.setOpaque(false);
     panel.setHasShadow(true);
-    // ALPHA 0.01, NOT CLEAR — and that distinction is the whole CGS recipe. The server blurs
+    // ALPHA 0.01, NOT CLEAR — and that distinction is the whole CGS recipe. Applied ONLY when the
+    // CGS blur is on: a material blurs for itself, and this veil would just sit behind it dulling
+    // it, which is what stopped `Glass` looking like glass. The server blurs
     // "non-fully-transparent pixels", so with a truly clear background the only non-zero alpha in
     // the window is our CONTENT, and the blur region gets derived from the content's antialiased
     // edge. It treats any non-zero alpha as fully covered, so a 10%-covered edge pixel receives
@@ -612,7 +614,11 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // AppKit — here `NSGlassEffectView`'s own `cornerRadius` plus `clipsToBounds`. It has to: CGS
     // has no window-shape call at all (CGSPrivate.h carries only `CGSSetWindowTransform`, which is
     // affine). Terminal.app uses exactly 0.01, and it is the documented form of the recipe.
-    panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.01)));
+    if BLUR_RADIUS > 0 {
+        panel.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.01)));
+    } else {
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    }
     // DRAGGABLE BY ITS BODY. There is no titlebar to grab, so the background IS the handle —
     // AppKit does the whole drag, including the screen-edge behaviour, from this one flag.
     panel.setMovableByWindowBackground(true);
@@ -686,7 +692,7 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
             let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
             // Regular is the DENSE variant — Liquid Glass is designed to sit under content, so it
             // reads as a dark slab rather than as glass. Clear is the one that stays transparent.
-            glass.setStyle(NSGlassEffectViewStyle::Clear);
+            glass.setStyle(NSGlassEffectViewStyle::Regular);
             glass.setCornerRadius(RADIUS);
             // NOT a layer mask — `clipsToBounds` is an NSView property. Without it the rounded
             // material still paints its square bounds, showing as a thin dark box under `Regular`.
