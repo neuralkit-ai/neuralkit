@@ -88,7 +88,7 @@ const PAD: f64 = 12.0 * SCALE;
 ///
 /// WHITE lightens, BLACK darkens; alpha is the strength.
 const TINT_WHITE: f64 = 0.0;   // 1.0 = white (lighten) · 0.0 = black (darken)
-const TINT_ALPHA: f64 = 0.0;  // "smooth warp" — tuned by eye, NOT Warp's 30
+const TINT_ALPHA: f64 = 0.10;  // "smooth warp" — tuned by eye, NOT Warp's 30
 
 /// THE VIBRANCY DIAL. `NSVisualEffectView` has no lightness/tint knob — the material IS the
 /// appearance, each one a fixed recipe of blur, saturation and tint that the system owns.
@@ -197,14 +197,18 @@ const BLUR_RADIUS: i32 = 64;
 ///   pin its appearance — Apple's Liquid Glass guide documents only `cornerRadius`, `tintColor` and
 ///   `contentView`, and the forum thread asking exactly this (818901) is unanswered.
 ///
-///   IT CAN STILL BE HELD AT ONE APPEARANCE, just not by an API. On `Clear` with no CGS blur the
-///   glass IS the whole appearance and the shift measures ~45; defocused it falls back to something
-///   close to a plain system material. On `Regular` WITH `BLUR_RADIUS` and the alpha-0.01 veil
-///   beneath it, the glass stops being most of what you see — the blur and the veil are constant
-///   and focus-independent — and the shift disappears. Confirmed by eye and measured at 0.0.
+///   IT STAYS GLASS WHEN INACTIVE — it does NOT fall back to a material, which an earlier note
+///   here claimed. Observed by eye, the inactive state differs by STYLE:
 ///
-///   So the three pieces are load-bearing together: `Regular` (dense, not `Clear`), CGS blur on,
-///   and the veil that blur brings with it. Drop any one and the shift comes back.
+///   · `Clear`   — more blur, plus a faded white veil over it.
+///   · `Regular` — blur unchanged; it DESATURATES.
+///
+///   Neither is reachable from the API. `setTintColor` applies to both states equally, so it cannot
+///   close a gap that only exists in one of them, and there is no saturation knob at all.
+///
+///   Do not try to measure this with mean RGB. That metric reported delta 0.0 on configurations
+///   where the shift is plainly visible — it cannot see blur changing or saturation dropping, only
+///   average colour, which barely moves.
 #[derive(PartialEq)]
 #[allow(dead_code)] // the two non-selected arms are switchable configuration, not dead ends
 enum Backdrop {
@@ -212,7 +216,7 @@ enum Backdrop {
     Vibrancy,
     Glass,
 }
-const BACKDROP: Backdrop = Backdrop::Vibrancy;
+const BACKDROP: Backdrop = Backdrop::Terminal;
 
 // SAFETY: SkyLight's undocumented per-window blur, signature per the long-standing public
 // reverse-engineering of it. A wrong signature would be UB, so it is written once, here.
@@ -587,8 +591,14 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
         }
     }
 
-    // Above ordinary windows, below the menu bar. `setFloatingPanel:` is the panel-native way to
-    // say it; the level is the blunt instrument underneath, set too so the intent is explicit.
+    // ON TOP BY LEVEL, which is AppKit's only supported way to sit above OTHER APPS' windows.
+    // There are eleven levels — Normal, Floating, Submenu, TornOffMenu, MainMenu, Status,
+    // ModalPanel, PopUpMenu, ScreenSaver, Dock, FullScreenMode — and nothing else does this: the
+    // collection behaviours govern spaces, full-screen and cycling, not cross-app z-order.
+    //
+    // An observer that re-ordered the window on app deactivation was tried instead, to test whether
+    // the LEVEL rather than app-activation drives the inactive glass. It was machinery around an
+    // API that already exists, and the glass degraded either way.
     panel.setFloatingPanel(true);
     panel.setLevel(NSFloatingWindowLevel);
     // KEY ONLY WHEN IT NEEDS TO BE. Without this, clicking the card makes it key and resigns the
