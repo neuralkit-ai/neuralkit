@@ -389,8 +389,12 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
     // Regular is the DENSE variant — Liquid Glass is designed to sit under content, so it reads
     // as a dark slab rather than as glass. Clear is the one that stays transparent.
-    glass.setStyle(NSGlassEffectViewStyle::Clear);
+    glass.setStyle(NSGlassEffectViewStyle::Regular);
     glass.setCornerRadius(RADIUS);
+    // Part of the documented NSGlassEffectView setup, and NOT a layer mask — `clipsToBounds` is an
+    // NSView property. Without it the rounded material still paints its square bounds, which shows
+    // as a thin dark box around the card under `Regular` (invisible under `Clear`).
+    glass.setClipsToBounds(true);
     // A window resizes its own contentView, so the glass follows for free. `inner` is the GLASS's
     // contentView, not the window's, so it needs the mask spelled out — otherwise the labels and
     // the webview keep the launch size inside a grown card.
