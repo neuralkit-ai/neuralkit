@@ -27,12 +27,13 @@
 //! nothing here returns an error — the worst case is no panel.
 
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::AnyObject;
-use objc2::{sel, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyObject, NSObject};
+use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSCellImagePosition, NSColor, NSFloatingWindowLevel, NSFont,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSCellImagePosition, NSColor,
+    NSFloatingWindowLevel, NSFont,
     NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSTextField, NSView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSResponder, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{
@@ -50,8 +51,8 @@ const SCALE: f64 = 2.0;
 /// system window reads as the odd one out. There is no public API for the system value, so this
 /// is tuned by eye against a real window rather than derived.
 const RADIUS: f64 = 12.0 * SCALE;
-const W: f64 = 360.0 * SCALE;
-const H: f64 = 140.0 * SCALE;
+const W: f64 = 400.0 * SCALE;
+const H: f64 = 400.0 * SCALE;
 /// The left/right inset, and the width every label gets.
 const PAD: f64 = 12.0 * SCALE;
 
@@ -107,8 +108,43 @@ fn close_button(parent: &NSView, panel: &NSPanel, frame: NSRect, mtm: MainThread
     button.setFrame(frame);
     button.setBordered(false);
     button.setImagePosition(NSCellImagePosition::ImageOnly);
+    // PIN TO THE TOP-RIGHT. AppKit's origin is bottom-left, so a fixed frame keeps its distance
+    // from the BOTTOM — grow the panel and the button appears to slide down. Flexible left and
+    // bottom margins are what make "stays in the corner" mean the corner it was put in.
+    button.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
     parent.addSubview(&button);
 }
+
+/// An `NSPanel` that will accept key status.
+///
+/// A BORDERLESS WINDOW REFUSES TO BECOME KEY. `NSWindow.canBecomeKeyWindow` is documented as true
+/// only when the window has a title bar or a resize bar; this panel has neither, so AppKit answered
+/// NO and `makeKeyAndOrderFront:` silently did nothing (measured: canBecomeKey=false, isKey=false).
+///
+/// That is what starved the page of hover. `mouseMoved:` is delivered ONLY to the key window, so
+/// with no key window the WKWebView never saw a move event and never forwarded one to JS —
+/// measured as 20 move events, every one with a button held, and zero on hover. Dragging worked
+/// because `performWindowDragWithEvent:` runs AppKit's own tracking loop, which bypasses all of it.
+///
+/// Overriding the property is the documented remedy, and it is safe HERE specifically because
+/// `NonactivatingPanel` is in the style mask: that bit exists so a panel can take key status
+/// WITHOUT activating its owning application — so the card can follow the cursor while the
+/// frontmost app keeps its focus.
+define_class!(
+    #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NKWelcomePanel"]
+    struct KeyablePanel;
+
+    impl KeyablePanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            true
+        }
+    }
+);
 
 /// A `HasWindowHandle` over an `NSView` WE own.
 ///
@@ -146,6 +182,9 @@ impl HasWindowHandle for ViewHandle {
 /// `panel/index.html`.
 const PANEL: &str = include_str!("../panel/dist/panel.html");
 
+/// The whole build, embedded — the custom-protocol path serves lazy chunks out of this.
+static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
+
 /// Fill `parent` with a `WKWebView` rendering `PANEL`.
 ///
 /// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
@@ -159,10 +198,14 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
     // panel — and neither refcount would ever reach zero. `load()` returning None is the honest
     // answer once the panel is gone.
     let weak = Weak::from_retained(panel);
-    WebViewBuilder::new()
+
+    let builder = WebViewBuilder::new()
         .with_transparent(true)
         .with_ipc_handler(move |req| {
             if req.body() != "drag" {
+                // Anything that is not the drag ping is a diagnostic from the page — the only
+                // channel a `with_html` document has back to the process.
+                eprintln!("[panel] {}", req.body());
                 return
             }
             // The event AppKit is dispatching right now IS the mousedown the page just saw, which
@@ -172,14 +215,78 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                 return
             };
             panel.performWindowDragWithEvent(&event);
-        })
-        .with_html(PANEL)
+        });
+
+    // SPIKE — SERVE THE SAME BYTES OVER A REAL ORIGIN.
+    //
+    // `with_html` gives the document a `null` origin (`protocol: about:`), and WebGPU is
+    // SECURE-CONTEXT gated, so `navigator.gpu` is withheld no matter what WebKit's own WebGPU
+    // switch says (measured: the switch was already on). W3C Secure Contexts decides
+    // trustworthiness on the HOST, not only the scheme — `127.0.0.0/8`, `::1`, `localhost` and
+    // `*.localhost` all qualify — and wry's macOS custom protocol serves at
+    // `<scheme>://localhost`. So the same bytes over `nk://localhost` should be a secure context
+    // WITHOUT a local port, a certificate, or any private API.
+    //
+    // `NEURALKIT_PANEL_PROTO=1` picks it, so both deliveries stay comparable side by side.
+    let builder = if std::env::var_os("NEURALKIT_PANEL_PROTO").is_some() {
+        builder
+            .with_custom_protocol("nk".into(), |_id, req| {
+                // Serve the whole build, not just the document. Fabric code-splits its engine —
+                // the entry runs `import("./sdfEngine-….js")`, which reaches `sdf.wgsl` in turn —
+                // so a handler that answered every path with the HTML would hand a <script> a
+                // document and fail with a syntax error.
+                // `index.html`, NOT the inlined `panel.html`. Inlining folds the ENTRY chunk into
+                // the document, but the lazy chunks import that entry BY FILENAME
+                // (`sdfEngine` → `./index-<hash>.js`) — so serving the inlined page loads the
+                // entry twice, as two module instances, and its top-level `render()` runs twice.
+                // Measured as the card drawn twice. Inlining exists only to survive `with_html`'s
+                // null origin; with a real origin it is actively wrong.
+                let path = req.uri().path().trim_start_matches('/');
+                let path = if path.is_empty() { "index.html" } else { path };
+                let mime = match path.rsplit('.').next() {
+                    Some("html") => "text/html",
+                    Some("js") => "text/javascript",
+                    Some("css") => "text/css",
+                    Some("wasm") => "application/wasm",
+                    _ => "application/octet-stream",
+                };
+                match DIST.get_file(path) {
+                    // Vite emits `<script type="module" crossorigin>`, so the entry is fetched in
+                    // CORS mode. Same origin, but a custom scheme with no ACAO header can still be
+                    // refused — and the failure mode is a blank panel, not an error.
+                    Some(f) => wry::http::Response::builder()
+                        .header(wry::http::header::CONTENT_TYPE, mime)
+                        .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(std::borrow::Cow::Borrowed(f.contents()))
+                        .unwrap(),
+                    None => wry::http::Response::builder()
+                        .status(404)
+                        .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
+                        .unwrap(),
+                }
+            })
+            .with_url("nk://localhost")
+    } else {
+        builder.with_html(PANEL)
+    };
+
+    builder
         .with_bounds(Rect {
             position: dpi::LogicalPosition::new(0.0, 0.0).into(),
             size: dpi::LogicalSize::new(W, H).into(),
         })
         .build_as_child(&ViewHandle(view))
         .ok()
+        .inspect(|wv| {
+            // `with_bounds` is a one-shot placement; without an autoresizing mask the webview keeps
+            // the launch rect and the page is clipped (or floats) the moment the panel is dragged.
+            use wry::WebViewExtMacOS;
+            let v: &NSView = unsafe { &*(Retained::as_ptr(&wv.webview()) as *const NSView) };
+            v.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+
+        })
 }
 
 /// Show the panel, handing back the owner.
@@ -205,13 +312,20 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
 
     // Borderless is the EMPTY style set, so `NonactivatingPanel` alone is the whole mask: no
     // titlebar, and no focus taken from the frontmost app when it appears.
-    let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-        NSPanel::alloc(mtm),
-        rect(x, y, W, H),
-        NSWindowStyleMask::NonactivatingPanel,
-        NSBackingStoreType::Buffered,
-        false,
-    );
+    // `Resizable` on a BORDERLESS panel: there is no titlebar or grip, but AppKit still gives the
+    // window's edges the resize hit-area and cursors once the bit is set. Everything below — the
+    // glass, its contentView, the webview — has to be told to follow, or the window grows while its
+    // contents stay the launch size.
+    let panel: Retained<KeyablePanel> = unsafe {
+        msg_send![
+            KeyablePanel::alloc(mtm),
+            initWithContentRect: rect(x, y, W, H),
+            styleMask: NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::Resizable,
+            backing: NSBackingStoreType::Buffered,
+            defer: false,
+        ]
+    };
+    let panel: Retained<NSPanel> = panel.into_super();
 
     // WE ALLOCATED THIS PANEL, SO WE OWN IT. AppKit's default is `releasedWhenClosed = YES`: a
     // `-close` would deallocate it out from under the `Retained` handed back. Nothing reaches
@@ -226,6 +340,11 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // frontmost app's — the same focus theft `NonactivatingPanel` prevents on show, arriving one
     // click later.
     panel.setBecomesKeyOnlyIfNeeded(true);
+    // HOVER IS OPT-IN. An NSWindow does NOT deliver `mouseMoved:` unless asked — the default is
+    // off because most windows only care about clicks. Without this the page sees mousemove ONLY
+    // while a button is held (a drag is tracked separately), which reads as "the camera follows
+    // the pointer, but only when I drag the panel".
+    panel.setAcceptsMouseMovedEvents(true);
     // FOLLOWS THE PERSON ACROSS SPACES. A welcome card left behind on the desktop it opened on is
     // a card nobody reads; joining all spaces is what a menu-bar accessory's window should do.
     panel.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces);
@@ -272,8 +391,16 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // as a dark slab rather than as glass. Clear is the one that stays transparent.
     glass.setStyle(NSGlassEffectViewStyle::Clear);
     glass.setCornerRadius(RADIUS);
+    // A window resizes its own contentView, so the glass follows for free. `inner` is the GLASS's
+    // contentView, not the window's, so it needs the mask spelled out — otherwise the labels and
+    // the webview keep the launch size inside a grown card.
+    inner.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
     glass.setContentView(Some(&inner));
     panel.setContentView(Some(&glass));
+    // Small enough to still be a card, large enough that the glass corners never overlap.
+    panel.setContentMinSize(NSSize::new(W / 2.0, H / 2.0));
 
     // y counts UP, so the title sits highest and the commands sit near the floor.
     // TYPE STAYS AT SYSTEM SIZE while the panel scales. Doubling the point size would make the
@@ -304,9 +431,16 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     const BTN: f64 = 22.0;
     close_button(&inner, &panel, rect(W - PAD / 2.0 - BTN, H - PAD / 2.0 - BTN, BTN, BTN), mtm);
 
-    // `orderFrontRegardless` AND NOT `makeKeyAndOrderFront:`. The latter activates the app, which
-    // is the focus theft this whole panel style is arranged to avoid; this shows the card and
-    // leaves the frontmost app frontmost.
-    panel.orderFrontRegardless();
+    // KEY, BUT NOT ACTIVE — and those are different things. `mouseMoved:` is delivered ONLY to
+    // the KEY window (Apple: "the window will receive mouse-moved events when it is the key
+    // window"), so `orderFrontRegardless` — which shows without making key — left the page with
+    // no hover at all. The tell was that the camera tracked ONLY while the window was being
+    // dragged: `performWindowDragWithEvent:` runs AppKit's own tracking loop, which delivers
+    // events irrespective of key status.
+    //
+    // `makeKeyAndOrderFront:` activating the app is a property of a normal NSWindow.
+    // `NonactivatingPanel` exists precisely so a panel can take key WITHOUT activating its owner,
+    // which is the whole reason that bit is in the style mask.
+    panel.makeKeyAndOrderFront(None);
     Some((panel, web))
 }

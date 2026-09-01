@@ -11,13 +11,18 @@
     "noEmit": true,
     "skipLibCheck": true,
     "noImplicitAny": false,
-    "types": ["vite/client"],
+    "types": ["vite/client", "vite-plugin-glsl/ext", "@webgpu/types"],
     "jsx": "react-jsx",
     "jsxImportSource": "@madenowhere/phaze",
     "plugins": [
       // Suppresses TS6133/6192 false-positives for directive imports consumed
       // only via JSX `use:NAME` namespaces. Same entry neuralkit-web carries.
       { "name": "@madenowhere/phaze-tsplugin" }
-    ]
+    ],
+    // Mirrors vite.config.ts's `@web/` alias. No `baseUrl` — TS 7 removed it, and paths now
+    // resolve relative to this file.
+    "paths": {
+      "@web/*": ["../../neuralkit-web/src/*"]
+    }
   }
 }

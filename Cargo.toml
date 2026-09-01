@@ -103,9 +103,18 @@ objc2-foundation = "0.3"
 # does nothing — the `drawsBackground = NO` that stops WKWebView painting white is behind that
 # cfg. A webview that paints its own background hides the Liquid Glass the panel exists to show.
 wry = { version = "0.53", features = ["transparent"] }
+# Embeds panel/dist so the custom protocol can serve fabric's LAZY chunks. `with_html` could
+# not: a null-origin page has nothing for `import("./sdfEngine-….js")` to resolve against.
+include_dir = "0.7"
 raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
     "NSTextField", "NSControl", "NSButton", "NSCell",
     "NSImage", "NSColor", "NSFont", "NSGlassEffectView",
 ] }
+
+[dev-dependencies]
+# SPIKE ONLY (dev-dependency — never in the shipped binary): proves fabric's own WGSL
+# compute shader runs natively through Rust wgpu on Metal.
+wgpu = "30"
+pollster = "0.4"

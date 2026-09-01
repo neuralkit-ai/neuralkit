@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import phazeCompile from '@madenowhere/phaze-compile/vite'
 import tailwindcss from '@tailwindcss/vite'
+import glsl from 'vite-plugin-glsl'
 
 // Vite 8 (Rolldown + oxc). Config copied from phaze-cloudflare's own
 // `plugin.ts` — the `esbuild` key is deprecated on 8, and oxc wants the
@@ -17,13 +18,21 @@ export default defineConfig({
   // nothing and every span collapses to width 0 in the same spot — measured, not
   // assumed. `src/styles.css` carries the `@source` that makes Tailwind scan the
   // out-of-tree file — required, and verified against a COLD build.
-  plugins: [phazeCompile(), tailwindcss()],
+  // `glsl` resolves fabric's WGSL `#include` graph (sdf.wgsl pulls in 36 primitives/materials)
+  // and compresses it. `warnDuplicatedImports: false` because fabric deliberately includes each
+  // material from both the fs and fs_fast pipelines — same flags neuralkit-web uses.
+  plugins: [
+    phazeCompile(),
+    tailwindcss(),
+    // @ts-ignore — same as neuralkit-web: the plugin's published types omit these options.
+    glsl({ compress: true, warnDuplicatedImports: false }),
+  ],
   resolve: {
     alias: [{ find: /^@web\//, replacement: WEB }],
     // Both projects `link:` phaze and photon to the SAME realpath, so importing
     // across the boundary does not fork the runtime. Stated explicitly because a
     // second copy would not error — it would just break reactivity.
-    dedupe: ['@madenowhere/phaze', '@madenowhere/photon'],
+    dedupe: ['@madenowhere/phaze', '@madenowhere/photon', '@madenowhere/graviton'],
   },
   oxc: {
     jsx: { runtime: 'automatic', importSource: '@madenowhere/phaze' },
@@ -31,8 +40,8 @@ export default defineConfig({
   },
   // Workspace-link contract: excluded from pre-bundling + the roots allowed,
   // or the dev server 404s the symlinked packages.
-  optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/photon'] },
-  server: { fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', WEB, '.'] } },
+  optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/photon', '@madenowhere/graviton'] },
+  server: { fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '/Users/r/Minilab/graviton', WEB, '.'] } },
   // The polyfill is off because the page ships as ONE inlined module with no
   // imports — there is nothing to preload, and `with_html` gives it no base URL
   // to preload from.

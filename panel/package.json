@@ -8,6 +8,7 @@
     "check": "phaze-check --noEmit"
   },
   "dependencies": {
+    "@madenowhere/graviton": "link:/Users/r/Minilab/graviton",
     "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
     "@madenowhere/photon": "link:/Users/r/Minilab/photon"
   },
@@ -16,15 +17,18 @@
     "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
     "@madenowhere/phaze-tsplugin": "link:/Users/r/Minilab/phaze/packages/phaze-tsplugin",
     "@tailwindcss/vite": "^4.3.3",
+    "@webgpu/types": "^0.1.72",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vite-plugin-glsl": "^1.6.1"
   },
   "pnpm": {
     "overrides": {
       "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
       "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
-      "@madenowhere/photon": "link:/Users/r/Minilab/photon"
+      "@madenowhere/photon": "link:/Users/r/Minilab/photon",
+      "@madenowhere/graviton": "link:/Users/r/Minilab/graviton"
     }
   }
 }

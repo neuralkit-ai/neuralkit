@@ -5,6 +5,7 @@ import { inc } from '@madenowhere/phaze/numeric'
 import { interval, seconds } from '@madenowhere/phaze/time'
 // THE one definition — neuralkit-web's. `@web/` is aliased in vite.config.ts.
 import { StepIndicator } from '@web/components/ui/StepIndicator.phaze'
+import { FabricCube } from './FabricCube'
 
 // The welcome card, as a phaze app rather than a Rust string literal. The copy is
 // the same one `panel.rs` shipped inline; what is new is that it can hold live
@@ -17,6 +18,7 @@ function App() {
 
   return (
     <main>
+      <FabricCube />
       <h1>Neuralkit CLI is installed</h1>
       <p>The neuralkit command is now on your PATH.</p>
 
