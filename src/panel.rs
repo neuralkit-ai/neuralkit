@@ -114,10 +114,27 @@ const TINT_ALPHA: f64 = 0.10;  // "smooth warp" — tuned by eye, NOT Warp's 30
 /// | `FullScreenUI`          | 139.7     | 20.0      |
 /// | `HUDWindow`             | 142.7     | 15.5      |
 ///
-/// Variation moves INVERSELY with lightness, and that is the useful half: the darker materials pass
-/// more of the desktop through, so lighter also means more obscuring. `HUDWindow` is the most
-/// opaque of the set, not the darkest — this comment previously claimed the opposite, written from
-/// assumption before anything was measured.
+/// THE SECOND COLUMN IS NOT TRANSMISSION. It comes from a window-id capture, which carries the
+/// material's own colour and NOT the desktop, so it says how much of OUR OWN content the material
+/// washes out — nothing about seeing through. An earlier draft of this comment read it as desktop
+/// transmission and concluded "lighter means more obscuring", which measuring on screen contradicts.
+///
+/// TRANSMISSION, measured properly — five materials rendered at one fixed screen position and the
+/// composited result sampled, so the desktop behind is identical for all of them:
+///
+/// | material              | structure through | light through |
+/// |-----------------------|-------------------|---------------|
+/// | `UnderPageBackground` | 41.8              | 35.5          |
+/// | `Sheet`               | 37.8              | 46.6          |
+/// | `FullScreenUI`        | 34.2              | 61.0          |
+/// | `Popover`             | 34.1              | 59.6          |
+/// | `HUDWindow`           | 33.4              | 61.6          |
+///
+/// The two run OPPOSITE, which is why "most translucent" needs saying carefully. `HUDWindow` passes
+/// the most LIGHT and the least STRUCTURE — it blurs hardest, so the desktop arrives as a bright
+/// wash rather than as shapes. Over a light desktop that is what reads as most see-through, and it
+/// is the one picked by eye. `UnderPageBackground` is the reverse: you can make out what is behind
+/// it, but it is dark.
 ///
 /// (`Light`/`Dark`/`MediumLight`/`UltraDark`/`AppearanceBased` also exist but are deprecated.)
 const MATERIAL: NSVisualEffectMaterial = NSVisualEffectMaterial::HUDWindow;
@@ -187,7 +204,7 @@ enum Backdrop {
     Vibrancy,
     Glass,
 }
-const BACKDROP: Backdrop = Backdrop::Terminal;
+const BACKDROP: Backdrop = Backdrop::Vibrancy;
 
 // SAFETY: SkyLight's undocumented per-window blur, signature per the long-standing public
 // reverse-engineering of it. A wrong signature would be UB, so it is written once, here.
