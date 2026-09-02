@@ -93,7 +93,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
                 crate::passkey::save_device_id(id)?;
             }
             println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.unwrap_or(user)));
-            println!("  {}", crate::style::dim("cli registered"));
+            println!("  {}", crate::style::dim("cli registered · cloud (SOC 2 Type II)"));
             // PROMOTE — arming the Watch takes effect on THIS login, no re-scan. When the gate is
             // armed but the gated slot is empty, the session just obtained (signed with the software
             // key inside `quick_login`) is exactly what registering the enclave key needs.
@@ -309,7 +309,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
                     // it registers the machine. Naming the second is what makes the code
                     // option on the next run — and `auth unregister` — make sense.
                     println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.as_deref().unwrap_or(user)));
-                    println!("  {}", crate::style::dim("cli registered"));
+                    println!("  {}", crate::style::dim("cli registered · cloud (SOC 2 Type II)"));
 
                     // BOOTSTRAP, DONE ONCE AND INVISIBLY. Whichever path just signed this
                     // machine in, it now holds the one thing registering a passkey needs: a
