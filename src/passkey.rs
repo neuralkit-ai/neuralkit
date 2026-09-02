@@ -898,8 +898,26 @@ pub(crate) async fn quick_login(
 ) -> Result<Option<(String, Value)>> {
     let base_url = base_url.trim_end_matches('/');
     let (Some(device_id), Some(challenge)) = (device_id(), next_challenge()) else { return Ok(None) };
-    let Some(cred_id) = read_credential_id()? else { return Ok(None) };
-    let (key, created) = load_or_create()?;
+    // WHICH KEY SIGNS THIS SESSION. Normally the gated (active) slot. But arming the gate points
+    // `read_credential_id` at the enclave slot, which stays EMPTY until a session exists to register
+    // it against — the bootstrap order. When the SOFTWARE slot still holds a credential the machine
+    // is not stuck: sign in with it to obtain that session, and the caller then registers the
+    // enclave key against it. This is what the single-slot flow did before c180529 split the slots,
+    // minus the overwrite the split removed — the two existing slots reused, no new surface.
+    let (cred_id, key, created): (Vec<u8>, Box<dyn Signer>, bool) = match read_credential_id()? {
+        Some(cred_id) => {
+            let (key, created) = load_or_create()?;
+            (cred_id, key, created)
+        }
+        None if gate_armed() => match read_slot("credential_id")? {
+            Some(cred_id) => {
+                let (key, created) = load_or_create_software()?;
+                (cred_id, Box::new(key), created)
+            }
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
     if created { return Ok(None) }
 
     // The device_code is fresh per run — it keys nothing durable here (the row is named by

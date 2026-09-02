@@ -94,6 +94,40 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
             }
             println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.unwrap_or(user)));
             println!("  {}", crate::style::dim("cli registered"));
+            // PROMOTE — arming the Watch takes effect on THIS login, no re-scan. When the gate is
+            // armed but the gated slot is empty, the session just obtained (signed with the software
+            // key inside `quick_login`) is exactly what registering the enclave key needs.
+            //
+            // TWO STEPS, because registration does not sign. `register()` records the enclave PUBLIC
+            // key with `none` attestation and never touches the private half, so it raises no Watch
+            // prompt on its own. So once the slot is filled, sign in ONCE MORE: `quick_login` now
+            // reads the enclave slot and ASSERTS with it — and the assertion IS the operation the
+            // gate guards, so the Watch double-click fires here, on the arming login, the way the
+            // single-slot flow felt before c180529. The session kept becomes the gated one.
+            //
+            // Best-effort and quiet, like the QR path: neither the registration nor the confirming
+            // sign-in may fail the login — the software session already saved stands either way.
+            if !crate::passkey::is_registered() {
+                match crate::passkey::register(base_url, true).await {
+                    Err(e) => {
+                        println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string()));
+                    }
+                    Ok(()) => {
+                        if let Ok(Some((tok2, d2))) = crate::passkey::quick_login(base_url, &qk_pk.to_hex()).await {
+                            let _ = save_credentials(
+                                base_url, &tok2,
+                                d2.get("user").and_then(Value::as_str).unwrap_or(user),
+                                d2.get("email").and_then(Value::as_str).or(email),
+                                d2.get("expires").and_then(Value::as_i64).or(expires),
+                                &qk_sk.to_hex(),
+                                d2.get("signKey").and_then(Value::as_str).or(sign_key),
+                                d2.get("deviceId").and_then(Value::as_str).or(device_id),
+                                d2.get("totpEnabled").and_then(Value::as_bool).or(totp),
+                            );
+                        }
+                    }
+                }
+            }
             if crate::passkey::is_registered() {
                 println!(
                 "  {}",
