@@ -134,7 +134,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
                 crate::style::dim(if crate::passkey::gate_armed() {
                     "passkey registered · Secure Enclave"
                 } else {
-                    "passkey registered"
+                    "passkey registered · On Device (P-256)"
                 }),
             );
             }
@@ -336,7 +336,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
                 crate::style::dim(if crate::passkey::gate_armed() {
                     "passkey registered · Secure Enclave"
                 } else {
-                    "passkey registered"
+                    "passkey registered · On Device (P-256)"
                 }),
             );
                     }
