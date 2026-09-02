@@ -7,9 +7,7 @@ import { interval, seconds } from '@madenowhere/phaze/time'
 import { StepIndicator } from '@web/components/ui/StepIndicator.phaze'
 import { FabricCube } from './FabricCube'
 
-// The welcome card, as a phaze app rather than a Rust string literal. The copy is
-// the same one `panel.rs` shipped inline; what is new is that it can hold live
-// state — the indicator below advances on its own, which a `&str` could not do.
+
 function App() {
   const state = s<'intake' | 'signal' | 'model' | 'report'>('intake')
   const steps = s(['intake', 'signal', 'model', 'report'])
@@ -22,12 +20,8 @@ function App() {
       <h1>Neuralkit CLI is installed</h1>
       <p>The neuralkit command is now on your PATH.</p>
 
-      <StepIndicator state={state} steps={steps} className="mt-1.5" />
+      <StepIndicator state={state} steps={steps} className="mt-1.5 opacity-30" />
 
-      <ul>
-        <li><code>neuralkit auth login</code><span>sign in</span></li>
-        <li><code>neuralkit --help</code><span>everything else</span></li>
-      </ul>
     </main>
   )
 }
