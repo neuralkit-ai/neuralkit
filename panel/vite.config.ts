@@ -43,6 +43,23 @@ export default defineConfig({
     // there is ONE chunk — every fabric `import()` site is folded into it — so the
     // report is the size of the script the document carries, before inlining.
     sizeReport({
+      // The same map neuralkit-web's config declares — these are fabric's own
+      // runtime conditions, identical wherever fabric is consumed. A chunk listed
+      // here loads only when its condition holds (`◌ conditional`); a code-split
+      // chunk that is not listed hydrates SSR-painted content (`◐ hydrates`).
+      conditionalReasons: {
+        StatsHUD:     'scene.stats === true',
+        sdfEngine:    'first SDF shape mount',
+        sdf:          'sdfEngine loads its shader',
+        textEngine:   'first <Text> mount',
+        text:         'textEngine loads its shader',
+        grid:         'Grid mounts (its WGSL shader)',
+        loadGeometry: 'Grid has geometryUrl (PLY)',
+        meshEngine:   'first <Mesh> mount',
+        axes:         'scene.showAxes === true',
+        bgmip:        'glass material with roughness > 0',
+        blit:         'drag-resize triggers offscreen blit',
+      },
       groups: [
         { name: 'panel',    match: (c) => c.moduleIds.some((m) => m.includes('/panel/src/')) },
         { name: 'graviton', match: (c) => c.moduleIds.some((m) => m.includes('/graviton/')) },

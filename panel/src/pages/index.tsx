@@ -3,7 +3,7 @@
 // document. The card's copy is in the HTML before any script runs.
 
 import '../styles.css'
-import { listen } from '@madenowhere/phaze'
+import { drag } from '@madenowhere/phaze-native/wry'
 import { s } from '@madenowhere/phaze/dsl'
 import { inc } from '@madenowhere/phaze/numeric'
 import { interval, seconds } from '@madenowhere/phaze/time'
@@ -19,21 +19,15 @@ export default function Welcome() {
 
   interval(seconds(3), inc(state))
 
-  // WKWebView SWALLOWS THE MOUSE, which is why `setMovableByWindowBackground:` stopped working
-  // the moment a webview filled the panel: AppKit only drags when the click reaches a view that
-  // does not handle it. So the page reports the press and AppKit does the drag —
-  // `performWindowDragWithEvent:` runs the real thing, including the screen-edge behaviour.
-  // Anything interactive can opt out with `data-no-drag`. Guarded because this body also runs
-  // at build, against linkedom, which installs `document` but never `window`.
-  if (typeof window !== 'undefined') {
-    listen(window, 'mousedown', (e: MouseEvent) => {
-      if (e.button !== 0 || (e.target as Element | null)?.closest('[data-no-drag]')) return
-      ;(window as Window & { ipc?: { postMessage(m: string): void } }).ipc?.postMessage('drag')
-    })
-  }
+  // The whole card is a drag handle (`data-tauri-drag-region` on <main>, matched
+  // with `closest`, so the copy inside drags too); anything interactive opts out
+  // with `data-no-drag`. Why the page is involved at all — WKWebView swallows the
+  // mouse, so the page reports the press and AppKit runs the real drag — is the
+  // shell binding's to explain; panel.rs answers the `drag` message it posts.
+  drag()
 
   return (
-    <main>
+    <main data-tauri-drag-region>
       <FabricCube ssr={false} />
       <h1>Neuralkit CLI is installed</h1>
       <p>The neuralkit command is now on your PATH.</p>
