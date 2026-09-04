@@ -520,10 +520,16 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                             }
                         }
                     }
-                    None => wry::http::Response::builder()
-                        .status(404)
-                        .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
-                        .unwrap(),
+                    None => {
+                        // Loud on purpose. A chunk declared off in `native({ conditional })`
+                        // that the page asks for anyway lands here — the only sign would
+                        // otherwise be a feature silently missing from the card.
+                        eprintln!("[panel] 404 {path} — not in the embedded build (declared off in native({{ conditional }})?)");
+                        wry::http::Response::builder()
+                            .status(404)
+                            .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
+                            .unwrap()
+                    }
                 }
             })
             .with_url("nk://localhost");

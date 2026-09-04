@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import native from '@madenowhere/phaze-native/vite'
 import tailwindcss from '@tailwindcss/vite'
 import glsl from 'vite-plugin-glsl'
+import { fabricShakePlugin } from '../../neuralkit-web/build/vite-plugin-fabric-shake.mjs'
 import { sizeReport } from '@madenowhere/vite-plugin-phaze'
 
 // THE UI COMPONENT IS NOT COPIED HERE. `@web/` points at neuralkit-web's `src/`,
@@ -39,6 +40,14 @@ export default defineConfig({
     // material from both the fs and fs_fast pipelines — same flags neuralkit-web uses.
     // @ts-ignore — same as neuralkit-web: the plugin's published types omit these options.
     glsl({ compress: true, warnDuplicatedImports: false }),
+    // Fabric's shaker, as in neuralkit-web's config: the transform-stage region
+    // strips (RIG / GLASS / MESH features) that keep the shader correct, plus the
+    // COND_FEATURE strips — fabric's `import()` sites behind runtime conditions
+    // (`stats`, `showAxes`, `geometryUrl`, background mips) are removed when this
+    // app's source never turns the condition on, so the bundler never emits the
+    // chunk and the binary never embeds it. Detection is an fs-walk of `src/`
+    // (the cwd's, i.e. this panel's). `regionsOnly` as in -web.
+    fabricShakePlugin({ regionsOnly: true }),
     // Same grouped, labelled build report neuralkit-web prints. Under `publish`
     // there is ONE chunk — every fabric `import()` site is folded into it — so the
     // report is the size of the script the document carries, before inlining.
