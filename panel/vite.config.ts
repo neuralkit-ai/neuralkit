@@ -13,12 +13,11 @@ const WEB = new URL('../../neuralkit-web/src/', import.meta.url).pathname
 export default defineConfig({
   plugins: [
     // The native target. Generates `src/pages/**` at build (the page runs against
-    // linkedom, so its copy is in the HTML) and hydrates it in the webview.
-    // `publish: true` folds the entry module, the stylesheet and every dynamic
-    // import into ONE document — `dist/index.html` is the whole build, which is
-    // what `with_html` needs (no base URL, so nothing may be left as a src/href)
-    // and what `include_str!` embeds. Bundles phaze-compile and the oxc JSX
-    // config, so neither is listed here.
+    // linkedom, so its copy is in the HTML) and hydrates it in the webview over
+    // `nk://` — `dist/index.html` references the entry as a file, and fabric's lazy
+    // chunks are served out of the same embedded directory. No `publish`: the
+    // string-loaded document it adds has a null origin, and this card needs WebGPU.
+    // Bundles phaze-compile and the oxc JSX config, so neither is listed here.
     // `compress`: the served scripts and stylesheet are written as `*.gz` (or `*.br`);
     // panel.rs's protocol handler decodes by suffix — gzip with the flate2 the tray
     // already links, brotli only under `cargo --features panel-brotli`. WebKit does not
@@ -28,7 +27,7 @@ export default defineConfig({
     // adds 165 kB to the binary (7,547,664 → 7,712,848) and decodes slower (entry 218 →
     // 380 µs). gzip until the assets are ~30× larger — the decoder is a fixed cost, the
     // tighter packing scales with the assets.
-    native({ shell: 'wry', publish: true, compress: 'gzip' }),
+    native({ shell: 'wry', compress: 'gzip' }),
     // StepIndicator.phaze's layout IS Tailwind utilities (`relative` + `absolute
     // left-0 top-0` positioning every dot). Without the plugin those classes generate
     // nothing and every span collapses to width 0 in the same spot — measured, not

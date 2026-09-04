@@ -385,35 +385,26 @@ impl HasWindowHandle for ViewHandle {
     }
 }
 
-/// The card, as a document — BUILT rather than written here. `panel/` is a phaze app on the
-/// native target (`@madenowhere/phaze-native`); this is its output. It ships in the binary, has
-/// no path to get wrong, and `with_html` is the delivery mechanism.
+/// The card, as a build — not written here. `panel/` is a phaze app on the native target
+/// (`@madenowhere/phaze-native`); this is its output, the whole directory, embedded at COMPILE
+/// time and served by the custom protocol below: `index.html` (the page GENERATED at build, so
+/// its copy is in the HTML before any script runs, referencing the entry as a file), the entry
+/// and stylesheet under `assets/` (gzip'd by the build, decoded here), and fabric's lazy chunks,
+/// which the entry `import()`s by filename at runtime. The directory is committed (see
+/// `panel/.gitignore`) because `include_dir!` reads it at compile time; a fresh clone cannot
+/// build without it.
 ///
-/// `panel/dist/publish.html` is ONE self-contained file because the app builds with
-/// `native({ publish: true })`: the page is GENERATED at build (its copy is in the HTML before any
-/// script runs) and the entry module and the stylesheet are folded into the document. That is
-/// not tidiness — `with_html` hands WKWebView a string with NO BASE URL, so anything left as a
-/// `src`/`href` has nothing to resolve against and silently never loads. It sits BESIDE the served
-/// build (`index.html` + `assets/`), which is what the custom protocol below serves; the two are
-/// the same entry in two deliveries. The file is committed (see `panel/.gitignore`) because
-/// `include_str!` reads it at COMPILE time; a fresh clone cannot build without it.
-///
-/// THE TRADE, from wry's own docs: a page loaded from a string has a **`null` origin** — no
-/// localStorage, no fetch, no relative URLs, and no secure context, so `navigator.gpu` and
-/// `crypto.subtle` are withheld. This card needs none of them. A panel that grows to need any
-/// wants `with_custom_protocol` + `with_url("<scheme>://localhost")` instead — the same document,
-/// served under a real origin, which is what Tauri does (the spike below).
+/// Why a protocol and not `with_html`: a page loaded from a string has a **`null` origin** (wry's
+/// own docs) — no secure context, so `navigator.gpu` is withheld and the cube cannot render. The
+/// card is fabric over WebGPU, so the string delivery was retired (2026-09-04) along with the
+/// inlined document it needed.
 ///
 /// What used to be written here moved INTO the app and is still doing the same job: the
 /// transparency and `canvastext` rules are in `panel/src/styles.css`, the drag handler in
 /// `panel/src/pages/index.tsx`.
-const PANEL: &str = include_str!("../panel/dist/publish.html");
-
-/// The whole build, embedded — the custom-protocol path serves the lazy chunks out of this, and
-/// serves `index.html` (entry as a file), never the inlined document.
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
 
-/// Fill `parent` with a `WKWebView` rendering `PANEL`.
+/// Fill `parent` with a `WKWebView` rendering the panel app out of `DIST` over `nk://`.
 ///
 /// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
 /// stay exactly as they were so the two can be compared side by side. What it is testing is
@@ -431,8 +422,8 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
         .with_transparent(true)
         .with_ipc_handler(move |req| {
             if req.body() != "drag" {
-                // Anything that is not the drag ping is a diagnostic from the page — the only
-                // channel a `with_html` document has back to the process.
+                // Anything that is not the drag ping is a diagnostic from the page — its channel
+                // back to the process (there is no inspector build).
                 eprintln!("[panel] {}", req.body());
                 return
             }
@@ -445,30 +436,24 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
             panel.performWindowDragWithEvent(&event);
         });
 
-    // SPIKE — SERVE THE SAME BYTES OVER A REAL ORIGIN.
-    //
-    // `with_html` gives the document a `null` origin (`protocol: about:`), and WebGPU is
-    // SECURE-CONTEXT gated, so `navigator.gpu` is withheld no matter what WebKit's own WebGPU
-    // switch says (measured: the switch was already on). W3C Secure Contexts decides
-    // trustworthiness on the HOST, not only the scheme — `127.0.0.0/8`, `::1`, `localhost` and
-    // `*.localhost` all qualify — and wry's macOS custom protocol serves at
-    // `<scheme>://localhost`. So the same bytes over `nk://localhost` should be a secure context
-    // WITHOUT a local port, a certificate, or any private API.
-    //
-    // `NEURALKIT_PANEL_PROTO=1` picks it, so both deliveries stay comparable side by side.
-    let builder = if std::env::var_os("NEURALKIT_PANEL_PROTO").is_some() {
-        builder
+    // A REAL ORIGIN, WITHOUT A PORT. WebGPU is SECURE-CONTEXT gated, so a string-loaded document
+    // (`null` origin) never gets `navigator.gpu`, no matter what WebKit's own WebGPU switch says
+    // (measured: the switch was already on). W3C Secure Contexts decides trustworthiness on the
+    // HOST, not only the scheme — `127.0.0.0/8`, `::1`, `localhost` and `*.localhost` all qualify
+    // — and wry's macOS custom protocol serves at `<scheme>://localhost`. So the build over
+    // `nk://localhost` is a secure context WITHOUT a local port, a certificate, or any private
+    // API. Measured: the cube renders.
+    let builder = builder
             .with_custom_protocol("nk".into(), |_id, req| {
                 // Serve the whole build, not just the document. Fabric code-splits its engine —
                 // the entry runs `import("./sdfEngine-….js")`, which reaches `sdf.wgsl` in turn —
                 // so a handler that answered every path with the HTML would hand a <script> a
                 // document and fail with a syntax error.
-                // `index.html`, NOT the inlined `panel.html`. Inlining folds the ENTRY chunk into
-                // the document, but the lazy chunks import that entry BY FILENAME
-                // (`sdfEngine` → `./index-<hash>.js`) — so serving the inlined page loads the
-                // entry twice, as two module instances, and its top-level `render()` runs twice.
-                // Measured as the card drawn twice. Inlining exists only to survive `with_html`'s
-                // null origin; with a real origin it is actively wrong.
+                // The document must reference the entry AS A FILE, never inline it: the lazy
+                // chunks import the entry BY FILENAME (`sdfEngine` → `./phaze-native-<hash>.js`),
+                // so an inlined entry would load twice, as two module instances, and its
+                // top-level `render()` would run twice. Measured as the card drawn twice
+                // (`c8a4a61`).
                 let path = req.uri().path().trim_start_matches('/');
                 let path = if path.is_empty() { "index.html" } else { path };
                 let mime = match path.rsplit('.').next() {
@@ -541,10 +526,7 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                         .unwrap(),
                 }
             })
-            .with_url("nk://localhost")
-    } else {
-        builder.with_html(PANEL)
-    };
+            .with_url("nk://localhost");
 
     builder
         .with_bounds(Rect {
