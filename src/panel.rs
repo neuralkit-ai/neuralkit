@@ -482,11 +482,35 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                     // Vite emits `<script type="module" crossorigin>`, so the entry is fetched in
                     // CORS mode. Same origin, but a custom scheme with no ACAO header can still be
                     // refused — and the failure mode is a blank panel, not an error.
-                    Some(f) => wry::http::Response::builder()
-                        .header(wry::http::header::CONTENT_TYPE, mime)
-                        .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(std::borrow::Cow::Borrowed(f.contents()))
-                        .unwrap(),
+                    Some(f) => {
+                        // `assets/*` are gzip'd in place by the build (`native({ compress:
+                        // 'gzip' })`). WebKit does NOT decode a scheme-handler body — measured:
+                        // a `Content-Encoding: br` response reached the parser as raw bytes —
+                        // so the decode happens here and the response carries no encoding
+                        // header. Documents (`index.html`) are never compressed. A file that
+                        // is not gzip (a future raw asset) is served as-is.
+                        let body: std::borrow::Cow<'static, [u8]> = if path.starts_with("assets/") {
+                            use std::io::Read;
+                            let started = std::time::Instant::now();
+                            let mut out = Vec::with_capacity(f.contents().len() * 4);
+                            match flate2::read::GzDecoder::new(f.contents()).read_to_end(&mut out) {
+                                Ok(_) => {
+                                    if std::env::var_os("NEURALKIT_PANEL_TIMING").is_some() {
+                                        eprintln!("[panel] gunzip {path} {}B → {}B in {:?}", f.contents().len(), out.len(), started.elapsed());
+                                    }
+                                    std::borrow::Cow::Owned(out)
+                                }
+                                Err(_) => std::borrow::Cow::Borrowed(f.contents()),
+                            }
+                        } else {
+                            std::borrow::Cow::Borrowed(f.contents())
+                        };
+                        wry::http::Response::builder()
+                            .header(wry::http::header::CONTENT_TYPE, mime)
+                            .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body(body)
+                            .unwrap()
+                    }
                     None => wry::http::Response::builder()
                         .status(404)
                         .body(std::borrow::Cow::Borrowed(&b"not found"[..]))

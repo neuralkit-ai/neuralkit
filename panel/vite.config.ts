@@ -19,7 +19,11 @@ export default defineConfig({
     // what `with_html` needs (no base URL, so nothing may be left as a src/href)
     // and what `include_str!` embeds. Bundles phaze-compile and the oxc JSX
     // config, so neither is listed here.
-    native({ shell: 'wry', publish: true }),
+    // `compress`: the served scripts and stylesheet are gzip'd in place; panel.rs's
+    // protocol handler decodes them with the flate2 the tray already links. WebKit
+    // does not decode a scheme-handler body itself (measured: `Content-Encoding: br`
+    // reached the parser as raw bytes), so the decode is the shell's, not a header's.
+    native({ shell: 'wry', publish: true, compress: 'gzip' }),
     // StepIndicator.phaze's layout IS Tailwind utilities (`relative` + `absolute
     // left-0 top-0` positioning every dot). Without the plugin those classes generate
     // nothing and every span collapses to width 0 in the same spot — measured, not

@@ -7,7 +7,9 @@ node_modules/
 # `sdf.wgsl` in turn, and the custom protocol serves those out of the embedded copy. So a clone
 # without `dist/` does not "just miss an optimisation" — it fails to build, or builds a panel that
 # 404s every lazy chunk at runtime. `publish.html` beside it is the same entry inlined, for the
-# `with_html` delivery, read by `include_str!`.
+# `with_html` delivery, read by `include_str!`. The files under `assets/` are gzip'd in place by
+# the build (`native({ compress: 'gzip' })`) and decoded by the protocol handler — so they are
+# binary blobs here, and a diff of them means nothing.
 #
 # The hashed filenames change on every build, so this directory churns. That is the price of
 # `include_dir!`; the alternative is a build.rs that runs vite, which would make `cargo build`
