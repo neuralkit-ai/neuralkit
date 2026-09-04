@@ -2,12 +2,9 @@ node_modules/
 
 # `dist/` IS TRACKED — deliberately, and it is not build noise here.
 #
-# `src/panel.rs` embeds the whole directory with `include_dir!`, which reads it at COMPILE time,
-# and fabric code-splits: the entry does `import("./sdfEngine-<hash>.js")`, which reaches
-# `sdf.wgsl` in turn, and the custom protocol serves those out of the embedded copy. So a clone
-# without `dist/` does not "just miss an optimisation" — it fails to build, or builds a panel that
-# 404s every lazy chunk at runtime.
-#
-# The hashed filenames change on every build, so this directory churns. That is the price of
-# `include_dir!`; the alternative is a build.rs that runs vite, which would make `cargo build`
-# depend on node.
+# `src/panel.rs` embeds it at COMPILE time (`include_str!` for the document, `include_dir!` for the
+# custom-protocol path), so a clone without `dist/` fails to build. Under `native({ publish: true })`
+# the directory is ONE file, `index.html`, with the entry module, the stylesheet and every fabric
+# `import()` site folded in — nothing hashed, nothing for the protocol to 404 on — so it no longer
+# churns per build. The alternative remains a build.rs that runs vite, which would make
+# `cargo build` depend on node.

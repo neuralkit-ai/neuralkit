@@ -3,19 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build && node inline.mjs",
+    "build": "vite build",
     "dev": "vite",
     "check": "phaze-check --noEmit"
   },
   "dependencies": {
     "@madenowhere/graviton": "link:/Users/r/Minilab/graviton",
     "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
+    "@madenowhere/phaze-native": "link:/Users/r/Minilab/phaze/packages/phaze-native",
     "@madenowhere/photon": "link:/Users/r/Minilab/photon"
   },
   "devDependencies": {
     "@madenowhere/phaze-check": "link:/Users/r/Minilab/phaze/packages/phaze-check",
-    "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
     "@madenowhere/phaze-tsplugin": "link:/Users/r/Minilab/phaze/packages/phaze-tsplugin",
+    "@madenowhere/vite-plugin-phaze": "link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze",
     "@tailwindcss/vite": "^4.3.3",
     "@webgpu/types": "^0.1.72",
     "tailwindcss": "^4.3.3",
@@ -27,6 +28,10 @@
     "overrides": {
       "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
       "@madenowhere/phaze-compile": "link:/Users/r/Minilab/phaze/packages/compile",
+      "@madenowhere/phaze-native": "link:/Users/r/Minilab/phaze/packages/phaze-native",
+      "@madenowhere/phaze-render-to-string": "link:/Users/r/Minilab/phaze/packages/render-to-string",
+      "@madenowhere/phaze-vite": "link:/Users/r/Minilab/phaze/packages/vite",
+      "@madenowhere/vite-plugin-phaze": "link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze",
       "@madenowhere/photon": "link:/Users/r/Minilab/photon",
       "@madenowhere/graviton": "link:/Users/r/Minilab/graviton"
     }

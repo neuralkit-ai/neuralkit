@@ -385,27 +385,31 @@ impl HasWindowHandle for ViewHandle {
     }
 }
 
-/// The card, as markup — now BUILT rather than written here. `panel/` is a phaze app; this is its
-/// output. Inline rather than a file or a local server, for the same reasons as before: it ships
-/// in the binary, has no path to get wrong, and `with_html` is the whole delivery mechanism.
+/// The card, as a document — BUILT rather than written here. `panel/` is a phaze app on the
+/// native target (`@madenowhere/phaze-native`); this is its output. It ships in the binary, has
+/// no path to get wrong, and `with_html` is the delivery mechanism.
 ///
-/// `panel/dist/panel.html` is ONE self-contained file because `panel/inline.mjs` folds the module
-/// and the stylesheet back into the document after `vite build`. That is not tidiness — `with_html`
-/// hands WKWebView a string with NO BASE URL, so anything left as a `src`/`href` has nothing to
-/// resolve against and silently never loads. The file is committed (see `panel/.gitignore`)
-/// because `include_str!` reads it at COMPILE time; a fresh clone cannot build without it.
+/// `panel/dist/index.html` is ONE self-contained file because the app builds with
+/// `native({ publish: true })`: the page is GENERATED at build (its copy is in the HTML before any
+/// script runs), and the entry module, the stylesheet and every fabric `import()` site are folded
+/// into the document. That is not tidiness — `with_html` hands WKWebView a string with NO BASE
+/// URL, so anything left as a `src`/`href` has nothing to resolve against and silently never
+/// loads. The file is committed (see `panel/.gitignore`) because `include_str!` reads it at
+/// COMPILE time; a fresh clone cannot build without it.
 ///
 /// THE TRADE, from wry's own docs: a page loaded from a string has a **`null` origin** — no
-/// localStorage, no fetch, no relative URLs. This card needs none of them. A panel that grows to
-/// need any wants `with_custom_protocol` + `with_url("wry://localhost")` instead — the same build
-/// output, served under a real origin, which is what Tauri does.
+/// localStorage, no fetch, no relative URLs, and no secure context, so `navigator.gpu` and
+/// `crypto.subtle` are withheld. This card needs none of them. A panel that grows to need any
+/// wants `with_custom_protocol` + `with_url("<scheme>://localhost")` instead — the same document,
+/// served under a real origin, which is what Tauri does (the spike below).
 ///
 /// What used to be written here moved INTO the app and is still doing the same job: the
 /// transparency and `canvastext` rules are in `panel/src/styles.css`, the drag handler in
-/// `panel/index.html`.
-const PANEL: &str = include_str!("../panel/dist/panel.html");
+/// `panel/src/pages/index.tsx`.
+const PANEL: &str = include_str!("../panel/dist/index.html");
 
-/// The whole build, embedded — the custom-protocol path serves lazy chunks out of this.
+/// The build directory, embedded — the custom-protocol path serves out of this. Under `publish`
+/// it holds the one document; a served-directory build (hashed chunks) would land here too.
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
 
 /// Fill `parent` with a `WKWebView` rendering `PANEL`.

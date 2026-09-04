@@ -7,6 +7,10 @@ settings:
 overrides:
   '@madenowhere/phaze': link:/Users/r/Minilab/phaze/packages/core
   '@madenowhere/phaze-compile': link:/Users/r/Minilab/phaze/packages/compile
+  '@madenowhere/phaze-native': link:/Users/r/Minilab/phaze/packages/phaze-native
+  '@madenowhere/phaze-render-to-string': link:/Users/r/Minilab/phaze/packages/render-to-string
+  '@madenowhere/phaze-vite': link:/Users/r/Minilab/phaze/packages/vite
+  '@madenowhere/vite-plugin-phaze': link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze
   '@madenowhere/photon': link:/Users/r/Minilab/photon
   '@madenowhere/graviton': link:/Users/r/Minilab/graviton
 
@@ -20,6 +24,9 @@ importers:
       '@madenowhere/phaze':
         specifier: link:/Users/r/Minilab/phaze/packages/core
         version: link:../../phaze/packages/core
+      '@madenowhere/phaze-native':
+        specifier: link:/Users/r/Minilab/phaze/packages/phaze-native
+        version: link:../../phaze/packages/phaze-native
       '@madenowhere/photon':
         specifier: link:/Users/r/Minilab/photon
         version: link:../../photon
@@ -27,12 +34,12 @@ importers:
       '@madenowhere/phaze-check':
         specifier: link:/Users/r/Minilab/phaze/packages/phaze-check
         version: link:../../phaze/packages/phaze-check
-      '@madenowhere/phaze-compile':
-        specifier: link:/Users/r/Minilab/phaze/packages/compile
-        version: link:../../phaze/packages/compile
       '@madenowhere/phaze-tsplugin':
         specifier: link:/Users/r/Minilab/phaze/packages/phaze-tsplugin
         version: link:../../phaze/packages/phaze-tsplugin
+      '@madenowhere/vite-plugin-phaze':
+        specifier: link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze
+        version: link:../../phaze/packages/vite-plugin-phaze
       '@tailwindcss/vite':
         specifier: ^4.3.3
         version: 4.3.3(vite@8.2.2(jiti@2.7.0))
