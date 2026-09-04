@@ -1,0 +1,20 @@
+// The app shell — what every page of this panel renders inside, and what
+// survives a navigation if the panel ever gains a second route: the card as a
+// drag handle, and the cube. The page is `{children}`. Same shape as
+// neuralkit-web's `src/app.phaze`, which mounts FabricCanvas the same way.
+import { JSXChild } from '@madenowhere/phaze'
+import { drag } from '@madenowhere/phaze-native/wry'
+import { FabricCube } from './FabricCube'
+
+import './styles.css'
+
+---props
+children?: JSXChild
+---
+
+drag()
+
+<main data-tauri-drag-region>
+  <FabricCube ssr={false} />
+  {children}
+</main>

@@ -11,6 +11,7 @@
     "@madenowhere/graviton": "link:/Users/r/Minilab/graviton",
     "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
     "@madenowhere/phaze-native": "link:/Users/r/Minilab/phaze/packages/phaze-native",
+    "@madenowhere/phaze-vite": "link:/Users/r/Minilab/phaze/packages/vite",
     "@madenowhere/photon": "link:/Users/r/Minilab/photon"
   },
   "devDependencies": {

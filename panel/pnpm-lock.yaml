@@ -27,6 +27,9 @@ importers:
       '@madenowhere/phaze-native':
         specifier: link:/Users/r/Minilab/phaze/packages/phaze-native
         version: link:../../phaze/packages/phaze-native
+      '@madenowhere/phaze-vite':
+        specifier: link:/Users/r/Minilab/phaze/packages/vite
+        version: link:../../phaze/packages/vite
       '@madenowhere/photon':
         specifier: link:/Users/r/Minilab/photon
         version: link:../../photon
