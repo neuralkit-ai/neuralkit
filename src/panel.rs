@@ -478,38 +478,62 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                     Some("wasm") => "application/wasm",
                     _ => "application/octet-stream",
                 };
-                match DIST.get_file(path) {
+                // Static precompression: the build (`native({ compress })`) replaces each
+                // `assets/*.js|css` with `<name>.gz` or `<name>.br`, so the directory names its
+                // decoder. Raw first — documents are never compressed — then by suffix. WebKit
+                // does NOT decode a scheme-handler body — measured: a `Content-Encoding: br`
+                // response reached the parser as raw bytes — so the decode happens here and
+                // the response carries no encoding header.
+                let found = DIST
+                    .get_file(path)
+                    .map(|f| (f, ""))
+                    .or_else(|| DIST.get_file(format!("{path}.gz")).map(|f| (f, "gz")))
+                    .or_else(|| DIST.get_file(format!("{path}.br")).map(|f| (f, "br")));
+                match found {
                     // Vite emits `<script type="module" crossorigin>`, so the entry is fetched in
                     // CORS mode. Same origin, but a custom scheme with no ACAO header can still be
                     // refused — and the failure mode is a blank panel, not an error.
-                    Some(f) => {
-                        // `assets/*` are gzip'd in place by the build (`native({ compress:
-                        // 'gzip' })`). WebKit does NOT decode a scheme-handler body — measured:
-                        // a `Content-Encoding: br` response reached the parser as raw bytes —
-                        // so the decode happens here and the response carries no encoding
-                        // header. Documents (`index.html`) are never compressed. A file that
-                        // is not gzip (a future raw asset) is served as-is.
-                        let body: std::borrow::Cow<'static, [u8]> = if path.starts_with("assets/") {
-                            use std::io::Read;
-                            let started = std::time::Instant::now();
-                            let mut out = Vec::with_capacity(f.contents().len() * 4);
-                            match flate2::read::GzDecoder::new(f.contents()).read_to_end(&mut out) {
-                                Ok(_) => {
-                                    if std::env::var_os("NEURALKIT_PANEL_TIMING").is_some() {
-                                        eprintln!("[panel] gunzip {path} {}B → {}B in {:?}", f.contents().len(), out.len(), started.elapsed());
-                                    }
-                                    std::borrow::Cow::Owned(out)
-                                }
-                                Err(_) => std::borrow::Cow::Borrowed(f.contents()),
-                            }
-                        } else {
-                            std::borrow::Cow::Borrowed(f.contents())
+                    Some((f, enc)) => {
+                        use std::io::Read;
+                        let started = std::time::Instant::now();
+                        let mut out = Vec::with_capacity(f.contents().len() * 4);
+                        let decoded: Result<std::borrow::Cow<'static, [u8]>, String> = match enc {
+                            "gz" => flate2::read::GzDecoder::new(f.contents())
+                                .read_to_end(&mut out)
+                                .map(|_| std::borrow::Cow::Owned(out))
+                                .map_err(|e| format!("gunzip {path}.gz: {e}")),
+                            #[cfg(feature = "panel-brotli")]
+                            "br" => brotli_decompressor::Decompressor::new(f.contents(), 4096)
+                                .read_to_end(&mut out)
+                                .map(|_| std::borrow::Cow::Owned(out))
+                                .map_err(|e| format!("brotli {path}.br: {e}")),
+                            #[cfg(not(feature = "panel-brotli"))]
+                            "br" => Err(format!(
+                                "{path}.br: the panel was built with `compress: 'brotli'` but this binary has no brotli decoder — build with `--features panel-brotli`, or rebuild the panel with `compress: 'gzip'`"
+                            )),
+                            _ => Ok(std::borrow::Cow::Borrowed(f.contents())),
                         };
-                        wry::http::Response::builder()
-                            .header(wry::http::header::CONTENT_TYPE, mime)
-                            .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(body)
-                            .unwrap()
+                        match decoded {
+                            Ok(body) => {
+                                if !enc.is_empty() && std::env::var_os("NEURALKIT_PANEL_TIMING").is_some() {
+                                    eprintln!("[panel] {enc} {path} {}B → {}B in {:?}", f.contents().len(), body.len(), started.elapsed());
+                                }
+                                wry::http::Response::builder()
+                                    .header(wry::http::header::CONTENT_TYPE, mime)
+                                    .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                    .body(body)
+                                    .unwrap()
+                            }
+                            Err(why) => {
+                                // Loud: served as-is, compressed bytes reach the parser and the
+                                // panel is blank with nothing on stderr.
+                                eprintln!("[panel] {why}");
+                                wry::http::Response::builder()
+                                    .status(500)
+                                    .body(std::borrow::Cow::Owned(why.into_bytes()))
+                                    .unwrap()
+                            }
+                        }
                     }
                     None => wry::http::Response::builder()
                         .status(404)

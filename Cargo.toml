@@ -10,6 +10,10 @@ keywords = ["QML"]
 categories = ["science::neuroscience"]
 authors = ["R. <r@neuralkit.ai>"]
 
+[features]
+# The panel's brotli decoder — see `brotli-decompressor` under [dependencies].
+panel-brotli = ["dep:brotli-decompressor"]
+
 [dependencies]
 # Ingest — NeuroSky serial headset + CLI args.
 serialport = "4.3.0"
@@ -111,6 +115,11 @@ include_dir = "0.7"
 # not decode a scheme-handler body (measured — a `Content-Encoding: br` response reached the
 # parser as raw bytes), so the shell decodes and serves raw.
 flate2 = "1"
+# NOT otherwise in the build. The decode-only half of the brotli crate Tauri embeds with; it
+# carries brotli's 122,784-byte static dictionary, which is why it is a feature and not a default:
+# pair `--features panel-brotli` with `native({ compress: 'brotli' })` in panel/vite.config.ts,
+# and measure the binary — the dictionary is a fixed cost, the tighter packing scales with assets.
+brotli-decompressor = { version = "5", optional = true, default-features = false, features = ["std"] }
 raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
