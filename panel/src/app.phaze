@@ -4,7 +4,7 @@
 // neuralkit-web's `src/app.phaze`, which mounts FabricCanvas the same way.
 import { JSXChild } from '@madenowhere/phaze'
 import { drag } from '@madenowhere/phaze-native/wry'
-import { FabricCube } from './FabricCube'
+import { FabricCube } from './components/(app)/FabricCube'
 
 import './styles.css'
 

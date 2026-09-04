@@ -87,7 +87,7 @@ export default defineConfig({
         { name: 'pages',      match: (c) => !c.chunkName.startsWith('phaze') && c.moduleIds.some((m) => m.includes('/src/pages/')) },
         { name: 'phaze',      match: (c) => c.chunkName === 'phaze' || c.chunkName.startsWith('phaze-')
                                 || ['store', 'portal', 'catch', 'time', 'match', 'list', 'defer', 'revalidate'].includes(c.chunkName) },
-        { name: 'components', match: (c) => c.moduleIds.some((m) => m.includes('/src/components/') || /\/panel\/src\/FabricCube\.tsx$/.test(m)) },
+        { name: 'components', match: (c) => c.moduleIds.some((m) => m.includes('/src/components/')) },
         { name: 'graviton',   match: (c) => c.moduleIds.some((m) => m.includes('/graviton/')) },
         { name: 'fabric',     match: (c) => c.moduleIds.some((m) => m.includes('/fabric/') || m.includes('/wgsl/')) },
       ],
@@ -113,8 +113,11 @@ export default defineConfig({
               if (phazeChunk && phazeChunk !== 'phaze') return phazeChunk
               // The fabric wrapper → 'fabric-cube'; fabric's statically imported
               // engine follows transitively, its `import()` targets stay their own
-              // async chunks (named here they would join the eager chunk).
-              if (/\/panel\/src\/FabricCube\.tsx$/.test(id)) return 'fabric-cube'
+              // async chunks (named here they would join the eager chunk). Matched
+              // with or without a `(group)/` segment, as -web matches FabricCanvas,
+              // so a later move into a label folder does not drop it into
+              // ui-components.
+              if (/\/src\/components\/(?:\([^)]+\)\/)?FabricCube\.tsx$/.test(id)) return 'fabric-cube'
               // Graviton — one chunk for the whole package.
               if (id.includes('/graviton/')) return 'graviton'
               // Photon and the shared -web components → ui-components, as in -web.

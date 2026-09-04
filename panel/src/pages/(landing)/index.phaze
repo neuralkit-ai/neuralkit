@@ -1,28 +1,25 @@
-// The welcome page — the copy of the card. The shell around it (the drag
+// The welcome route, `/` — the copy of the card. The shell around it (the drag
 // handle, the cube, the stylesheet) is `src/app.phaze`; this file is only what
 // the route says. `native()` renders it at build into `dist/index.html`, its
 // copy in the HTML before any script runs, and the webview hydrates it.
-
 import { s } from '@madenowhere/phaze/dsl'
 import { inc } from '@madenowhere/phaze/numeric'
 import { interval, seconds } from '@madenowhere/phaze/time'
 // THE one definition — neuralkit-web's. `@web/` is aliased in vite.config.ts.
 import { StepIndicator } from '@web/components/ui/StepIndicator.phaze'
 
-export const head = { title: 'Neuralkit' }
+---page
+head: { title: 'Neuralkit' }
+---state
+state : s<'intake' | 'signal' | 'model' | 'report'>('intake')
+steps : s(['intake', 'signal', 'model', 'report'])
+---
 
-export default function Welcome() {
-  const state = s<'intake' | 'signal' | 'model' | 'report'>('intake')
-  const steps = s(['intake', 'signal', 'model', 'report'])
+interval(seconds(3), inc(state))
 
-  interval(seconds(3), inc(state))
+<>
+  <h1>Neuralkit CLI is installed</h1>
+  <p>The neuralkit command is now on your PATH.</p>
 
-  return (
-    <>
-      <h1>Neuralkit CLI is installed</h1>
-      <p>The neuralkit command is now on your PATH.</p>
-
-      <StepIndicator state={state} steps={steps} className="mt-1.5 opacity-30" />
-    </>
-  )
-}
+  <StepIndicator state={state} steps={steps} className="mt-1.5 opacity-30" />
+</>
