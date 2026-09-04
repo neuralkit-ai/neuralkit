@@ -521,10 +521,11 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                         }
                     }
                     None => {
-                        // Loud on purpose. A chunk declared off in `native({ conditional })`
+                        // Loud on purpose. A chunk the build's shaker stripped (a fabric
+                        // `import()` behind a condition this card's source never turns on)
                         // that the page asks for anyway lands here — the only sign would
                         // otherwise be a feature silently missing from the card.
-                        eprintln!("[panel] 404 {path} — not in the embedded build (declared off in native({{ conditional }})?)");
+                        eprintln!("[panel] 404 {path} — not in the embedded build (stripped by the shaker, yet requested?)");
                         wry::http::Response::builder()
                             .status(404)
                             .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
