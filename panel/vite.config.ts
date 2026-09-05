@@ -56,7 +56,9 @@ export default defineConfig({
     // app's source never turns the condition on, so the bundler never emits the
     // chunk and the binary never embeds it. Detection is an fs-walk of `src/`
     // (the cwd's, i.e. this panel's). `regionsOnly` as in -web.
-    fabricShakePlugin({ regionsOnly: true }),
+    // `PANEL_NO_SHAKE=1 pnpm build` leaves the shaker out — the one-line bisection
+    // for "did a region strip change what fabric draws".
+    ...(process.env.PANEL_NO_SHAKE ? [] : [fabricShakePlugin({ regionsOnly: true })]),
     // Same grouped, labelled build report neuralkit-web prints. Under `publish`
     // there is ONE chunk — every fabric `import()` site is folded into it — so the
     // report is the size of the script the document carries, before inlining.
