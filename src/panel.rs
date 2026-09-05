@@ -420,10 +420,22 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
 
     let builder = WebViewBuilder::new()
         .with_transparent(true)
+        // NO DISK RESIDUE. WebKit's default data store is persistent: this panel had written
+        // `~/Library/WebKit/ai.neuralkit.cli/WebsiteData` and a 1 MB WebKit network cache under
+        // `~/Library/Caches/ai.neuralkit.cli` — for a page that stores nothing and is served out
+        // of the binary. A non-persistent store keeps all of that in the process.
+        .with_incognito(true)
+        // THE ALLOWLIST, AT THE NAVIGATION LEVEL. The protocol handler already answers 404 for a
+        // path it does not have; this refuses any other ORIGIN, so no link and no `location`
+        // assignment can turn the card into a browser. wry's default allows every navigation.
+        .with_navigation_handler(|url| url.starts_with("nk://localhost"))
+        // A real Web Inspector (right-click → Inspect): wry has it on in debug builds, and a
+        // release build gets it only with `--features panel-devtools` (see Cargo.toml).
+        .with_devtools(cfg!(any(debug_assertions, feature = "panel-devtools")))
         .with_ipc_handler(move |req| {
             if req.body() != "drag" {
                 // Anything that is not the drag ping is a diagnostic from the page — its channel
-                // back to the process (there is no inspector build).
+                // back to the process in a build without the inspector.
                 eprintln!("[panel] {}", req.body());
                 return
             }
@@ -505,7 +517,9 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                                 }
                                 wry::http::Response::builder()
                                     .header(wry::http::header::CONTENT_TYPE, mime)
-                                    .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                    // The exact origin, not `*` — measured as `location.origin`
+                                    // under the custom scheme.
+                                    .header(wry::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "nk://localhost")
                                     .body(body)
                                     .unwrap()
                             }

@@ -13,6 +13,10 @@ authors = ["R. <r@neuralkit.ai>"]
 [features]
 # The panel's brotli decoder — see `brotli-decompressor` under [dependencies].
 panel-brotli = ["dep:brotli-decompressor"]
+# A real Web Inspector on the panel (right-click → Inspect) in a RELEASE build: wry enables
+# devtools in debug builds by itself but needs its `devtools` feature for release, which calls
+# private WebKit API — never in the shipped binary, hence a feature and not a default.
+panel-devtools = ["wry/devtools"]
 
 [dependencies]
 # Ingest — NeuroSky serial headset + CLI args.
