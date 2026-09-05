@@ -10,7 +10,47 @@ keywords = ["QML"]
 categories = ["science::neuroscience"]
 authors = ["R. <r@neuralkit.ai>"]
 
+# `phaze native dev` / `build` / `bundle` / `info` read this table (`phaze native info` prints it
+# resolved). `app` is the phaze app the shell embeds; `dev-url` is what `dev` waits for and bakes
+# into a dev build (build.rs); `run-args` is what `cargo run --` needs to open the panel.
+[package.metadata.native]
+app = "panel"
+dev-url = "http://localhost:5180"   # panel/vite.config.ts binds it strictly; 5173 is -web's
+run-args = ["tray"]
+
+# The macOS bundle: the app's identity, committed. `bundle-id` and `team` must match the App ID
+# the profiles were issued for — `bundle` refuses to sign unless the entitlements claim exactly
+# `<team>.<bundle-id>`. Bundles land in target/<profile>/bundle/macos/ (Tauri's layout).
+[package.metadata.native.macos]
+product = "NeuralkitCLI"
+bundle-id = "ai.neuralkit.cli"
+team = "SBG7YFF24U"
+info-plist = "release/macos/Info.plist"
+entitlements = "release/macos/neuralkit.entitlements"
+
+# The signing pairs — an identity and the provisioning profile it was issued with. Neither is a
+# secret (the identity is a certificate's name; the private key stays in the keychain). Another
+# Mac overrides with APPLE_SIGNING_IDENTITY + PHAZE_NATIVE_PROFILE. The identity must be one the
+# PROFILE lists (`security cms -D -i <profile>`, DeveloperCertificates): a valid cert the profile
+# does not list still dies at launch — AMFI SIGKILL, exit 137, which reads exactly like "the
+# entitlement does not work".
+[package.metadata.native.macos.sign.dev]
+identity = "Apple Development: Rohan Rehman (CBQ9TZC7T3)"
+profile = "~/Downloads/Neuralkit_CLI_Dev.provisionprofile"
+
+[package.metadata.native.macos.sign.release]
+identity = "Developer ID Application: Neuralkit inc. (SBG7YFF24U)"
+profile = "~/Downloads/Neuralkit_CLI_Developer_ID.provisionprofile"
+
 [features]
+# THE EMBEDDED PANEL IS A FEATURE, ON BY DEFAULT — Tauri's `custom-protocol` model. A build
+# WITHOUT it is a DEV build: `include_dir!` is skipped (so `panel/dist` need not exist), and the
+# webview loads the Vite dev server URL that build.rs bakes in from PHAZE_NATIVE_DEV_URL — which
+# is what `phaze native dev` (panel/package.json `xdev`) sets, with `cargo run
+# --no-default-features`. A release binary therefore has no dev URL to be pointed at, and a bare
+# `cargo run` still embeds, as it always did.
+default = ["embed"]
+embed = []
 # The panel's brotli decoder — see `brotli-decompressor` under [dependencies].
 panel-brotli = ["dep:brotli-decompressor"]
 # A real Web Inspector on the panel (right-click → Inspect) in a RELEASE build: wry enables

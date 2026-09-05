@@ -38,15 +38,16 @@ export default defineConfig({
     // 380 µs). gzip until the assets are ~30× larger — the decoder is a fixed cost, the
     // tighter packing scales with the assets.
     // `artifacts`: the download — the report's last lines. Vite runs before cargo,
-    // so these are the PREVIOUS shell's sizes until the chain (`cargo build
-    // --release`, `release/macos/bundle.sh`, `hdiutil`) runs again; each row says so.
+    // so these are the PREVIOUS shell's sizes until `phaze native build --bundles
+    // app,dmg` runs again; each row says so. Bundles land in target/release/bundle/
+    // macos/ (Tauri's layout); the dmg carries the crate version and the arch.
     native({
       shell: 'wry',
       compress: 'gzip',
       artifacts: {
         binary: '../target/release/neuralkit',
-        app:    '../dist/NeuralkitCLI.app',
-        dmg:    '../dist/NeuralkitCLI.dmg',
+        app:    '../target/release/bundle/macos/NeuralkitCLI.app',
+        dmg:    '../target/release/bundle/macos/NeuralkitCLI_0.1.0_aarch64.dmg',
       },
     }),
     // StepIndicator.phaze's layout IS Tailwind utilities (`relative` + `absolute
@@ -153,5 +154,10 @@ export default defineConfig({
   // Workspace-link contract: excluded from pre-bundling + the roots allowed,
   // or the dev server 404s the symlinked packages.
   optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/phaze-native', '@madenowhere/photon', '@madenowhere/graviton'] },
-  server: { fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '/Users/r/Minilab/graviton', WEB, '.'] } },
+  // THE PANEL'S OWN PORT, STRICT. -web's dev server holds 5173 on this machine; without
+  // `strictPort` Vite would move to 5174 while `phaze native dev` waited on the port in
+  // Cargo.toml's `dev-url` — answered by -web — and the shell would show -web's landing page
+  // (measured 2026-09-05). Now a taken port fails Vite out loud instead, and the CLI refuses
+  // to start when something else already answers on `dev-url`.
+  server: { port: 5180, strictPort: true, fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '/Users/r/Minilab/graviton', WEB, '.'] } },
 })

@@ -5,7 +5,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "xdev": "vite & (cd .. && NEURALKIT_PANEL_DEV=http://localhost:5173 NEURALKIT_PANEL=1 NEURALKIT_PANEL_WEB=1 cargo run -- tray)",
+    "xdev": "NEURALKIT_PANEL=1 NEURALKIT_PANEL_WEB=1 phaze native dev",
     "check": "phaze-check --noEmit"
   },
   "dependencies": {

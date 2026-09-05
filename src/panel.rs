@@ -402,35 +402,31 @@ impl HasWindowHandle for ViewHandle {
 /// What used to be written here moved INTO the app and is still doing the same job: the
 /// transparency and `canvastext` rules are in `panel/src/styles.css`, the drag handler in
 /// `panel/src/pages/index.tsx`.
+#[cfg(feature = "embed")]
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
 
-/// `NEURALKIT_PANEL_DEV` — the panel's Vite dev origin, or None for the embedded build.
-///
-/// Only a loopback `http://` origin is accepted: it is what Vite serves, it is a secure context
-/// (so `navigator.gpu` exists, exactly as under `nk://localhost`), and the navigation allowlist
-/// widens by this one origin and nothing else. Anything else is refused out loud and the embed
-/// serves as usual, so a typo cannot turn the card into a browser.
-fn dev_origin() -> Option<String> {
-    let raw = std::env::var("NEURALKIT_PANEL_DEV").ok()?;
-    let origin = raw.trim().trim_end_matches('/').to_string();
-    if origin.is_empty() {
-        return None;
-    }
-    let loopback = ["http://localhost", "http://127.0.0.1"]
-        .iter()
-        .any(|p| origin == *p || origin.strip_prefix(p).is_some_and(|rest| rest.starts_with(':')));
-    if !loopback {
-        eprintln!("[panel] NEURALKIT_PANEL_DEV={raw}: not a loopback http origin — using the embedded build");
-        return None;
-    }
-    Some(origin)
-}
+/// A DEV BUILD IS THE CRATE WITHOUT `embed` (Tauri's `custom-protocol` model, Cargo.toml
+/// [features]). It embeds nothing — `panel/dist` need not exist — and loads the panel from the
+/// Vite dev server URL that build.rs bakes in from `PHAZE_NATIVE_DEV_URL`, which `phaze native
+/// dev` sets before `cargo run --no-default-features`. Baked at COMPILE time, so a release
+/// binary has no dev URL to be pointed at, and a dev build without one does not compile.
+/// Which API the binary talks to is a different thing entirely: `--url` (main.rs), at runtime,
+/// as always.
+#[cfg(not(feature = "embed"))]
+const DEV_URL: Option<&str> = option_env!("PHAZE_NATIVE_DEV_URL");
+#[cfg(not(feature = "embed"))]
+const _: () = assert!(
+    DEV_URL.is_some(),
+    "a build without the `embed` feature is a dev build and needs PHAZE_NATIVE_DEV_URL (`phaze native dev` sets it)"
+);
 
-/// The host waits, so `vite` and `cargo run` can start in either order — the `xdev` script
-/// backgrounds vite and sequences nothing. Every address the host name resolves to is tried
-/// (Vite may be listening on `::1`, `127.0.0.1`, or both), every 500 ms, for up to 30 s; then
-/// the URL is loaded anyway, so a stuck dev server shows as WebKit's own error rather than a
-/// panel that never appears. Dev-only, so blocking the main thread here costs nothing that matters.
+/// `phaze native dev` already waits for the dev server's port before `cargo run`; this second
+/// wait covers a bare `cargo run --no-default-features` with the URL set by hand. Every address
+/// the host name resolves to is tried (Vite may be listening on `::1`, `127.0.0.1`, or both),
+/// every 500 ms, for up to 30 s; then the URL is loaded anyway, so a stuck dev server shows as
+/// WebKit's own error rather than a panel that never appears. Dev-only, so blocking the main
+/// thread here costs nothing that matters.
+#[cfg_attr(feature = "embed", allow(dead_code))]
 fn wait_for_dev(origin: &str) {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::{Duration, Instant};
@@ -463,13 +459,12 @@ fn wait_for_dev(origin: &str) {
 /// whether HTML over `NSGlassEffectView` keeps the material, since a webview that paints its own
 /// background would defeat the panel's whole appearance.
 ///
-/// DEV, ONE SWITCH. `NEURALKIT_PANEL_DEV=http://localhost:5173` loads the panel from its Vite dev
-/// server instead of the embedded build — edits reload in the webview, and nothing here has to
-/// be rebuilt, bundled or signed to see them. `panel/package.json`'s `xdev` script starts both
-/// halves; this process waits for the port, so their order does not matter. Everything else is
-/// unchanged: the protocol handler stays registered (unused, harmless), and the allowlist widens
-/// by exactly that one origin. The embedded build is still what ships, so the full chain remains
-/// the proof before a commit.
+/// DEV IS A BUILD, NOT A SWITCH. `phaze native dev` (panel/package.json `xdev`) starts the panel's
+/// Vite dev server, waits for its port, and runs this crate without the `embed` feature with the
+/// dev URL baked in (`DEV_URL` above) — edits reload in the webview, and nothing is rebuilt,
+/// bundled or signed to see them. In that build the protocol handler is not registered and the
+/// allowlist widens by exactly the dev origin. The embedded build is what ships, so `phaze native
+/// build` remains the proof before a commit.
 fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -> Option<WebView> {
     let view = NonNull::new(parent as *const NSView as *mut c_void)?;
     // WEAK, NOT RETAINED. The webview lives inside the panel's view tree, so a handler holding
@@ -477,8 +472,10 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
     // panel — and neither refcount would ever reach zero. `load()` returning None is the honest
     // answer once the panel is gone.
     let weak = Weak::from_retained(panel);
-    let dev = dev_origin();
-    let allowed = dev.clone();
+    #[cfg(feature = "embed")]
+    let dev: Option<&'static str> = None;
+    #[cfg(not(feature = "embed"))]
+    let dev: Option<&'static str> = DEV_URL.map(|u| u.trim_end_matches('/'));
 
     let builder = WebViewBuilder::new()
         .with_transparent(true)
@@ -492,7 +489,7 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
         // assignment can turn the card into a browser. wry's default allows every navigation.
         // In dev the one extra origin is the dev server's.
         .with_navigation_handler(move |url| {
-            url.starts_with("nk://localhost") || allowed.as_deref().is_some_and(|o| url.starts_with(o))
+            url.starts_with("nk://localhost") || dev.is_some_and(|o| url.starts_with(o))
         })
         // A real Web Inspector (right-click → Inspect): wry has it on in debug builds, and a
         // release build gets it only with `--features panel-devtools` (see Cargo.toml).
@@ -520,6 +517,7 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
     // — and wry's macOS custom protocol serves at `<scheme>://localhost`. So the build over
     // `nk://localhost` is a secure context WITHOUT a local port, a certificate, or any private
     // API. Measured: the cube renders.
+    #[cfg(feature = "embed")]
     let builder = builder
             .with_custom_protocol("nk".into(), |_id, req| {
                 // Serve the whole build, not just the document. Fabric code-splits its engine —
@@ -611,14 +609,14 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                             .unwrap()
                     }
                 }
-            })
-            .with_url(match &dev {
-                Some(origin) => {
-                    wait_for_dev(origin);
-                    format!("{origin}/")
-                }
-                None => "nk://localhost".to_string(),
             });
+    let builder = builder.with_url(match dev {
+        Some(origin) => {
+            wait_for_dev(origin);
+            format!("{origin}/")
+        }
+        None => "nk://localhost".to_string(),
+    });
 
     builder
         .with_bounds(Rect {
