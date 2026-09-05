@@ -404,12 +404,72 @@ impl HasWindowHandle for ViewHandle {
 /// `panel/src/pages/index.tsx`.
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
 
+/// `NEURALKIT_PANEL_DEV` — the panel's Vite dev origin, or None for the embedded build.
+///
+/// Only a loopback `http://` origin is accepted: it is what Vite serves, it is a secure context
+/// (so `navigator.gpu` exists, exactly as under `nk://localhost`), and the navigation allowlist
+/// widens by this one origin and nothing else. Anything else is refused out loud and the embed
+/// serves as usual, so a typo cannot turn the card into a browser.
+fn dev_origin() -> Option<String> {
+    let raw = std::env::var("NEURALKIT_PANEL_DEV").ok()?;
+    let origin = raw.trim().trim_end_matches('/').to_string();
+    if origin.is_empty() {
+        return None;
+    }
+    let loopback = ["http://localhost", "http://127.0.0.1"]
+        .iter()
+        .any(|p| origin == *p || origin.strip_prefix(p).is_some_and(|rest| rest.starts_with(':')));
+    if !loopback {
+        eprintln!("[panel] NEURALKIT_PANEL_DEV={raw}: not a loopback http origin — using the embedded build");
+        return None;
+    }
+    Some(origin)
+}
+
+/// The host waits, so `vite` and `cargo run` can start in either order — the `xdev` script
+/// backgrounds vite and sequences nothing. Every address the host name resolves to is tried
+/// (Vite may be listening on `::1`, `127.0.0.1`, or both), every 500 ms, for up to 30 s; then
+/// the URL is loaded anyway, so a stuck dev server shows as WebKit's own error rather than a
+/// panel that never appears. Dev-only, so blocking the main thread here costs nothing that matters.
+fn wait_for_dev(origin: &str) {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::{Duration, Instant};
+    let hostport = origin.trim_start_matches("http://");
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(80)),
+        None => (hostport, 80),
+    };
+    let addrs: Vec<_> = (host, port).to_socket_addrs().map(|a| a.collect()).unwrap_or_default();
+    let started = Instant::now();
+    let mut said = false;
+    while !addrs.iter().any(|a| TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok()) {
+        if started.elapsed() > Duration::from_secs(30) {
+            eprintln!("[panel] {origin} is not answering after 30 s — loading it anyway");
+            return;
+        }
+        if !said {
+            eprintln!("[panel] waiting for {origin} …");
+            said = true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("[panel] dev: loading {origin} — the embedded build is not used");
+}
+
 /// Fill `parent` with a `WKWebView` rendering the panel app out of `DIST` over `nk://`.
 ///
 /// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
 /// stay exactly as they were so the two can be compared side by side. What it is testing is
 /// whether HTML over `NSGlassEffectView` keeps the material, since a webview that paints its own
 /// background would defeat the panel's whole appearance.
+///
+/// DEV, ONE SWITCH. `NEURALKIT_PANEL_DEV=http://localhost:5173` loads the panel from its Vite dev
+/// server instead of the embedded build — edits reload in the webview, and nothing here has to
+/// be rebuilt, bundled or signed to see them. `panel/package.json`'s `xdev` script starts both
+/// halves; this process waits for the port, so their order does not matter. Everything else is
+/// unchanged: the protocol handler stays registered (unused, harmless), and the allowlist widens
+/// by exactly that one origin. The embedded build is still what ships, so the full chain remains
+/// the proof before a commit.
 fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -> Option<WebView> {
     let view = NonNull::new(parent as *const NSView as *mut c_void)?;
     // WEAK, NOT RETAINED. The webview lives inside the panel's view tree, so a handler holding
@@ -417,6 +477,8 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
     // panel — and neither refcount would ever reach zero. `load()` returning None is the honest
     // answer once the panel is gone.
     let weak = Weak::from_retained(panel);
+    let dev = dev_origin();
+    let allowed = dev.clone();
 
     let builder = WebViewBuilder::new()
         .with_transparent(true)
@@ -428,7 +490,10 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
         // THE ALLOWLIST, AT THE NAVIGATION LEVEL. The protocol handler already answers 404 for a
         // path it does not have; this refuses any other ORIGIN, so no link and no `location`
         // assignment can turn the card into a browser. wry's default allows every navigation.
-        .with_navigation_handler(|url| url.starts_with("nk://localhost"))
+        // In dev the one extra origin is the dev server's.
+        .with_navigation_handler(move |url| {
+            url.starts_with("nk://localhost") || allowed.as_deref().is_some_and(|o| url.starts_with(o))
+        })
         // A real Web Inspector (right-click → Inspect): wry has it on in debug builds, and a
         // release build gets it only with `--features panel-devtools` (see Cargo.toml).
         .with_devtools(cfg!(any(debug_assertions, feature = "panel-devtools")))
@@ -547,7 +612,13 @@ fn web_card(parent: &NSView, panel: &Retained<NSPanel>, mtm: MainThreadMarker) -
                     }
                 }
             })
-            .with_url("nk://localhost");
+            .with_url(match &dev {
+                Some(origin) => {
+                    wait_for_dev(origin);
+                    format!("{origin}/")
+                }
+                None => "nk://localhost".to_string(),
+            });
 
     builder
         .with_bounds(Rect {
