@@ -37,7 +37,18 @@ export default defineConfig({
     // adds 165 kB to the binary (7,547,664 → 7,712,848) and decodes slower (entry 218 →
     // 380 µs). gzip until the assets are ~30× larger — the decoder is a fixed cost, the
     // tighter packing scales with the assets.
-    native({ shell: 'wry', compress: 'gzip' }),
+    // `artifacts`: the download — the report's last lines. Vite runs before cargo,
+    // so these are the PREVIOUS shell's sizes until the chain (`cargo build
+    // --release`, `release/macos/bundle.sh`, `hdiutil`) runs again; each row says so.
+    native({
+      shell: 'wry',
+      compress: 'gzip',
+      artifacts: {
+        binary: '../target/release/neuralkit',
+        app:    '../dist/NeuralkitCLI.app',
+        dmg:    '../dist/NeuralkitCLI.dmg',
+      },
+    }),
     // StepIndicator.phaze's layout IS Tailwind utilities (`relative` + `absolute
     // left-0 top-0` positioning every dot). Without the plugin those classes generate
     // nothing and every span collapses to width 0 in the same spot — measured, not
