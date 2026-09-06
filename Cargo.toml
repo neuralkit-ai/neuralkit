@@ -14,8 +14,8 @@ authors = ["R. <r@neuralkit.ai>"]
 # resolved). `app` is the phaze app the shell embeds; `dev-url` is what `dev` waits for and bakes
 # into a dev build (build.rs); `run-args` is what `cargo run --` needs to open the panel.
 [package.metadata.native]
-app = "panel"
-dev-url = "http://localhost:5180"   # panel/vite.config.ts binds it strictly; 5173 is -web's
+app = "app"
+dev-url = "http://localhost:5180"   # app/vite.config.ts binds it strictly; 5173 is -web's
 run-args = ["tray"]
 
 # The macOS bundle: the app's identity, committed. `bundle-id` and `team` must match the App ID
@@ -44,9 +44,9 @@ profile = "~/Downloads/Neuralkit_CLI_Developer_ID.provisionprofile"
 
 [features]
 # THE EMBEDDED PANEL IS A FEATURE, ON BY DEFAULT — Tauri's `custom-protocol` model. A build
-# WITHOUT it is a DEV build: `include_dir!` is skipped (so `panel/dist` need not exist), and the
+# WITHOUT it is a DEV build: `include_dir!` is skipped (so `app/dist` need not exist), and the
 # webview loads the Vite dev server URL that build.rs bakes in from PHAZE_NATIVE_DEV_URL — which
-# is what `phaze native dev` (panel/package.json `xdev`) sets, with `cargo run
+# is what `phaze native dev` (app/package.json `xdev`) sets, with `cargo run
 # --no-default-features`. A release binary therefore has no dev URL to be pointed at, and a bare
 # `cargo run` still embeds, as it always did.
 default = ["embed"]
@@ -144,14 +144,14 @@ tray-icon = "0.24.2"
 # explicit because objc2-app-kit gates every class behind one.
 objc2 = "0.6"
 objc2-foundation = "0.3"
-# A TEST, behind NEURALKIT_PANEL_WEB — see panel.rs. Wry is the only genuinely NEW dependency
+# THE PANEL'S RENDERER — see panel.rs `web_card`. Wry is the only genuinely NEW dependency
 # here (unlike the objc2 family, which tao already resolved); it embeds the OS's own WKWebView
 # rather than shipping a browser, and raw-window-handle is how it is told which NSView to sit in.
 # `transparent` IS NOT A DEFAULT FEATURE, and without it `with_transparent(true)` compiles and
 # does nothing — the `drawsBackground = NO` that stops WKWebView painting white is behind that
 # cfg. A webview that paints its own background hides the Liquid Glass the panel exists to show.
 wry = { version = "0.53", features = ["transparent"] }
-# Embeds panel/dist so the custom protocol can serve fabric's LAZY chunks. `with_html` could
+# Embeds app/dist so the custom protocol can serve fabric's LAZY chunks. `with_html` could
 # not: a null-origin page has nothing for `import("./sdfEngine-….js")` to resolve against.
 include_dir = "0.7"
 # ALREADY IN THE BUILD — `tray-icon` → `png` links flate2 (miniz_oxide backend); naming it here
@@ -161,14 +161,14 @@ include_dir = "0.7"
 flate2 = "1"
 # NOT otherwise in the build. The decode-only half of the brotli crate Tauri embeds with; it
 # carries brotli's 122,784-byte static dictionary, which is why it is a feature and not a default:
-# pair `--features panel-brotli` with `native({ compress: 'brotli' })` in panel/vite.config.ts,
+# pair `--features panel-brotli` with `native({ compress: 'brotli' })` in app/vite.config.ts,
 # and measure the binary — the dictionary is a fixed cost, the tighter packing scales with assets.
 brotli-decompressor = { version = "5", optional = true, default-features = false, features = ["std"] }
 raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSWindow", "NSPanel", "NSResponder", "NSView", "NSGraphics",
-    "NSTextField", "NSControl", "NSButton", "NSCell",
-    "NSImage", "NSColor", "NSFont", "NSGlassEffectView",
+    "NSControl", "NSButton", "NSCell",
+    "NSImage", "NSColor", "NSGlassEffectView",
     "NSVisualEffectView", "NSBezierPath",
 ] }
 

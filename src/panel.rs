@@ -31,8 +31,8 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSCellImagePosition, NSColor,
-    NSFloatingWindowLevel, NSFont,
-    NSBezierPath, NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSTextField, NSView,
+    NSFloatingWindowLevel,
+    NSBezierPath, NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSPanel, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSResponder, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
     NSWindowTitleVisibility,
@@ -230,27 +230,6 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-/// One label, added to `parent`.
-///
-/// `labelWithString:` IS THE DE-CONTROLLING. A bare `NSTextField` is an editable control that
-/// paints an opaque background over whatever is behind it; this constructor hands back one
-/// already non-editable, non-selectable, unbezeled and transparent — four setters this file used
-/// to spell out by hand, and one bug (the white box) it used to have to explain.
-fn label(parent: &NSView, text: &str, size: f64, bold: bool, frame: NSRect, mtm: MainThreadMarker) {
-    let field = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-    field.setFrame(frame);
-    let font = if bold {
-        NSFont::boldSystemFontOfSize(size)
-    } else {
-        NSFont::systemFontOfSize(size)
-    };
-    field.setFont(Some(&font));
-    // `labelColor` is SEMANTIC — it follows light and dark mode, where a literal white or black
-    // would be wrong in one of them.
-    field.setTextColor(Some(&NSColor::labelColor()));
-    parent.addSubview(&field);
-}
-
 /// The close button — an `NSButton` whose target is the panel itself, so no custom class and no
 /// delegate is needed to make it work.
 ///
@@ -385,13 +364,13 @@ impl HasWindowHandle for ViewHandle {
     }
 }
 
-/// The card, as a build — not written here. `panel/` is a phaze app on the native target
+/// The card, as a build — not written here. `app/` is a phaze app on the native target
 /// (`@madenowhere/phaze-native`); this is its output, the whole directory, embedded at COMPILE
 /// time and served by the custom protocol below: `index.html` (the page GENERATED at build, so
 /// its copy is in the HTML before any script runs, referencing the entry as a file), the entry
 /// and stylesheet under `assets/` (gzip'd by the build, decoded here), and fabric's lazy chunks,
 /// which the entry `import()`s by filename at runtime. The directory is committed (see
-/// `panel/.gitignore`) because `include_dir!` reads it at compile time; a fresh clone cannot
+/// `app/.gitignore`) because `include_dir!` reads it at compile time; a fresh clone cannot
 /// build without it.
 ///
 /// Why a protocol and not `with_html`: a page loaded from a string has a **`null` origin** (wry's
@@ -400,13 +379,13 @@ impl HasWindowHandle for ViewHandle {
 /// inlined document it needed.
 ///
 /// What used to be written here moved INTO the app and is still doing the same job: the
-/// transparency and `canvastext` rules are in `panel/src/styles.css`, the drag handler in
-/// `panel/src/pages/index.tsx`.
+/// transparency and `canvastext` rules are in `app/src/styles.css`, the drag handler in
+/// `app/src/pages/index.tsx`.
 #[cfg(feature = "embed")]
-static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/panel/dist");
+static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/app/dist");
 
 /// A DEV BUILD IS THE CRATE WITHOUT `embed` (Tauri's `custom-protocol` model, Cargo.toml
-/// [features]). It embeds nothing — `panel/dist` need not exist — and loads the panel from the
+/// [features]). It embeds nothing — `app/dist` need not exist — and loads the panel from the
 /// Vite dev server URL that build.rs bakes in from `PHAZE_NATIVE_DEV_URL`, which `phaze native
 /// dev` sets before `cargo run --no-default-features`. Baked at COMPILE time, so a release
 /// binary has no dev URL to be pointed at, and a dev build without one does not compile.
@@ -454,12 +433,13 @@ fn wait_for_dev(origin: &str) {
 
 /// Fill `parent` with a `WKWebView` rendering the panel app out of `DIST` over `nk://`.
 ///
-/// A TEST PATH, not the default — `NEURALKIT_PANEL_WEB=1` picks it, and the NSTextField labels
-/// stay exactly as they were so the two can be compared side by side. What it is testing is
-/// whether HTML over `NSGlassEffectView` keeps the material, since a webview that paints its own
-/// background would defeat the panel's whole appearance.
+/// THE CARD, since 2026-09-06. It began as a test path behind a flag, beside the original
+/// NSTextField labels, to check that HTML over `NSGlassEffectView` keeps the material — a
+/// webview that paints its own background would defeat the panel's whole appearance. It does
+/// keep it (`with_transparent`), and the type renders the same as AppKit's, so the labels and
+/// the flag are gone.
 ///
-/// DEV IS A BUILD, NOT A SWITCH. `phaze native dev` (panel/package.json `xdev`) starts the panel's
+/// DEV IS A BUILD, NOT A SWITCH. `phaze native dev` (app/package.json `xdev`) starts the panel's
 /// Vite dev server, waits for its port, and runs this crate without the `embed` feature with the
 /// dev URL baked in (`DEV_URL` above) — edits reload in the webview, and nothing is rebuilt,
 /// bundled or signed to see them. In that build the protocol handler is not registered and the
@@ -851,28 +831,13 @@ pub fn welcome(anchor: Option<(f64, f64)>) -> Option<(Retained<NSPanel>, Option<
     // Small enough to still be a card, large enough that the glass corners never overlap.
     panel.setContentMinSize(NSSize::new(W / 2.0, H / 2.0));
 
-    // y counts UP, so the title sits highest and the commands sit near the floor.
-    // TYPE STAYS AT SYSTEM SIZE while the panel scales. Doubling the point size would make the
-    // panel bigger without making it more readable — macOS text is sized against the system
-    // font, not against its container.
-    // TWO WAYS TO FILL THE SAME CARD, so they can be compared rather than argued about.
-    // `NEURALKIT_PANEL_WEB=1` renders the content as HTML in a WKWebView; without it the
-    // NSTextField labels run exactly as before. The window, the glass and the close button are
-    // shared by both — only what fills the middle differs.
-    let web = if std::env::var_os("NEURALKIT_PANEL_WEB").is_some() {
-        web_card(&inner, &panel, mtm)
-    } else {
-        let line = W - PAD * 2.0;
-        label(&inner, "Neuralkit CLI is installed", 15.0, true,
-            rect(PAD, H - 42.0 * SCALE, line, 22.0), mtm);
-        label(&inner, "The neuralkit command is now on your PATH.", 12.0, false,
-            rect(PAD, H - 66.0 * SCALE, line, 18.0), mtm);
-        label(&inner, "neuralkit auth login     sign in", 11.5, false,
-            rect(PAD, 36.0 * SCALE, line, 16.0), mtm);
-        label(&inner, "neuralkit --help         everything else", 11.5, false,
-            rect(PAD, 16.0 * SCALE, line, 16.0), mtm);
-        None
-    };
+    // THE PHAZE CARD FILLS THE MIDDLE. The window, the glass and the close button are AppKit;
+    // what sits inside is the panel app in a WKWebView. Until 2026-09-06 four NSTextField labels
+    // were the default and the webview a flag (`NEURALKIT_PANEL_WEB`), kept so the two could be
+    // compared rather than argued about. Measured side by side at 4×: the same system font at the
+    // same sizes renders the same over the glass — the only visible text difference was the
+    // stylesheet's own `opacity: .8` on the subtitle. So the labels went, and with them the flag.
+    let web = web_card(&inner, &panel, mtm);
     // ON TOP OF EITHER. Added after the webview so it stays above it in z-order — a subview added
     // first would end up behind the WKWebView and be unclickable.
     // Top-right, inset by half the padding so it sits in the corner rather than in the text

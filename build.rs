@@ -31,14 +31,14 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("CARGO_FEATURE_EMBED").is_some() {
         // Only when embedding: cargo re-runs this script when the panel's build changes, so a
-        // `pnpm build` in panel/ recompiles without a `touch`. NOT in a dev build — measured: a
+        // `pnpm build` in app/ recompiles without a `touch`. NOT in a dev build — measured: a
         // tracked path that does not exist makes cargo re-run this script (protobuf, flatc) and
         // recompile on EVERY build.
-        println!("cargo:rerun-if-changed=panel/dist");
+        println!("cargo:rerun-if-changed=app/dist");
         // A `.br` asset needs the `panel-brotli` feature (the decoder); without it the panel
         // answers a 500 at runtime. Fail here instead, where the message can say what to do.
         if std::env::var_os("CARGO_FEATURE_PANEL_BROTLI").is_none() {
-            if let Some(br) = find_with_ext(std::path::Path::new("panel/dist"), "br") {
+            if let Some(br) = find_with_ext(std::path::Path::new("app/dist"), "br") {
                 panic!(
                     "{} — the panel was built with `compress: 'brotli'` but this build has no brotli decoder: build with `--features panel-brotli`, or rebuild the panel with `compress: 'gzip'`",
                     br.display()

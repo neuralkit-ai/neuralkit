@@ -575,12 +575,12 @@ pub fn run() -> Result<()> {
                     .expect("create the menu-bar item"),
             );
             // FIRST RUN ONLY — the run that actually published the command is the run that has
-            // something new to say. `NEURALKIT_PANEL=1` forces it for a look without having to
+            // something new to say. `WELCOME_PANEL=1` forces it for a look without having to
             // delete the symlink first.
             // HELD, NOT DISCARDED. `welcome` hands back a `Retained` — ARC — so letting it drop
             // releases the panel and it vanishes on the same frame it appeared. Parking it beside
             // the icon gives it the icon's lifetime, which is the lifetime it should have.
-            if first_run || std::env::var_os("NEURALKIT_PANEL").is_some() {
+            if first_run || std::env::var_os("WELCOME_PANEL").is_some() {
                 panel = crate::panel::welcome(None);
             }
         }
