@@ -305,28 +305,6 @@ pub fn spawn_detached_quiet() -> SpawnOutcome {
     }
 }
 
-/// The printing wrapper — the REPL's `tray` verb.
-pub fn spawn_detached() {
-    match spawn_detached_quiet() {
-        SpawnOutcome::AlreadyRunning => println!(
-            "  {} {}",
-            crate::style::green("✓"),
-            crate::style::dim("the tray is already in the menu bar"),
-        ),
-        SpawnOutcome::Started => println!(
-            "  {} {}",
-            crate::style::green("✓"),
-            crate::style::dim("tray is up — quit it from its menu"),
-        ),
-        SpawnOutcome::Unconfirmed => println!(
-            "  {} {}",
-            crate::style::green("✓"),
-            crate::style::dim("tray starting — icon should appear momentarily"),
-        ),
-        SpawnOutcome::Failed(e) => println!("  {} could not start the tray: {e}", crate::style::red("✗")),
-    }
-}
-
 /// The relay's glyph — a ring, distinct from the status card's waveform at a glance:
 /// two icons, two processes, two shapes.
 fn icon_ring() -> Result<Icon> {

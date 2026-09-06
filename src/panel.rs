@@ -295,6 +295,7 @@ define_class!(
     }
 );
 
+define_class!(
 /// The `Backdrop::Terminal` backdrop: one squircle fill, at the window's own alpha.
 ///
 /// The window server blurs "non-fully-transparent pixels", so whatever alpha this paints IS the
@@ -311,7 +312,6 @@ define_class!(
 ///
 /// The constant is read off the path `tailwind-ios-corners` ships (`index.js`, the mask SVG):
 /// `M0 50 C0 8.825 8.825 0 50 0 …` — over a quadrant of 50, the controls sit at 8.825.
-define_class!(
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "NKBackdropView"]
@@ -329,10 +329,8 @@ define_class!(
             // truly clear background the server derived the blur region from THIS path's
             // antialiased edge and treated any non-zero alpha as fully covered, so the corner came
             // out ringed by full-strength backdrop under a fraction of the tint.
-            unsafe {
-                NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA).setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), RADIUS, RADIUS).fill();
-            }
+            NSColor::colorWithWhite_alpha(TINT_WHITE, TINT_ALPHA).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), RADIUS, RADIUS).fill();
         }
     }
 );
