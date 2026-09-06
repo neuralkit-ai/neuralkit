@@ -840,6 +840,21 @@ fn pick(header: &str, expanded: &mut bool, s: MenuShape) -> Result<Option<Row>> 
 ///
 /// Raw mode is entered and left around ONE closure so no early return can strand the
 /// terminal without an echo, which is the classic way a picker breaks a shell.
+///
+/// THE SEAM RULE (2026-09-06): a picker owns its LEADING blank line and nothing after its
+/// rows. An empty `header` means no title — one blank, then the rows, so the rows continue
+/// whatever printed above them instead of opening a block of their own. Everything that can
+/// follow a picker (`totp::setup`, the email prompt, the front-door menu) opens with a blank
+/// of its own, so a trailing one here doubled every seam: measured on the bare flow, the
+/// sign-in status, the offer and the menu read as three stacked dialogs, each with a
+/// `neuralkit ·` title, with two blanks between them.
+///
+/// AN ANSWERED QUESTION LEAVES THE SCREEN. Once a row is chosen (or the picker declined), it
+/// erases everything it printed — the leading blank, the title if any, the rows — with the
+/// same `MoveUp` + `Clear` its frames use, so what comes next lands WHERE THE QUESTION WAS.
+/// The alternative, leaving the last frame in place, pushed the next block down the screen
+/// on every step of the bare flow: a person who had just answered had to scroll to see the
+/// menu that answered them. `pick` replaces its rows in place for the same reason.
 pub(crate) fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
     use crossterm::{
         cursor,
@@ -855,8 +870,10 @@ pub(crate) fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
 
     let mut out = std::io::stdout();
     println!();
-    println!("{header}");
-    println!();
+    if !header.is_empty() {
+        println!("{header}");
+        println!();
+    }
 
     let mut sel = 0usize;
     enable_raw_mode()?;
@@ -893,9 +910,14 @@ pub(crate) fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
         }
     })();
 
+    // The last row ended with `\r\n`, so the cursor sits at the start of the line after the rows
+    // and nothing has printed since the last frame — the count is exact: the rows, the leading
+    // blank, and the title with its blank when there was one. After the clear the cursor is on
+    // the line the picker started on, where the next block prints its own leading blank.
+    let printed = options.len() as u16 + 1 + if header.is_empty() { 0 } else { 2 };
+    execute!(out, cursor::MoveUp(printed), Clear(ClearType::FromCursorDown))?;
     execute!(out, cursor::Show)?;
     disable_raw_mode()?;
-    println!();
     outcome
 }
 

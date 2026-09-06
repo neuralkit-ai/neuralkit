@@ -600,6 +600,9 @@ pub fn run() -> Result<()> {
                 // alive leaves a ghost icon until the system notices the process died. The
                 // welcome panel goes the same way: releasing the last `Retained` closes it,
                 // so quitting takes the card with the icon it introduced.
+                // QUIT ENDS THE PROCESS, NOT THE CHOICE. The front-door menu's `tray` field in
+                // passkey.json is that menu's to write; a wanted tray comes back on the next bare
+                // `neuralkit`, and turning it off for good is that menu's row (2026-09-06).
                 #[cfg(target_os = "macos")]
                 panel.take();
                 tray.take();

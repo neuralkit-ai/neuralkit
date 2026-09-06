@@ -1016,7 +1016,16 @@ enum Row {
 /// never re-entered, so acting on a row can't stack a second copy of the menu
 /// into the scrollback. The tray row is live state, styled by it: dim when off,
 /// bright with a ✓ when on — and the label is truthful immediately because the
-/// quiet spawns confirm the flock before returning.
+/// quiet spawns confirm the flock before returning. The row is also the SETTING:
+/// toggling it records the choice, and a wanted tray that is not running is
+/// started before the first frame (see below).
+///
+/// NO TITLE, and one blank line on each side (2026-09-06). The sign-in's status lines
+/// above are this menu's context, so the rows follow them after a single blank — the
+/// `select` seam rule; the authenticator offer that may have stood here has erased
+/// itself by now, so these rows take its place rather than stacking under it — and the
+/// trailing blank stays because this is the end of the flow: what comes next is the
+/// shell prompt, or the dashboard taking the screen.
 fn front_door() -> anyhow::Result<Option<FrontDoor>> {
     use crossterm::{
         cursor,
@@ -1027,12 +1036,27 @@ fn front_door() -> anyhow::Result<Option<FrontDoor>> {
     use std::io::Write as _;
 
     let mut out = io::stdout();
-    println!();
-    println!("  {} {}", style::bold("neuralkit"), style::dim("· what do you want to run?"));
+    // THE CHOICE OUTLIVES THE ICON (2026-09-06). Two facts from two sources: the flock says
+    // whether a tray is RUNNING; `passkey.json`'s `tray` field says whether one is WANTED. Only
+    // this row writes the field — the icon's own Quit ends the process and nothing else — so
+    // until now quitting the icon also forgot the choice, and the next bare `neuralkit` opened
+    // with the row off. A wanted-but-absent tray is brought back HERE, before the first frame,
+    // and the row is still drawn from the flock: a fact, never a claim. Before the header, so
+    // the block appears at once rather than around a pause; failure speaks on the status row,
+    // exactly as a toggle's would. Piped runs never reach this menu, so nothing starts under a
+    // script.
+    let mut status = String::new();
+    #[cfg(target_os = "macos")]
+    if crate::passkey::tray_wanted() && !tray::is_running() {
+        status = match tray::spawn_detached_quiet() {
+            tray::SpawnOutcome::Started | tray::SpawnOutcome::AlreadyRunning => String::new(),
+            tray::SpawnOutcome::Unconfirmed => "tray starting — give it a moment".into(),
+            tray::SpawnOutcome::Failed(e) => format!("tray failed: {e}"),
+        };
+    }
     println!();
 
     let mut sel = 0usize;
-    let mut status = String::new();
     raw_on()?;
     execute!(out, cursor::Hide)?;
     let outcome = (|| -> anyhow::Result<Option<FrontDoor>> {
@@ -1100,6 +1124,15 @@ fn front_door() -> anyhow::Result<Option<FrontDoor>> {
                                     tray::SpawnOutcome::Failed(e) => format!("tray failed: {e}"),
                                 }
                             };
+                            // RECORDED EITHER WAY: the field holds what was ASKED FOR, the row
+                            // keeps showing what is true, and the status row already carries
+                            // any gap between the two. A choice that could not be saved would
+                            // silently come back wrong next run, so that failure speaks too.
+                            if let Err(e) = crate::passkey::set_tray(!tray_on) {
+                                if status.is_empty() {
+                                    status = format!("could not save the tray choice: {e}");
+                                }
+                            }
                         }
                         #[cfg(not(target_os = "macos"))]
                         {
@@ -1147,9 +1180,13 @@ async fn login_and_offer(url: &str, method: Option<login::Method>) -> Result<boo
     if io::stdout().is_terminal() && io::stdin().is_terminal() && login::totp_enabled() == Some(false) {
         // The SAME picker the sign-in menu uses — arrow keys, one highlighted row. It runs
         // OFF the async runtime: crossterm's event::read blocks.
-        let header = format!("  {} {}", style::bold("neuralkit"), style::dim("· one more thing"));
+        // NO TITLE (2026-09-06). The two rows ARE the question, and they continue the status
+        // lines the sign-in just printed; a `neuralkit · one more thing` header opened a second
+        // block under the first, and the menu after it a third — three titles for one flow.
+        // Answered, the picker erases itself (`select`), so the front-door menu that follows
+        // lands where these rows were instead of below them.
         let picked = tokio::task::spawn_blocking(move || {
-            login::select(&header, &["set up an authenticator app", "skip"])
+            login::select("", &["set up an authenticator app", "skip"])
         })
         .await;
         if let Ok(Ok(Some(0))) = picked {

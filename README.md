@@ -83,7 +83,7 @@ re-register after flipping it.
 
 ```
 ~/.config/neuralkit/credentials.json   # the SESSION — token, identity, deadline; dies on logout/expiry
-~/.config/neuralkit/passkey.json       # the MACHINE — credential, device id, gate; outlives sessions
+~/.config/neuralkit/passkey.json       # the MACHINE — credential, device id, gate, tray choice; outlives sessions
 ```
 
 Two files because they answer different questions: who is signed in now, and what this

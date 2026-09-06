@@ -188,6 +188,53 @@ pub(crate) fn set_gate(choice: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the owner turned the tray ON in the front-door menu and has not turned it OFF there
+/// since. A CHOICE, not a liveness fact: the flock says whether an icon is running right now,
+/// this says whether one is wanted. The icon's own Quit ends the process and leaves this alone,
+/// which is what lets the next bare `neuralkit` bring the icon back (2026-09-06 — until then the
+/// choice lived only in the running process, so quitting the icon also forgot it).
+#[cfg(target_os = "macos")]
+pub(crate) fn tray_wanted() -> bool {
+    let Ok(raw) = path().and_then(|p| std::fs::read_to_string(p).map_err(Into::into)) else { return false };
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("tray")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Record the front-door menu's tray choice — ONLY that menu writes it; `neuralkit tray` and the
+/// REPL's `tray` stay one-off starts. Merged into the file like every other write here, and
+/// deliberately NOT through `ensure_metadata_file`: the fresh file that creates carries a `gate`,
+/// which would arm a hardware gate as a side effect of turning a menu-bar icon on.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_tray(on: bool) -> Result<()> {
+    let path = path()?;
+    let mut v: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if on {
+        v["tray"] = Value::Bool(true);
+    } else if let Some(o) = v.as_object_mut() {
+        o.remove("tray");
+    }
+    // Same 0600-at-create + 0700 directory as `save`: the file may not exist yet, and when it
+    // later gains the software key the permission story must already be right.
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let dir = format!("{home}/.config/neuralkit");
+    std::fs::create_dir_all(&dir)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    opts.open(&path)?.write_all(serde_json::to_string_pretty(&v)?.as_bytes())?;
+    Ok(())
+}
+
 fn load_or_create_software() -> Result<(SoftwareKey, bool)> {
     let path = path()?;
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -359,6 +406,9 @@ pub fn forget() -> Result<()> {
     // prompt. A credential is a thing you revoke; a policy is a thing you chose.
     #[cfg(target_os = "macos")]
     let gated = stored_gate_name();
+    // The tray choice is a policy of the same kind, and shares the file for the same reason.
+    #[cfg(target_os = "macos")]
+    let tray = tray_wanted();
 
     // The hardware key goes too. It is this machine's credential just as the file was, and
     // leaving it behind means a later run silently adopts a key the server no longer knows —
@@ -375,6 +425,10 @@ pub fn forget() -> Result<()> {
     #[cfg(target_os = "macos")]
     if let Some(g) = gated {
         set_gate(Some(&g))?;
+    }
+    #[cfg(target_os = "macos")]
+    if tray {
+        set_tray(true)?;
     }
     Ok(())
 }
