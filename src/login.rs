@@ -992,7 +992,13 @@ fn fmt_left(left: u64) -> String {
 }
 
 /// What the code prompt produced.
-enum Code {
+///
+/// SHARED WITH `totp::setup` (2026-09-06): the six-cell line, its paste handling, its clock and
+/// its retry loop are the one way this binary reads a six-digit code, wherever the code comes
+/// from — an inbox or an authenticator app. What differs per caller is the DEADLINE (the window
+/// the flow already holds) and the REJECTION TEXT (fixed here on purpose, the server's own for
+/// enrolment), and both are arguments, not copies.
+pub(crate) enum Code {
     Entered(String),
     Expired,
     Quit,
@@ -1000,12 +1006,12 @@ enum Code {
 
 /// Leaving raw mode is the one thing that must happen on EVERY path out — an early return that
 /// skipped it would hand back a shell with no echo.
-struct RawGuard;
+pub(crate) struct RawGuard;
 impl RawGuard {
     /// `None` when nothing is attached — the piped path draws no line and must not touch termios.
     /// Held by the RETRY LOOP, not by one read: the line survives a rejection, so the trailing
     /// newline fires once, when the prompt is finished with.
-    fn enter() -> Result<Option<Self>> {
+    pub(crate) fn enter() -> Result<Option<Self>> {
         use crossterm::{event::EnableBracketedPaste, execute, terminal::enable_raw_mode};
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -1055,7 +1061,7 @@ fn draw(buf: &str, secs: u64, err: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<Code> {
+pub(crate) async fn read_code(deadline: tokio::time::Instant, err: Option<&str>) -> Result<Code> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use std::io::{IsTerminal, Write as _};
 

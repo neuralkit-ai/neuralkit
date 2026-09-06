@@ -16,8 +16,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use std::io::Write as _;
-use tokio::io::AsyncBufReadExt;
 
 /// Enrol an authenticator app against the account this machine is signed in as.
 pub async fn setup(base_url: &str) -> Result<()> {
@@ -67,35 +65,55 @@ pub async fn setup(base_url: &str) -> Result<()> {
     println!();
 
     // 2. The code proves the app holds the same secret. Only now does the account change.
-    print!("  {} ", crate::style::dim("6-digit code from the app:"));
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if stdin.read_line(&mut line).await? == 0 {
-        println!();
-        return Err(anyhow!("no code entered"))
+    //
+    // THE SAME LINE THE EMAILED CODE USES (2026-09-06): six cells, paste, the sixth digit
+    // submits, a rejection takes the clock's slot — `login::read_code`, instead of the plain
+    // `read_line` prompt this was. The clock counts the PENDING SECRET's own window:
+    // `Totp.enrollStart` holds it for ten minutes (transport.phaze, `expirationTtl:
+    // minutes(10)`), and past that the QR on screen is dead, so the line says how long it stays
+    // scannable. The RETRY LOOP owns the line: `enrollFinish` deletes the pending secret only on
+    // SUCCESS, so a wrong code is retried against the same QR, and the server's own message —
+    // `incorrect code` — is the rejection text; the emailed path fixes its wording on purpose
+    // and this path has no such reason. A "no pending enrollment" answer means the server's
+    // window closed before ours did, and ends it the same way the clock does.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+    enum Done {
+        Enrolled,
+        Expired,
+        Quit,
     }
-    let code = line.trim();
-    if code.is_empty() {
-        println!();
-        return Err(anyhow!("no code entered"))
-    }
-
-    let finish: Value = serde_json::from_str(
-        &client
-            .post(format!("{base_url}/transport/action/Totp/enrollFinish"))
-            .header("content-type", "application/json")
-            .header("cookie", &cookie)
-            .body(serde_json::json!({ "code": code }).to_string())
-            .send()
-            .await?
-            .text()
-            .await?,
-    )?;
-    if let Some(m) = finish.pointer("/error/message").and_then(Value::as_str) {
-        println!();
-        println!("  {} {}\n", crate::style::red("✗"), m);
-        return Err(anyhow!("enrolment refused"))
+    let done = {
+        let _raw = crate::login::RawGuard::enter()?;
+        let mut err: Option<String> = None;
+        loop {
+            let code = match crate::login::read_code(deadline, err.as_deref()).await? {
+                crate::login::Code::Entered(c) => c,
+                crate::login::Code::Quit => break Done::Quit,
+                crate::login::Code::Expired => break Done::Expired,
+            };
+            let finish: Value = serde_json::from_str(
+                &client
+                    .post(format!("{base_url}/transport/action/Totp/enrollFinish"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(serde_json::json!({ "code": code }).to_string())
+                    .send()
+                    .await?
+                    .text()
+                    .await?,
+            )?;
+            match finish.pointer("/error/message").and_then(Value::as_str) {
+                None => break Done::Enrolled,
+                Some(m) if m.starts_with("no pending enrollment") => break Done::Expired,
+                Some(m) => err = Some(m.to_string()),
+            }
+        }
+    };
+    match done {
+        Done::Enrolled => {}
+        // The same words an empty line produced before the six cells existed.
+        Done::Quit => return Err(anyhow!("no code entered")),
+        Done::Expired => return Err(anyhow!("the enrolment window closed — run it again for a fresh QR")),
     }
 
     // The sign-in menu reads this to decide whether to offer the code path. Updating it here
