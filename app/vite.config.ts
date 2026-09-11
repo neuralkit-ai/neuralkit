@@ -56,21 +56,27 @@ export default defineConfig({
     // assumed. `src/styles.css` carries the `@source` that makes Tailwind scan the
     // out-of-tree file — required, and verified against a COLD build.
     tailwindcss(),
-    // `glsl` resolves fabric's WGSL `#include` graph (sdf.wgsl pulls in 36 primitives/materials)
-    // and compresses it. `warnDuplicatedImports: false` because fabric deliberately includes each
-    // material from both the fs and fs_fast pipelines — same flags neuralkit-web uses.
-    // @ts-ignore — same as neuralkit-web: the plugin's published types omit these options.
-    glsl({ compress: true, warnDuplicatedImports: false }),
     // Fabric's shaker, as in neuralkit-web's config: the transform-stage region
-    // strips (RIG / GLASS / MESH features) that keep the shader correct, plus the
-    // COND_FEATURE strips — fabric's `import()` sites behind runtime conditions
-    // (`stats`, `showAxes`, `geometryUrl`, background mips) are removed when this
-    // app's source never turns the condition on, so the bundler never emits the
-    // chunk and the binary never embeds it. Detection is an fs-walk of `src/`
+    // strips (SDF_TYPE / SHADER / MODIFIER, RIG / GLASS / MESH features) that keep the
+    // shader correct and small, plus the COND_FEATURE strips — fabric's `import()` sites
+    // behind runtime conditions (`stats`, `showAxes`, `geometryUrl`, background mips) are
+    // removed when this app's source never turns the condition on, so the bundler never
+    // emits the chunk and the binary never embeds it. Detection is an fs-walk of `src/`
     // (the cwd's, i.e. this panel's). `regionsOnly` as in -web.
     // `PANEL_NO_SHAKE=1 pnpm build` leaves the shaker out — the one-line bisection
     // for "did a region strip change what fabric draws".
+    //
+    // BEFORE `glsl()`, as in -web (11f18b1 there): both are `enforce: 'pre'`, so array order
+    // decides who transforms a `.wgsl` first, and glsl's chunk loader drops `//` comments —
+    // the region markers — whatever its options. Listed after it, as this config had it since
+    // be029b7, the shaker saw sdf.wgsl with no markers and stripped nothing there.
     ...(process.env.PANEL_NO_SHAKE ? [] : [fabricShakePlugin({ regionsOnly: true })]),
+    // `glsl` resolves fabric's WGSL `#include` graph and minifies it. `minify`, not `compress`:
+    // `compress` is the option's pre-1.4 name, which 1.6 ignores (c8e4877 in -web, which this
+    // line was copied from before that fix). `warnDuplicatedImports: false` because fabric
+    // deliberately includes each material from both the fs and fs_fast pipelines — same flags
+    // neuralkit-web uses.
+    glsl({ minify: true, warnDuplicatedImports: false }),
     // Same grouped, labelled build report neuralkit-web prints. Under `publish`
     // there is ONE chunk — every fabric `import()` site is folded into it — so the
     // report is the size of the script the document carries, before inlining.

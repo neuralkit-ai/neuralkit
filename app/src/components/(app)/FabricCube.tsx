@@ -75,7 +75,7 @@ export function FabricCube({ className, camera, scene }: Props) {
   const activeCamera = { ...DEFAULT_CAMERA, ...camera }
   const activeScene  = { ...DEFAULT_SCENE,  ...scene  }
 
-  const capsuleGlow   = photonValue(0.2)
+  const boxGlow   = photonValue(0.2)
   const flux: any = {}
 
   return (
@@ -85,8 +85,9 @@ export function FabricCube({ className, camera, scene }: Props) {
 
       <Effect
             //outline={{ thickness: 0.1, color: '#00000020', merge: false }}
-            glow={{ intensity: capsuleGlow, color: '#00ff66', radius: 0.2 }}
+            glow={{ intensity: boxGlow, color: '#00ff66', radius: 0.2 }}
           >
+           
             <Box
               position={[1, -2, 0]}
               rotation={[flux.cube3RotX ?? 30, flux.cube3RotY ?? 30, flux.cube3RotZ ?? 0]}
