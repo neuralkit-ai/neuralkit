@@ -1,10 +1,11 @@
 //! `neuralkit auth passkey` — this machine's own credential, created and used with no browser.
 //!
-//! WHAT THIS IS FOR. Today a CLI session is always DERIVED: the QR flow needs a browser to
-//! authenticate first, so the terminal can only ever receive a token some other session minted.
-//! A key held here changes the direction — the machine can PROVE something, which is what an
-//! authenticator does. This command is the first half of that: mint the key, and show that an
-//! assertion made with it satisfies the same verifier the server runs.
+//! WHAT THIS IS FOR. Without it a CLI session is always DERIVED: the QR flow needs a browser to
+//! authenticate first, so the terminal can only receive a token some other session minted. A key
+//! held here changes the direction — the machine can PROVE something, which is what an
+//! authenticator does. Every sign-in registers one (`register`), a registered machine signs in
+//! with it in one call (`quick_login` → `Cli.login`), and `neuralkit auth passkey` on its own
+//! shows the credential and self-tests an assertion against the verifier the server runs.
 //!
 //! WHY IT IS A SEPARATE FILE FROM credentials.json, and this is the important part. That file
 //! is deleted on logout, on expiry, and by `auth unregister` — it holds a SESSION. A credential
@@ -12,12 +13,13 @@
 //! what having a credential is supposed to stop. So the key lives in its own file, outlives
 //! every session, and only `auth unregister` removes it.
 //!
-//! WHY A SOFTWARE KEY, FOR NOW. `phaze_auth::enclave` holds the key in hardware, and it works —
-//! but persisting a Secure Enclave key needs the binary signed and carrying a provisioning
-//! profile inside an `.app`, which `cargo run` does not produce. The key here is an ordinary
-//! in-process P-256 key, the same class of secret as the ML-KEM secret this CLI already keeps
-//! beside its token. Swapping in the enclave later changes which `Signer` is constructed and
-//! nothing else — everything below is written against the trait.
+//! TWO KEYS, CHOSEN BY THE GATE. With no gate the key is an ordinary in-process P-256 key in
+//! passkey.json, the same class of secret as the ML-KEM secret beside the token. With a gate
+//! chosen (the tray's checkbox, or `NEURALKIT_ENCLAVE=1`) it is a Secure Enclave key behind Apple
+//! Watch or Touch ID (`phaze_auth::enclave`) — persistable only by the signed `.app`, because an
+//! access control on a persisted key needs a provisioning profile, which `cargo run` does not
+//! produce. Both sit behind the `Signer` trait, so nothing below knows which answered, and each
+//! keeps its own registration slot (`cred_field`).
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -519,9 +521,13 @@ pub fn run(url: &str) -> Result<()> {
         }
     }
 
-    // Say plainly what this does NOT yet do, so nobody reads a passing self-test as a
-    // working login. Registering the public half needs a fence that does not exist.
-    println!("  {}", crate::style::dim("not yet registered with the server — that surface is still to build"));
+    // A passing self-test proves the FORMAT, not a login — so say where this machine stands with
+    // the server, for the key just shown.
+    println!("  {}", crate::style::dim(if is_registered() {
+        "registered with the server — `auth login` signs in with it"
+    } else {
+        "not registered yet — `auth passkey register` binds it to your account"
+    }));
     println!();
     Ok(())
 }
@@ -562,11 +568,10 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 
 // ── talking to the server ──────────────────────────────────────────────
 //
-// SCENARIO A, UNDER TEST: register through the EXISTING Passkey.* fences rather than adding
-// native ones. The server never learns this key is native — it parses the same
-// attestationObject and verifies the same assertion a browser produces. Whether that is the
-// right home for a MACHINE credential is the open question these calls exist to answer, by
-// showing what actually lands in the database.
+// THROUGH THE EXISTING Passkey.* fences, not native ones. The server never learns this key is
+// native — it parses the same attestationObject and verifies the same assertion a browser
+// produces, into the same `credentials` table; the `aaguid` is what tells the two apart (see
+// `login::Method::Browser`).
 
 pub(crate) fn http(base_url: &str) -> Result<reqwest::Client> {
     let insecure = base_url.contains("127.0.0.1") || base_url.contains("localhost");

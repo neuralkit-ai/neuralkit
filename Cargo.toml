@@ -80,9 +80,9 @@ phaze-moq = { path = "../phaze/crates/phaze-moq" }
 bytes = "1"
 anyhow = "1.0"
 url = "2.5"
-# `neuralkit login` (passkey QR device flow): held HTTPS SSE + terminal QR.
-# The channel is plain over TLS (no per-frame seal), so no crypto deps and no
-# keys/config — a distributed `neuralkit login` needs nothing but the URL.
+# `neuralkit auth login` (the device flow): held HTTPS SSE + terminal QR. The stream is
+# plain over TLS (no per-frame seal) — the session channel's crypto is phaze-crypto, below —
+# so a distributed `neuralkit auth login` needs nothing but the URL.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
 qrcode = "0.14"

@@ -374,8 +374,8 @@ fn load_credentials() -> Result<Credentials> {
     })
 }
 
-/// Upgrade to the command channel. (The ML-KEM handshake is temporarily removed —
-/// see the fence comment; restore both ends together from git.)
+/// Upgrade to the command channel, then build the per-connection seal from the one-time
+/// `__grant` frame before the readiness ack.
 async fn connect(creds: &Credentials) -> Result<(Ws, Option<Seal>, Vec<String>)> {
     // rustls picks its process-level provider by crate-feature detection, which
     // PANICS when several are compiled in — quinn (via phaze-moq) brings both

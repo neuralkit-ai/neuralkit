@@ -1,12 +1,13 @@
-//! `neuralkit auth login` — passkey QR device flow.
+//! `neuralkit auth login` — one call for a registered machine, else the device flow.
 //!
-//! The CLI generates a SECRET `device_code`, holds the `QR.request` SSE stream, and
-//! renders the returned `user_code` as a terminal QR. The phone scans it →
+//! The device flow: the CLI generates a SECRET `device_code`, holds the `QR.request` SSE
+//! stream, and renders the returned `user_code` as a terminal QR. The phone scans it →
 //! `/qr?code=…` → the passkey login (which signs the phone in) → `QR.approve`
-//! broadcasts a fresh session token to `qr:<device_code>`, which this held
-//! connection alone receives. The channel is plain over TLS (no per-frame seal) — the token is
-//! one-time + revocable, so a distributed `neuralkit auth login` needs nothing
-//! but the URL: no keys, no config.
+//! broadcasts a fresh session token to `qr:<device_code>`, which this held connection alone
+//! receives — or this machine approves its own flow with an authenticator code, an emailed
+//! code, its passkey or its browser (`choose_method`). The stream is plain over TLS (no
+//! per-frame seal): the token is one-time + revocable. Nothing is configured or embedded — the
+//! ML-KEM keypair that seals the session channel is minted here, per login.
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;

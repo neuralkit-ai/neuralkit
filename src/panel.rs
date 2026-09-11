@@ -378,7 +378,7 @@ impl HasWindowHandle for ViewHandle {
 ///
 /// What used to be written here moved INTO the app and is still doing the same job: the
 /// transparency and `canvastext` rules are in `app/src/styles.css`, the drag handler in
-/// `app/src/pages/index.tsx`.
+/// `app/src/app.phaze` (`drag()` from `@madenowhere/phaze-native/wry`).
 #[cfg(feature = "embed")]
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/app/dist");
 

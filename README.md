@@ -74,7 +74,7 @@ neuralkit tray                    # a menu-bar presence — opt-in, alive only w
 
 By default the machine's key is a software key on disk. On macOS it can live in the Secure
 Enclave behind a person — Apple Watch or Touch ID — which requires the signed `.app`
-bundle (`release/macos/bundle.sh`; an access control on a persisted key needs an
+bundle (`phaze native build --bundles app,dmg`; an access control on a persisted key needs an
 entitlement only a provisioning profile in a bundle can carry). The tray's checkbox
 chooses the gate; it applies at the next sign-in and changes which key signs, so
 re-register after flipping it.
@@ -98,5 +98,6 @@ cargo run -- tray
 ```
 
 The one exception: enclave-gated keys need the signed bundle — `cargo run` builds a bare
-binary that cannot satisfy the gate. `release/macos/bundle.sh` wraps any binary in the
-entitled `.app`.
+binary that cannot satisfy the gate. `phaze native bundle` wraps a built binary in the
+entitled, signed `.app` from `[package.metadata.native]` in Cargo.toml; `phaze native build`
+builds the panel and the binary first.
