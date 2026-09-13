@@ -71,7 +71,8 @@ const SCALE: f64 = 2.0;
 /// one, so scaling this with the panel is what made it disagree with everything beside it.
 ///
 /// Read by every arm: `Terminal` rounds its fill with it, `Vibrancy` and `Glass` pass it to their
-/// own `setCornerRadius:`.
+/// own `setCornerRadius:`. `Terminal` ships, so here it rounds only the tint fill: the corner you
+/// see is the system's, because the panel is titled (see `welcome`).
 const RADIUS: f64 = 12.0;
 const W: f64 = 400.0 * SCALE;
 const H: f64 = 400.0 * SCALE;

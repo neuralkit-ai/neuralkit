@@ -44,6 +44,7 @@ export default defineConfig({
     native({
       shell: 'wry',
       compress: 'gzip',
+      devStylesheets: ['/src/styles.css'],
       artifacts: {
         binary: '../target/release/neuralkit',
         app:    '../target/release/bundle/macos/NeuralkitCLI.app',

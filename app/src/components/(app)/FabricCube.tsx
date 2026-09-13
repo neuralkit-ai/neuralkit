@@ -89,7 +89,7 @@ export function FabricCube({ className, camera, scene }: Props) {
           >
            
             <Box
-              position={[1, -2, 0]}
+              position={[0, 0, 0]}
               rotation={[flux.cube3RotX ?? 30, flux.cube3RotY ?? 30, flux.cube3RotZ ?? 0]}
               size={{ x: 0.6, y: 0.6, z: 0.6 }}
               roundness={0.4}
