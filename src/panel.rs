@@ -438,7 +438,7 @@ fn wait_for_dev(origin: &str) {
 /// keep it (`with_transparent`), and the type renders the same as AppKit's, so the labels and
 /// the flag are gone.
 ///
-/// DEV IS A BUILD, NOT A SWITCH. `phaze native dev` (app/package.json `xdev`) starts the panel's
+/// DEV IS A BUILD, NOT A SWITCH. `phaze native dev` (app/package.json `wry:dev`) starts the panel's
 /// Vite dev server, waits for its port, and runs this crate without the `embed` feature with the
 /// dev URL baked in (`DEV_URL` above) — edits reload in the webview, and nothing is rebuilt,
 /// bundled or signed to see them. In that build the protocol handler is not registered and the

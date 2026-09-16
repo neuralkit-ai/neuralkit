@@ -16,6 +16,10 @@ authors = ["R. <r@neuralkit.ai>"]
 [package.metadata.native]
 app = "app"
 dev-url = "http://localhost:5180"   # app/vite.config.ts binds it strictly; 5173 is -web's
+# Vite named directly: the app's scripts are named for the shell they run (`wry:dev`,
+# `wry:build`), and a bare `dev` / `build` would be ambiguous once a second shell exists.
+dev-command = "pnpm exec vite"
+build-command = "pnpm exec vite build"
 run-args = ["tray"]
 
 # The macOS bundle: the app's identity, committed. `bundle-id` and `team` must match the App ID
@@ -46,7 +50,7 @@ profile = "~/Downloads/Neuralkit_CLI_Developer_ID.provisionprofile"
 # THE EMBEDDED PANEL IS A FEATURE, ON BY DEFAULT — Tauri's `custom-protocol` model. A build
 # WITHOUT it is a DEV build: `include_dir!` is skipped (so `app/dist` need not exist), and the
 # webview loads the Vite dev server URL that build.rs bakes in from PHAZE_NATIVE_DEV_URL — which
-# is what `phaze native dev` (app/package.json `xdev`) sets, with `cargo run
+# is what `phaze native dev` (app/package.json `wry:dev`) sets, with `cargo run
 # --no-default-features`. A release binary therefore has no dev URL to be pointed at, and a bare
 # `cargo run` still embeds, as it always did.
 default = ["embed"]

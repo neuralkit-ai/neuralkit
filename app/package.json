@@ -3,9 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "dev": "vite",
-    "xdev": "WELCOME_PANEL=1 phaze native dev",
+    "wry:dev": "WELCOME_PANEL=1 phaze native dev",
+    "wry:build": "phaze native build --bundles app,dmg",
     "check": "phaze-check --noEmit"
   },
   "dependencies": {

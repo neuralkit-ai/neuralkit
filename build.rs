@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("CARGO_FEATURE_EMBED").is_some() {
         // Only when embedding: cargo re-runs this script when the panel's build changes, so a
-        // `pnpm build` in app/ recompiles without a `touch`. NOT in a dev build — measured: a
+        // the app's build in app/ recompiles without a `touch`. NOT in a dev build — measured: a
         // tracked path that does not exist makes cargo re-run this script (protobuf, flatc) and
         // recompile on EVERY build.
         println!("cargo:rerun-if-changed=app/dist");
