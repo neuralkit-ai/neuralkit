@@ -1,0 +1,18 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	// The welcome panel has no server: its one view is an artifact, rendered at build and
+	// embedded in the binary. The build still runs the app's worker in Miniflare to render it —
+	// the one render path every native app shares — so this is the worker's name and its
+	// compatibility date, and nothing is ever deployed from it.
+	"name": "neuralkit-panel",
+	"main": "dist/server/index.js",
+	"workers_dev": false,
+	"preview_urls": false,
+	"no_bundle": true,
+	"compatibility_date": "2026-05-27",
+	"compatibility_flags": ["nodejs_compat"],
+	"assets": {
+		"directory": "./dist/client",
+		"binding": "ASSETS"
+	}
+}

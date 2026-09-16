@@ -381,7 +381,7 @@ impl HasWindowHandle for ViewHandle {
 /// transparency and `canvastext` rules are in `app/src/styles.css`, the drag handler in
 /// `app/src/app.phaze` (`drag()` from `@madenowhere/phaze-native/wry`).
 #[cfg(feature = "embed")]
-static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/app/dist");
+static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/app/dist/app");
 
 /// A DEV BUILD IS THE CRATE WITHOUT `embed` (Tauri's `custom-protocol` model, Cargo.toml
 /// [features]). It embeds nothing — `app/dist` need not exist — and loads the panel from the

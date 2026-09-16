@@ -19,7 +19,9 @@ dev-url = "http://localhost:5180"   # app/vite.config.ts binds it strictly; 5173
 # Vite named directly: the app's scripts are named for the shell they run (`wry:dev`,
 # `wry:build`), and a bare `dev` / `build` would be ambiguous once a second shell exists.
 dev-command = "pnpm exec vite"
-build-command = "pnpm exec vite build"
+# `--app`: the client, the app's worker (built, never deployed — the panel has no server) and the
+# shipped `dist/app`, the directory `include_dir!` embeds.
+build-command = "pnpm exec vite build --app"
 run-args = ["tray"]
 
 # The macOS bundle: the app's identity, committed. `bundle-id` and `team` must match the App ID

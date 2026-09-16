@@ -1,6 +1,12 @@
 node_modules/
+# wrangler's local state (the build renders through the app's worker in Miniflare)
+.wrangler/
+# The worker's own output: the client bundle and the worker the build emits beside `dist/app`.
+# Only `dist/app` — the artifact view and the assets — is embedded, and only it is tracked.
+dist/client/
+dist/server/
 
-# `dist/` IS TRACKED — deliberately, and it is not build noise here.
+# `dist/app/` IS TRACKED — deliberately, and it is not build noise here.
 #
 # `src/panel.rs` embeds the whole directory with `include_dir!`, which reads it at COMPILE time,
 # and fabric code-splits: the entry does `import("./sdfEngine-<hash>.js")`, which reaches
@@ -13,3 +19,7 @@ node_modules/
 # The hashed filenames change on every build, so this directory churns. That is the price of
 # `include_dir!`; the alternative is a build.rs that runs vite, which would make `cargo build`
 # depend on node.
+# the ambient types the build writes
+.phaze/
+# the web plugin's build sentinel
+dist/.build-complete
