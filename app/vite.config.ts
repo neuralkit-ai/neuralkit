@@ -22,8 +22,8 @@ const phazeChunkingRules = phazeChunks({ chunkDirectives: false, chunkActions: f
 
 export default defineConfig({
   plugins: [
-    // The native target. Generates `src/pages/**` at build (the page runs against
-    // linkedom, so its copy is in the HTML) and hydrates it in the webview over
+    // The native target. Renders the `artifact: true` views of `src/views/**` at build
+    // (the view runs against linkedom, so its copy is in the HTML) and hydrates it in the webview over
     // `nk://` — `dist/index.html` references the entry as a file, and fabric's lazy
     // chunks are served out of the same embedded directory. No `publish`: the
     // string-loaded document it adds has a null origin, and this card needs WebGPU.
@@ -105,7 +105,7 @@ export default defineConfig({
       // so `components` must precede `fabric`), graviton, then fabric's own lazy
       // engine chunks.
       groups: [
-        { name: 'pages',      match: (c) => !c.chunkName.startsWith('phaze') && c.moduleIds.some((m) => m.includes('/src/pages/')) },
+        { name: 'views',      match: (c) => !c.chunkName.startsWith('phaze') && c.moduleIds.some((m) => m.includes('/src/views/')) },
         { name: 'phaze',      match: (c) => c.chunkName === 'phaze' || c.chunkName.startsWith('phaze-')
                                 || ['store', 'portal', 'catch', 'time', 'match', 'list', 'defer', 'revalidate'].includes(c.chunkName) },
         { name: 'components', match: (c) => c.moduleIds.some((m) => m.includes('/src/components/')) },

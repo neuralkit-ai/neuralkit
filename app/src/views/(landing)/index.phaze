@@ -8,7 +8,8 @@ import { interval, seconds } from '@madenowhere/phaze/time'
 // THE one definition — neuralkit-web's. `@web/` is aliased in vite.config.ts.
 import { StepIndicator } from '@web/components/ui/StepIndicator.phaze'
 
----page
+---view
+artifact: true
 head: { title: 'Neuralkit' }
 ---state
 state : s<'intake' | 'signal' | 'model' | 'report'>('intake')
