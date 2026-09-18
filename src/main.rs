@@ -86,7 +86,7 @@ pub enum Menu {
 /// (`rpId` is `new URL(request.url).hostname`), so a credential minted against this host does NOT
 /// work against the apex. Shipping with this default would strand every install in the wrong
 /// passkey world.
-const DEFAULT_URL: &str = "https://dev.labs.tokyo.jp";
+const DEFAULT_URL: &str = "https://dev.neuralkit.ai";
 
 /// Clap defaults, as consts so the bare-invocation check compares against the
 /// SAME strings the parser fills in — a drifted literal would silently kill the menu.
