@@ -78,16 +78,15 @@ pub enum Menu {
     Transport,
 }
 
-/// ⚠ TEMPORARY — pointed at the dev tunnel, not prod (2026-08-29, user call). Every `--url`
-/// default and the bare front door read this one const, so flipping it back to
-/// `https://neuralkit.ai` before any release is a ONE-LINE change rather than seven.
+/// The apex — production. Every `--url` default and the bare front door read this one const; a
+/// dev run passes `--url https://dev.neuralkit.ai` (the tunnel to the local database) instead.
 ///
-/// The host decides the passkey world: the server's RP id is `neuralkit.ai` for the apex and every
-/// host under it (-web `auth.ts` `rpId`, since 2026-09-19), and the hostname itself anywhere else.
-/// A credential minted against one world does not work in another, so shipping with this default
-/// would strand every install in the wrong one. The CLI never derives the RP id — it signs with
-/// the one the server last stated (`passkey::rp_id`).
-const DEFAULT_URL: &str = "https://dev.neuralkit.ai";
+/// The host decides the database, and with it which credentials exist: a machine registered
+/// against the tunnel is unknown to production, and the other way round, so switch worlds with
+/// `auth unregister` first. The RP id is `neuralkit.ai` on the apex and every host under it
+/// (-web `auth.ts` `rpId`); the CLI never derives it — it signs with the one the server last
+/// stated (`passkey::rp_id`).
+const DEFAULT_URL: &str = "https://neuralkit.ai";
 
 /// Clap defaults, as consts so the bare-invocation check compares against the
 /// SAME strings the parser fills in — a drifted literal would silently kill the menu.
