@@ -386,6 +386,28 @@ pub(crate) fn next_challenge() -> Option<String> {
     v.get("next_challenge").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from)
 }
 
+/// The relying-party id the server stated — `rp.id` at registration, `rpId` at every
+/// `loginStart` — kept beside the challenge because the two bind the same next assertion.
+///
+/// THE SERVER STATES IT, THE CLIENT NEVER DERIVES IT. The rule that maps a host to its RP id is
+/// the server's (neuralkit-web `auth.ts` `rpId`: `neuralkit.ai` for the apex and every host
+/// under it, the hostname anywhere else), and the one-call sign-in signs before it speaks, so it
+/// must remember what the server last said rather than hash the host it dials.
+pub(crate) fn save_rp_id(rp_id: &str) -> Result<()> {
+    let path = path()?;
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let mut v: Value = serde_json::from_str(&raw)?;
+    v["rp_id"] = Value::String(rp_id.to_string());
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
+pub(crate) fn rp_id() -> Option<String> {
+    let raw = std::fs::read_to_string(path().ok()?).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("rp_id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from)
+}
+
 pub(crate) fn device_id() -> Option<String> {
     let raw = std::fs::read_to_string(path().ok()?).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
@@ -684,6 +706,7 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
     }
 
     save_credential_id(&reg.credential_id)?;
+    save_rp_id(rp_id)?;
     if !quiet {
         println!("  {}  {}", crate::style::dim(&format!("{:<13}", "credential id")), crate::style::dim(&b64(&reg.credential_id)));
         println!("  {}  {}", crate::style::dim(&format!("{:<13}", "account")), crate::style::dim(&user_id));
@@ -752,6 +775,9 @@ pub(crate) async fn assert_session_slot(base_url: &str, slot: Slot) -> Result<St
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("loginStart returned no challenge"))?;
     let rp_id = start.pointer("/data/rpId").and_then(Value::as_str).unwrap_or_default().to_string();
+    if !rp_id.is_empty() {
+        save_rp_id(&rp_id)?;
+    }
 
     let a = assert(&*key, &rp_id, &origin, challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
     let res = client
@@ -827,6 +853,9 @@ pub async fn login(base_url: &str) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("loginStart returned no challenge"))?;
     let rp_id = start.pointer("/data/rpId").and_then(Value::as_str).unwrap_or_default().to_string();
+    if !rp_id.is_empty() {
+        save_rp_id(&rp_id)?;
+    }
     let offered = start.pointer("/data/allowCredentials").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
     println!(
         "  {}  {}",
@@ -968,13 +997,21 @@ pub(crate) async fn quick_login(
             let (key, created) = load_or_create()?;
             (cred_id, key, created)
         }
-        None if gate_armed() => match read_slot("credential_id")? {
-            Some(cred_id) => {
-                let (key, created) = load_or_create_software()?;
-                (cred_id, Box::new(key), created)
+        None if gate_armed() => {
+            // REFUSE, DO NOT DOWNGRADE. The software key signs here only so the enclave key can
+            // be registered against the session it obtains — and that registration needs the
+            // gate met NOW. With the Watch away the promote cannot follow, and a software session
+            // would be an armed gate that never bites. The gate's own refusal is returned, which
+            // the caller keeps quiet and the menu answers with its Watch retry row.
+            enclave_gate()?;
+            match read_slot("credential_id")? {
+                Some(cred_id) => {
+                    let (key, created) = load_or_create_software()?;
+                    (cred_id, Box::new(key), created)
+                }
+                None => return Ok(None),
             }
-            None => return Ok(None),
-        },
+        }
         None => return Ok(None),
     };
     if created { return Ok(None) }
@@ -985,7 +1022,13 @@ pub(crate) async fn quick_login(
     getrandom::getrandom(&mut raw).map_err(|e| anyhow!("rng: {e}"))?;
     let device_code: String = raw.iter().map(|b| format!("{b:02x}")).collect();
 
-    let a = assert(&*key, &url_host(base_url)?, base_url, &challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
+    // The RP id the server stated last time; the dialed host only for a file written before
+    // the field existed, which the fallback's `loginStart` then fills.
+    let rp_id = match rp_id() {
+        Some(id) => id,
+        None => url_host(base_url)?,
+    };
+    let a = assert(&*key, &rp_id, base_url, &challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
     let fp = crate::fingerprint::value();
     let res = http(base_url)?
         .post(format!("{base_url}/transport/action/Cli/login"))

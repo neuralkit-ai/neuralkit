@@ -82,10 +82,11 @@ pub enum Menu {
 /// default and the bare front door read this one const, so flipping it back to
 /// `https://neuralkit.ai` before any release is a ONE-LINE change rather than seven.
 ///
-/// It matters more than a convenience: passkeys are scoped to the host that served the ceremony
-/// (`rpId` is `new URL(request.url).hostname`), so a credential minted against this host does NOT
-/// work against the apex. Shipping with this default would strand every install in the wrong
-/// passkey world.
+/// The host decides the passkey world: the server's RP id is `neuralkit.ai` for the apex and every
+/// host under it (-web `auth.ts` `rpId`, since 2026-09-19), and the hostname itself anywhere else.
+/// A credential minted against one world does not work in another, so shipping with this default
+/// would strand every install in the wrong one. The CLI never derives the RP id — it signs with
+/// the one the server last stated (`passkey::rp_id`).
 const DEFAULT_URL: &str = "https://dev.neuralkit.ai";
 
 /// Clap defaults, as consts so the bare-invocation check compares against the
