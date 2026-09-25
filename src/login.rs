@@ -656,6 +656,13 @@ async fn choose_method(
             }
             Some(Row::OnDevice) => {
                 if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Software).await? {
+                    // Picking the on-device key while the Watch is required steps the requirement
+                    // down, so the next run does not block again (user, 2026-09-25). Best-effort:
+                    // a sign-in must not fail because the preference write did.
+                    #[cfg(target_os = "macos")]
+                    if crate::passkey::gate_armed() {
+                        let _ = crate::passkey::set_gate(None);
+                    }
                     return Ok(Outcome::Approved)
                 }
                 continue
