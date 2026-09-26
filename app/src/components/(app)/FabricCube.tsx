@@ -14,6 +14,7 @@ import { photonValue } from '@madenowhere/photon/phaze'
 import { useGraviton } from '@web/lib/fabric/hooks/useGraviton'
 import { Camera, Scene, View } from '@web/lib/fabric'
 import { Box } from '@web/lib/fabric/shapes'
+import { Rig } from '@web/lib/fabric/components/Rig'
 import { Effect } from '@web/lib/fabric/Composers'
 import { CameraProps, SceneProps } from '@web/lib/fabric'
 import { CameraState, SceneState } from '@web/lib/fabric/core/types'
@@ -83,60 +84,65 @@ export function FabricCube({ className, camera, scene }: Props) {
       <Camera {...activeCamera} />
       <Scene {...activeScene} />
 
-      <Effect
-            //outline={{ thickness: 0.1, color: '#00000020', merge: false }}
-            glow={{ intensity: boxGlow, color: '#00ff66', radius: 0.2 }}
-          >
-           
-            <Box
-              position={[0, 0, 0]}
-              rotation={[flux.cube3RotX ?? 30, flux.cube3RotY ?? 30, flux.cube3RotZ ?? 0]}
-              size={{ x: 0.6, y: 0.6, z: 0.6 }}
-              roundness={0.4}
-              color="#ef23db"
-              material={{
-                ambient: 0.3,
-                shader: 'phong',
-                roughness: 0.004,
-                roughnessScale: 6.0,
-              }}
-              // Glass variant:
-              // material={{
-              //   shader:              'glass',
-              //   thickness:           (flux.sdfThickness           ?? 2)         as any,
-              //   ior:                 (flux.sdfIor                 ?? 0.79)      as any,
-              //   fresnel:             (flux.sdfFresnel             ?? 9)         as any,
-              //   fresnelColor:        (flux.sdfFresnelColor        ?? '#ffffff') as any,
-              //   outline:             (flux.sdfOutline             ?? 0.4)       as any,
-              //   attenuationDistance: (flux.sdfAttenuationDistance ?? 100)       as any,
-              //   attenuationColor:    (flux.sdfAttenuationColor    ?? '#ffffff') as any,
-              //   distortion:          (flux.sdfDistortion          ?? 0.0)       as any,
-              //   distortionScale:     (flux.sdfDistortionScale     ?? 1.0)       as any,
-              //   anisotropy:          (flux.sdfAnisotropy          ?? 0.0)       as any,
-              //   anisotropyRotation:  (flux.sdfAnisotropyRotation  ?? 0.0)       as any,
-              //   anisotropyBlur:      (flux.sdfAnisotropyBlur      ?? 0.0)       as any,
-              //   grain:               (flux.sdfGrain               ?? 0.0)       as any,
-              //   grainScale:          (flux.sdfGrainScale          ?? 0)         as any,
-              //   iridescence:         (flux.sdfIridescence         ?? 0.0)       as any,
-              //   iridescenceThickness:(flux.sdfIridescenceThickness ?? 400)      as any,
-              //   clearcoat:           (flux.sdfClearcoat           ?? 0.0)       as any,
-              //   clearcoatRoughness:  (flux.sdfClearcoatRoughness  ?? 0.0)       as any,
-              //   sheen:               (flux.sdfSheen               ?? 0.0)       as any,
-              //   sheenColor:          (flux.sdfSheenColor          ?? '#ffffff') as any,
-              //   reflection:          (flux.sdfReflection          ?? 0.0)       as any,
-              //   reflectionRoughness: (flux.sdfReflectionRoughness ?? 0.0)       as any,
-              //   temporalDistortion:  (flux.sdfTemporalDistortion  ?? 0.0)       as any,
-              //   metalness:           (flux.sdfMetalness           ?? 0.0)       as any,
-              //   color:               (flux.sdfBgColor             ?? '#ececec') as any,
-              //   innerSteps:          (flux.sdfInnerSteps          ?? 32)        as any,
-              //   chromaticAberration: (flux.sdfChromaticAberration ?? 0.02)      as any,
-              //   roughness:           (flux.sdfBlur                ?? 0.10)      as any,
-              //   gloss:               (flux.sdfGloss               ?? 0.0)       as any,
-              //   glossSharpness:      (flux.sdfGlossSharpness      ?? 0.7)       as any,
-              //   glossCoverage:       (flux.sdfGlossCoverage       ?? 0.18)      as any,
-              // }}
-            />
-          </Effect>
+           <Effect
+        outline={{ thickness: 0.1, color: "#00000020", merge: false }}
+        //glow={{ intensity: boxGlow, color: "#00ff66", radius: 0.2 }}
+      >
+        <Rig drag>
+          <Box
+            position={[0, 0, 0]}
+            rotation={[
+              flux.cube3RotX ?? 30,
+              flux.cube3RotY ?? 30,
+              flux.cube3RotZ ?? 0,
+            ]}
+            size={{ x: 1, y: 1, z: 1 }}
+            roundness={0.4}
+            color="#ef23db"
+            material={{
+              ambient: 0.3,
+              shader: "phong",
+              roughness: 0.004,
+              roughnessScale: 6.0,
+            }}
+            // Glass variant:
+            // material={{
+            //   shader:              'glass',
+            //   thickness:           (flux.sdfThickness           ?? 2)         as any,
+            //   ior:                 (flux.sdfIor                 ?? 0.79)      as any,
+            //   fresnel:             (flux.sdfFresnel             ?? 9)         as any,
+            //   fresnelColor:        (flux.sdfFresnelColor        ?? '#ffffff') as any,
+            //   outline:             (flux.sdfOutline             ?? 0.4)       as any,
+            //   attenuationDistance: (flux.sdfAttenuationDistance ?? 100)       as any,
+            //   attenuationColor:    (flux.sdfAttenuationColor    ?? '#ffffff') as any,
+            //   distortion:          (flux.sdfDistortion          ?? 0.0)       as any,
+            //   distortionScale:     (flux.sdfDistortionScale     ?? 1.0)       as any,
+            //   anisotropy:          (flux.sdfAnisotropy          ?? 0.0)       as any,
+            //   anisotropyRotation:  (flux.sdfAnisotropyRotation  ?? 0.0)       as any,
+            //   anisotropyBlur:      (flux.sdfAnisotropyBlur      ?? 0.0)       as any,
+            //   grain:               (flux.sdfGrain               ?? 0.0)       as any,
+            //   grainScale:          (flux.sdfGrainScale          ?? 0)         as any,
+            //   iridescence:         (flux.sdfIridescence         ?? 0.0)       as any,
+            //   iridescenceThickness:(flux.sdfIridescenceThickness ?? 400)      as any,
+            //   clearcoat:           (flux.sdfClearcoat           ?? 0.0)       as any,
+            //   clearcoatRoughness:  (flux.sdfClearcoatRoughness  ?? 0.0)       as any,
+            //   sheen:               (flux.sdfSheen               ?? 0.0)       as any,
+            //   sheenColor:          (flux.sdfSheenColor          ?? '#ffffff') as any,
+            //   reflection:          (flux.sdfReflection          ?? 0.0)       as any,
+            //   reflectionRoughness: (flux.sdfReflectionRoughness ?? 0.0)       as any,
+            //   temporalDistortion:  (flux.sdfTemporalDistortion  ?? 0.0)       as any,
+            //   metalness:           (flux.sdfMetalness           ?? 0.0)       as any,
+            //   color:               (flux.sdfBgColor             ?? '#ececec') as any,
+            //   innerSteps:          (flux.sdfInnerSteps          ?? 32)        as any,
+            //   chromaticAberration: (flux.sdfChromaticAberration ?? 0.02)      as any,
+            //   roughness:           (flux.sdfBlur                ?? 0.10)      as any,
+            //   gloss:               (flux.sdfGloss               ?? 0.0)       as any,
+            //   glossSharpness:      (flux.sdfGlossSharpness      ?? 0.7)       as any,
+            //   glossCoverage:       (flux.sdfGlossCoverage       ?? 0.18)      as any,
+            // }}
+          />
+        </Rig>
+      </Effect>
 
       <View track={fabric} />
 
