@@ -422,7 +422,7 @@ pub async fn unregister() -> Result<()> {
                 Ok(counts) => Some(Ok(counts)),
                 // Only an auth failure is worth a second attempt — a network error would fail
                 // the same way twice, and the passkey path is a round trip, not a retry.
-                Err(_) if crate::passkey::is_registered() => None,
+                Err(e) if e.downcast_ref::<crate::passkey::NoAnswer>().is_none() && crate::passkey::is_registered() => None,
                 Err(e) => Some(Err(e)),
             };
             let outcome = match live {
@@ -439,7 +439,11 @@ pub async fn unregister() -> Result<()> {
                     crate::style::dim(&format!("server forgot this machine · {d} device, {c} credential")),
                 ),
                 Ok(_) => {}
-                Err(e) => println!("  {} {}", crate::style::dim("could not revoke server-side:"), crate::style::dim(&e.to_string())),
+                Err(e) => println!(
+                    "  {} could not revoke server-side {}",
+                    crate::style::red("✗"),
+                    crate::style::dim(&format!("· {e}")),
+                ),
             }
 
             let insecure = origin.contains("127.0.0.1") || origin.contains("localhost");

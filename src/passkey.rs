@@ -319,6 +319,19 @@ fn save(key: &SoftwareKey) -> Result<()> {
 /// after an expiry is the main reason this command exists — so a refusal must not block the
 /// delete. The cost of that is an orphaned row, which is strictly better than a machine that
 /// cannot forget itself.
+/// A reply that is not the server's answer — nothing listening, a proxy's error page. Kept apart
+/// from a refusal, because asserting the passkey and asking again cannot change it.
+#[derive(Debug)]
+pub(crate) struct NoAnswer(pub String);
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 pub(crate) async fn revoke(base_url: &str, token: &str) -> Result<(u64, u64)> {
     let base_url = base_url.trim_end_matches('/');
     let mut body = serde_json::Map::new();
@@ -337,10 +350,17 @@ pub(crate) async fn revoke(base_url: &str, token: &str) -> Result<(u64, u64)> {
         .header("cookie", format!("session={token}; __Secure-session={token}"))
         .body(Value::Object(body).to_string())
         .send()
-        .await?;
+        .await
+        .map_err(|_| NoAnswer(format!("no answer from {base_url}")))?;
+    let status = res.status();
     let v: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
     if let Some(m) = v.pointer("/error/message").and_then(Value::as_str) {
         return Err(anyhow!("{m}"))
+    }
+    // Not the fence's own answer, so the rows were never reached — a revoke that did not happen,
+    // not one that deleted nothing.
+    if !status.is_success() || v.pointer("/data").is_none() {
+        return Err(NoAnswer(format!("{base_url} answered {status}")).into())
     }
     Ok((
         v.pointer("/data/devices").and_then(Value::as_u64).unwrap_or(0),
