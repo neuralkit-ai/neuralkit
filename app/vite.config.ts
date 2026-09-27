@@ -42,6 +42,11 @@ export default defineConfig({
     // app,dmg` runs again; each row says so. Bundles land in target/release/bundle/
     // macos/ (Tauri's layout); the dmg carries the crate version and the arch.
     native({
+      // The app's identity: the name a person sees, the bundle's file name — pinned, so the
+      // installed path stays /Applications/NeuralkitCLI.app — and the App ID it is signed as.
+      name: 'NEURALKIT™ CLI',
+      fileName: 'NeuralkitCLI',
+      identifier: 'ai.neuralkit.cli',
       shell: 'wry',
       compress: 'gzip',
       devStylesheets: ['/src/styles.css'],

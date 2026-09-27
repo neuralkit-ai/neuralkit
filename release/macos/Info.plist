@@ -2,22 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Must equal the App ID's bundle id exactly — the provisioning profile's
-	     application-identifier (SBG7YFF24U.ai.neuralkit.cli) is matched against
-	     TEAMID + this value at launch. -->
-	<key>CFBundleIdentifier</key>
-	<string>ai.neuralkit.cli</string>
-	<key>CFBundleName</key>
-	<string>Neuralkit CLI</string>
-	<key>CFBundleExecutable</key>
-	<string>neuralkit</string>
+	<!-- `phaze native bundle` stamps the rest: the identifier and both names from the app's
+	     `native({ name, fileName, identifier })` — the identifier must equal the App ID's bundle id,
+	     since the provisioning profile's application-identifier (SBG7YFF24U.ai.neuralkit.cli) is
+	     matched against TEAMID + it at launch — the executable from the crate, the version from
+	     Cargo.toml, and the localized name Finder shows. -->
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<!-- Stamped from Cargo.toml by `phaze native bundle`; the value here is a fallback. -->
-	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
-	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
 	<!-- A terminal tool wearing an .app: never in the Dock, never in Force Quit. -->
 	<key>LSUIElement</key>
 	<true/>

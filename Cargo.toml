@@ -24,12 +24,12 @@ dev-command = "pnpm exec vite"
 build-command = "pnpm exec vite build --app"
 run-args = ["tray"]
 
-# The macOS bundle: the app's identity, committed. `bundle-id` and `team` must match the App ID
-# the profiles were issued for — `bundle` refuses to sign unless the entitlements claim exactly
-# `<team>.<bundle-id>`. Bundles land in target/<profile>/bundle/macos/ (Tauri's layout).
+# The macOS bundle. Its name, file name and identifier are the app's — `native({ name, fileName,
+# identifier })` in app/vite.config.ts, written by the app's build to app/dist/app/phaze-app.json.
+# What stays here is how it is signed: `team` and the app's identifier must match the App ID the
+# profiles were issued for — `bundle` refuses to sign unless the entitlements claim exactly
+# `<team>.<identifier>`. Bundles land in target/<profile>/bundle/macos/ (Tauri's layout).
 [package.metadata.native.macos]
-product = "NeuralkitCLI"
-bundle-id = "ai.neuralkit.cli"
 team = "SBG7YFF24U"
 info-plist = "release/macos/Info.plist"
 entitlements = "release/macos/neuralkit.entitlements"
