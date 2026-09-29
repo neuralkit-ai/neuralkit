@@ -1050,9 +1050,17 @@ pub(crate) async fn quick_login(
     };
     let a = assert(&*key, &rp_id, base_url, &challenge, 0).map_err(|e| anyhow!("assert: {e}"))?;
     let fp = crate::fingerprint::value();
-    let res = http(base_url)?
+    let mut req = http(base_url)?
         .post(format!("{base_url}/transport/action/Cli/login"))
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    // THE SESSION THIS SIGN-IN REPLACES. Every run mints a new one and overwrites the token in
+    // credentials.json, and nothing released the old one — it sat in KV until its TTL. Presented
+    // as the cookie, the server revokes it after answering, so a login costs the same either way.
+    // Absent on a first run, which has nothing to replace.
+    if let Ok(t) = session_token() {
+        req = req.header("cookie", format!("session={t}; __Secure-session={t}"));
+    }
+    let res = req
         .body(serde_json::json!({
             "deviceId": device_id,
             "device":   device_code,
