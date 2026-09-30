@@ -425,10 +425,19 @@ pub async fn unregister() -> Result<()> {
                 Err(e) if e.downcast_ref::<crate::passkey::NoAnswer>().is_none() && crate::passkey::is_registered() => None,
                 Err(e) => Some(Err(e)),
             };
+            // The session the revoke was made with: the stored one, or the one asserted for it
+            // when the stored one had lapsed. Kept so the release below ends THAT session — the
+            // asserted one was minted only to authorise this call, and releasing the stored token
+            // in its place left it live for its whole hour (seen 2026-09-30).
+            let mut asserted: Option<String> = None;
             let outcome = match live {
                 Some(r) => r,
                 None => match crate::passkey::assert_session(origin).await {
-                    Ok(fresh) => crate::passkey::revoke(origin, &fresh).await,
+                    Ok(fresh) => {
+                        let r = crate::passkey::revoke(origin, &fresh).await;
+                        asserted = Some(fresh);
+                        r
+                    }
                     Err(e) => Err(e),
                 },
             };
@@ -448,9 +457,10 @@ pub async fn unregister() -> Result<()> {
 
             let insecure = origin.contains("127.0.0.1") || origin.contains("localhost");
             let client = reqwest::Client::builder().danger_accept_invalid_certs(insecure).build()?;
+            let used = asserted.as_deref().unwrap_or(token);
             let _ = client
                 .post(format!("{origin}/transport/action/Session/delete"))
-                .header("cookie", format!("session={token}; __Secure-session={token}"))
+                .header("cookie", format!("session={used}; __Secure-session={used}"))
                 .send()
                 .await;
         }
