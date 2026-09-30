@@ -1247,7 +1247,6 @@ pub(crate) fn wait_for_presence(_seconds: u64) -> Option<String> { None }
 pub async fn system(base_url: &str) -> Result<()> {
     let base_url = base_url.trim_end_matches('/');
     let rp_id = url_host(base_url)?;
-    let client = http(base_url)?;
 
     println!();
     println!("  {} {}", crate::style::bold("neuralkit"), crate::style::dim("· the account's own passkey"));
@@ -1260,8 +1259,35 @@ pub async fn system(base_url: &str) -> Result<()> {
     println!("  {}  {}", crate::style::dim(&format!("{:<13}", "running as")), crate::style::dim(&bundle_id));
     println!("  {}  {}", crate::style::dim(&format!("{:<13}", "bundle")), crate::style::dim(&bundle_path));
 
-    // The SERVER's challenge, exactly as every other assertion path uses. Nothing about this is
-    // local: a challenge we invented would prove the sheet appeared and nothing about identity.
+    println!();
+    println!("  {}", crate::style::dim("macOS should now show its passkey sheet — approve it"));
+    // THE REAL PROOF is the server accepting it, not the sheet appearing. `loginFinish` resolves
+    // the user from the credential id, so a success here means this machine just authenticated as
+    // an account it was never told the name of.
+    let (_token, user) = system_session(base_url).await?;
+    println!();
+    println!("  {} signed in as {}", crate::style::green("✓"), crate::style::bold(&user));
+    println!("  {}", crate::style::dim("no email, no code, no QR — the account's own credential"));
+    println!();
+    Ok(())
+}
+
+/// Ask macOS for the ACCOUNT's own passkey and return the session it mints, with the account's id.
+///
+/// Split out from `system` for the reason `assert_session` is split from `login`: the device flow
+/// needs the TOKEN, not a report — the menu's "use your passkey" row approves its own flow with it
+/// (`login::system_approve`). The server's challenge and the relying party the SERVER states, and
+/// the credentials it would accept scoping the sheet as a browser's `getPasskey` passes them: a Mac
+/// that holds the passkey signs with it; one that holds none is shown the sheet's own QR, and a
+/// phone signs this Mac's ceremony.
+///
+/// An error that starts `cancelled:` is the person dismissing the sheet; any other is a refusal —
+/// `code 1004` is the association missing from this binary's signature.
+#[cfg(target_os = "macos")]
+pub(crate) async fn system_session(base_url: &str) -> Result<(String, String)> {
+    let base_url = base_url.trim_end_matches('/');
+    let client = http(base_url)?;
+
     let start: Value = serde_json::from_str(
         &client
             .post(format!("{base_url}/transport/action/Passkey/loginStart"))
@@ -1280,30 +1306,25 @@ pub async fn system(base_url: &str) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("loginStart returned no challenge"))?;
     let challenge = URL_SAFE_NO_PAD.decode(challenge_b64).map_err(|e| anyhow!("challenge: {e}"))?;
-    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "challenge")), crate::style::dim(&format!("{} B from the server", challenge.len())));
+    let rp_id = match start.pointer("/data/rpId").and_then(Value::as_str) {
+        Some(rp) if !rp.is_empty() => rp.to_string(),
+        _ => url_host(base_url)?,
+    };
+    let allow: Vec<Vec<u8>> = start
+        .pointer("/data/allowCredentials")
+        .and_then(Value::as_array)
+        .map(|creds| {
+            creds
+                .iter()
+                .filter_map(|c| c.get("id").and_then(Value::as_str))
+                .filter_map(|id| URL_SAFE_NO_PAD.decode(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // NO allow-list ON PURPOSE. An empty list is the discoverable form — "any credential for this
-    // domain" — which is what a machine that does not yet know whose it is has to ask.
-    println!();
-    println!("  {}", crate::style::dim("macOS should now show its passkey sheet — approve it"));
-    let asrt = phaze_auth::system_passkey::assert(&rp_id, &challenge, &[], 60.0)
+    let asrt = phaze_auth::system_passkey::assert(&rp_id, &challenge, &allow, 60.0)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!();
-    println!("  {} {}", crate::style::green("✓"), "the OS returned an assertion");
-    println!("  {}  {}", crate::style::dim(&format!("{:<13}", "credential")), crate::style::dim(&b64(&asrt.credential_id)));
-    println!(
-        "  {}  {}",
-        crate::style::dim(&format!("{:<13}", "sizes")),
-        crate::style::dim(&format!(
-            "authData {} B · clientData {} B · signature {} B",
-            asrt.authenticator_data.len(), asrt.client_data_json.len(), asrt.signature.len(),
-        )),
-    );
-
-    // THE REAL PROOF is the server accepting it, not the sheet appearing. `loginFinish` resolves
-    // the user from the credential id, so a success here means this machine just authenticated as
-    // an account it was never told the name of.
     let res = client
         .post(format!("{base_url}/transport/action/Passkey/loginFinish"))
         .header("content-type", "application/json")
@@ -1315,15 +1336,12 @@ pub async fn system(base_url: &str) -> Result<()> {
         }).to_string())
         .send()
         .await?;
+    let token = session_cookie(&res);
     let body: Value = serde_json::from_str(&res.text().await?).unwrap_or(Value::Null);
     if let Some(m) = body.pointer("/error/message").and_then(Value::as_str) {
-        println!("  {} {}", crate::style::red("✗"), crate::style::dim(&format!("the server rejected it — {m}")));
-        return Ok(())
+        return Err(anyhow!("the server rejected it — {m}"))
     }
-    let user = body.pointer("/data/userId").and_then(Value::as_str).unwrap_or("");
-    println!();
-    println!("  {} signed in as {}", crate::style::green("✓"), crate::style::bold(user));
-    println!("  {}", crate::style::dim("no email, no code, no QR — the account's own credential"));
-    println!();
-    Ok(())
+    let user = body.pointer("/data/userId").and_then(Value::as_str).unwrap_or("").to_string();
+    let token = token.filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("no session cookie came back"))?;
+    Ok((token, user))
 }

@@ -24,7 +24,8 @@ pub enum Method {
     Totp,
     Passkey,
     Email,
-    /// A passkey asserted in this machine's BROWSER rather than by the CLI itself.
+    /// The ACCOUNT's passkey, asserted by an authenticator other than this CLI: macOS's passkey
+    /// sheet where this binary can raise it (`system_approve`), else this machine's BROWSER.
     ///
     /// THERE IS ONLY ONE KIND OF PASSKEY, and both paths mint a real WebAuthn credential through
     /// the same `Passkey/register*` + `Passkey/login*` fences into the same `credentials` table —
@@ -689,7 +690,18 @@ async fn choose_method(
             // user_code, before this menu was drawn — so deciding here spends them, and the wait
             // on an inbox is the only one that can outlive what is left.
             Some(Row::Go(Method::Email)) => Ok(Outcome::Restart(String::new())),
-            Some(Row::Go(Method::Browser)) => Ok(as_outcome(browser_approve(base_url, user_code)?)),
+            // THE SYSTEM SHEET FIRST, the browser when this binary cannot raise it. A dismissed
+            // sheet or a refused passkey comes back to the menu, as the on-device row does:
+            // declining is not failing, and opening a browser after a "no" would answer it loudly.
+            Some(Row::Go(Method::Browser)) => {
+                #[cfg(target_os = "macos")]
+                match system_approve(client, base_url, user_code).await? {
+                    Some(true) => return Ok(Outcome::Approved),
+                    Some(false) => continue,
+                    None => {}
+                }
+                Ok(as_outcome(browser_approve(base_url, user_code)?))
+            }
             Some(Row::Go(Method::Passkey)) => {
                 if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
                     return Ok(Outcome::Approved)
@@ -1363,6 +1375,39 @@ fn browser_approve(base_url: &str, user_code: &str) -> Result<bool> {
             Ok(false)
         }
     }
+}
+
+/// Approve this device flow with the ACCOUNT's own passkey, asked of macOS through its passkey
+/// sheet — the "use your passkey" row with no browser. The same move as `passkey_approve` with a
+/// different authenticator: the session comes from the passkey the person saved at signup, which
+/// this Mac holds through iCloud Keychain or, when it holds none, a phone signs through the
+/// sheet's own QR. So it works on a machine that has never signed in, which this machine's own
+/// key cannot.
+///
+/// `None` means the sheet could not be raised here — the binary's signature carries no
+/// association with the domain (`code 1004`), or there is no GUI session — and the caller opens
+/// the browser instead, the path this row took before. `Some(false)` is the person dismissing the
+/// sheet or the server refusing what it returned: back to the menu.
+#[cfg(target_os = "macos")]
+async fn system_approve(client: &reqwest::Client, base_url: &str, user_code: &str) -> Result<Option<bool>> {
+    println!();
+    println!("  {}", crate::style::dim("asking macOS for your passkey…"));
+    let token = match crate::passkey::system_session(base_url).await {
+        Ok((token, _user)) => token,
+        Err(e) => {
+            let why = e.to_string();
+            if why.contains("cancelled:") {
+                return Ok(Some(false))
+            }
+            if why.contains("the server rejected it") {
+                println!("  {} {}\n", crate::style::red("✗"), why);
+                return Ok(Some(false))
+            }
+            println!("  {}", crate::style::dim("the passkey sheet is not available here — using the browser"));
+            return Ok(None)
+        }
+    };
+    approve_and_release(client, base_url, user_code, &token, "passkey").await.map(Some)
 }
 
 async fn passkey_approve(
