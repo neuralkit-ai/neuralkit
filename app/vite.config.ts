@@ -44,7 +44,7 @@ export default defineConfig({
     native({
       // The app's identity: the name a person sees, the bundle's file name — pinned, so the
       // installed path stays /Applications/NeuralkitCLI.app — and the App ID it is signed as.
-      name: 'NEURALKIT™ CLI',
+      name: 'NEURALKIT ™ CLI',
       fileName: 'NeuralkitCLI',
       identifier: 'ai.neuralkit.cli',
       shell: 'wry',
