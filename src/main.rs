@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod bluetooth;
 mod fingerprint;
 mod login;
 #[cfg(target_os = "macos")]
@@ -43,6 +45,46 @@ const ASIC_EEG_POWER: u8 = 0x83;
 /// Top-level menu entries — each drills into a submenu.
 const MAIN_MENU: &[&str] = &["Relay", "Transport"];
 
+/// The menu's top level as the dashboard shows it: with "Headset" where a headset is read — a
+/// publisher reading hardware, on macOS (bluetooth.rs).
+pub fn main_menu(parser: &BrainWaveParser) -> &'static [&'static str] {
+    if cfg!(target_os = "macos") && !parser.is_subscriber && !parser.synthetic {
+        &["Relay", "Transport", "Headset"]
+    } else {
+        MAIN_MENU
+    }
+}
+
+/// The Bluetooth headset the dashboard reads, for the header and the Headset panel. `None` on
+/// `BrainWaveParser::headset_state` is a run that reads no Bluetooth headset (`--sub`,
+/// `--synthetic`, a serial port).
+#[derive(Clone, PartialEq)]
+pub enum HeadsetState {
+    /// No headset yet: no port named and none chosen before.
+    Missing,
+    Pairing,
+    /// The device asked for a PIN; the panel asks the person.
+    NeedsPin,
+    /// The device shows this code; the panel asks the person whether it matches.
+    NeedsConfirm(u32),
+    /// Reading its service records, to learn its serial channel.
+    Reading,
+    Connecting,
+    Streaming,
+    /// Open, but no ThinkGear frame for a few seconds.
+    NoData,
+    Closed,
+    Failed(String),
+}
+
+/// A row of the Headset panel: a device the search found or macOS has paired.
+#[derive(Clone, PartialEq)]
+pub struct HeadsetRow {
+    pub name: String,
+    pub address: String,
+    pub paired: bool,
+}
+
 /// Selectable relays (name, URL). Local carries the phaze-relay `--local`
 /// address so the ip:port is visible in the picker. Cloudflare points at
 /// PRODUCTION — phaze-moq's direct subscribe-by-name is exactly the
@@ -76,6 +118,11 @@ pub enum Menu {
     Main,
     Relay,
     Transport,
+    Headset,
+    /// Pairing asked for a PIN — opened by the loop, not the person.
+    HeadsetPin,
+    /// Pairing asked whether the device shows a code — opened by the loop.
+    HeadsetConfirm,
 }
 
 /// The apex — production. Every `--url` default and the bare front door read this one const; a
@@ -90,7 +137,7 @@ const DEFAULT_URL: &str = "https://neuralkit.ai";
 
 /// Clap defaults, as consts so the bare-invocation check compares against the
 /// SAME strings the parser fills in — a drifted literal would silently kill the menu.
-const DEFAULT_PORT: &str = "/dev/cu.usbmodem8D762F6448571";
+/// There is no default port: no device is named in the binary (bluetooth.rs).
 const DEFAULT_RELAY_URL: &str = "https://127.0.0.1:4443";
 const DEFAULT_STREAM_PATH: &str = "neuralkit";
 
@@ -101,9 +148,9 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Serial port to connect to
-    #[arg(default_value = DEFAULT_PORT)]
-    port: String,
+    /// The headset to read: a serial port, or `/dev/cu.<name>` for a paired Bluetooth headset.
+    /// Without one, the headset chosen last; without that, the Headset panel (M) searches.
+    port: Option<String>,
 
     /// Run in synthetic data mode
     #[arg(short, long)]
@@ -331,6 +378,33 @@ pub struct BrainWaveParser {
     pub attention_queue: VecDeque<u64>,
     pub meditation_queue: VecDeque<u64>,
     pub sub_sample_count: usize,
+    /// Packets the publisher task's channel refused (full or closed). Read by the loop's health
+    /// trace; with 100 slots at 4 packets a second it moves only after ~25 s of stall.
+    pub stream_drops: u64,
+    /// The most packets found waiting in that channel at a send since the trace last read it —
+    /// where the MoQ task falling behind on the runtime's worker threads shows first (0–1 when
+    /// it keeps up).
+    pub stream_backlog: usize,
+    /// The Headset panel's rows: the paired devices with a serial channel (read when the panel
+    /// opens), then what the search has found besides.
+    pub headset_rows: Vec<HeadsetRow>,
+    pub headset_paired: Vec<HeadsetRow>,
+    /// The panel asks the loop to search (on opening, and `S`); `headset_searching` is the loop's
+    /// answer while one runs.
+    pub headset_search: bool,
+    pub headset_searching: bool,
+    /// The Bluetooth headset in use, (name, address), and where it stands.
+    pub headset: Option<(String, String)>,
+    pub headset_state: Option<HeadsetState>,
+    /// A headset chosen in the panel, or at startup, for the dashboard loop to switch to. The
+    /// loop owns the search, the pairing and the connection; the panel never starts one itself,
+    /// as the relay picker never dials.
+    pub headset_pick: Option<HeadsetRow>,
+    /// The PIN being typed in the panel, and the answers it hands the loop's pairing: a PIN
+    /// (empty = cancelled), and whether the code shown matches.
+    pub pin_input: String,
+    pub pin_reply: Option<String>,
+    pub confirm_reply: Option<bool>,
 }
 
 impl BrainWaveParser {
@@ -377,6 +451,18 @@ impl BrainWaveParser {
             attention_queue: VecDeque::new(),
             meditation_queue: VecDeque::new(),
             sub_sample_count: 0,
+            stream_drops: 0,
+            stream_backlog: 0,
+            headset_rows: Vec::new(),
+            headset_paired: Vec::new(),
+            headset_search: false,
+            headset_searching: false,
+            headset: None,
+            headset_state: None,
+            headset_pick: None,
+            pin_input: String::new(),
+            pin_reply: None,
+            confirm_reply: None,
         }
     }
 
@@ -401,7 +487,10 @@ impl BrainWaveParser {
             };
             self.attention_update_pending = false;
             self.meditation_update_pending = false;
-            let _ = tx.try_send(packet);
+            self.stream_backlog = self.stream_backlog.max(tx.max_capacity() - tx.capacity());
+            if tx.try_send(packet).is_err() {
+                self.stream_drops += 1;
+            }
         }
     }
 
@@ -696,12 +785,45 @@ impl BrainWaveParser {
 /// duplicated. When the popup is open it captures the keys.
 fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
     use Menu::*;
+    // The PIN field takes every key while it is open — what is typed is the PIN, letters
+    // included — so it answers before the menu's own keys. Esc cancels the pairing.
+    if parser.menu == HeadsetPin {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_graphic() && parser.pin_input.len() < 16 => parser.pin_input.push(c),
+            KeyCode::Backspace => {
+                parser.pin_input.pop();
+            }
+            KeyCode::Enter if !parser.pin_input.is_empty() => {
+                parser.pin_reply = Some(parser.pin_input.clone());
+                parser.menu = Closed;
+            }
+            KeyCode::Esc => {
+                parser.pin_reply = Some(String::new());
+                parser.menu = Closed;
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if parser.menu == HeadsetConfirm {
+        let answer = match code {
+            KeyCode::Enter | KeyCode::Char('y') => Some(true),
+            KeyCode::Esc | KeyCode::Char('n') => Some(false),
+            _ => None,
+        };
+        if answer.is_some() {
+            parser.confirm_reply = answer;
+            parser.menu = Closed;
+        }
+        return false;
+    }
     if parser.menu != Closed {
         let len = match parser.menu {
-            Main => MAIN_MENU.len(),
+            Main => main_menu(parser).len(),
             Relay => RELAYS.len(),
             Transport => TRANSPORTS.len(),
-            Closed => 0,
+            Headset => parser.headset_rows.len(),
+            HeadsetPin | HeadsetConfirm | Closed => 0,
         };
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -721,6 +843,25 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                         parser.menu = Transport;
                         parser.menu_cursor = parser.sel.transport.load(Ordering::Relaxed);
                     }
+                    // Only listed where a headset is read (`main_menu`). The paired rows are read
+                    // now, from what macOS stored; the search the loop starts adds what it finds.
+                    2 => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            parser.headset_paired = bluetooth::serial_devices()
+                                .into_iter()
+                                .map(|(name, address)| HeadsetRow { name, address, paired: true })
+                                .collect();
+                        }
+                        parser.headset_rows = parser.headset_paired.clone();
+                        parser.headset_search = true;
+                        parser.menu = Headset;
+                        parser.menu_cursor = parser
+                            .headset
+                            .as_ref()
+                            .and_then(|(_, a)| parser.headset_rows.iter().position(|r| r.address == *a))
+                            .unwrap_or(0);
+                    }
                     _ => {}
                 },
                 Relay => {
@@ -739,17 +880,25 @@ fn handle_key(parser: &mut BrainWaveParser, code: KeyCode) -> bool {
                     parser.sel.reconfigure.notify_one(); // re-dial with the new transport
                     parser.menu = Closed; // selection made — close the popup
                 }
-                Closed => {}
+                Headset => {
+                    if let Some(row) = parser.headset_rows.get(parser.menu_cursor).cloned() {
+                        parser.headset_pick = Some(row); // the dashboard loop switches to it
+                        parser.menu = Closed; // selection made — close the popup
+                    }
+                }
+                HeadsetPin | HeadsetConfirm | Closed => {}
             },
             // Esc / ← backs up a level (or closes from Main).
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => match parser.menu {
                 Main => parser.menu = Closed,
-                Relay | Transport => {
+                Relay | Transport | Headset => {
                     parser.menu = Main;
                     parser.menu_cursor = 0;
                 }
-                Closed => {}
+                HeadsetPin | HeadsetConfirm | Closed => {}
             },
+            // Search again — the loop restarts it.
+            KeyCode::Char('s') if parser.menu == Headset => parser.headset_search = true,
             KeyCode::Char('m') | KeyCode::Char('q') => parser.menu = Closed,
             _ => {}
         }
@@ -941,7 +1090,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bare = args.command.is_none()
         && !args.synthetic
         && !args.sub
-        && args.port == DEFAULT_PORT
+        && args.port.is_none()
         && args.stream_url == DEFAULT_RELAY_URL
         && args.stream_path == DEFAULT_STREAM_PATH;
     if bare && io::stdout().is_terminal() && io::stdin().is_terminal() {
@@ -1244,6 +1393,124 @@ async fn sign_in_flow(
 /// the SAME thing bare `neuralkit` runs, with the same args the process started with.
 /// Owns the whole terminal (raw mode + alternate screen) for its lifetime; every exit
 /// path restores it, which is what lets a REPL prompt survive on the other side.
+/// No headset at `port_name`, and the dashboard has not taken the terminal yet. The raw io::Error
+/// Debug-dump named neither the port nor a way out: say WHICH device failed, keep the OS's
+/// reason, and hand over the two no-hardware paths instead of a struct.
+fn no_headset(port_name: &str, reason: &dyn std::fmt::Display) -> ! {
+    println!();
+    println!("  {} no headset at {} — {}", style::red("✗"), style::bold(port_name), reason);
+    println!();
+    println!(
+        "    plug in the NeuroSky, or name your device:  {}",
+        style::bold("neuralkit /dev/cu.<your-headset>"),
+    );
+    println!(
+        "    no hardware?  {} publishes a generated signal · {} views a live stream",
+        style::bold("neuralkit --synthetic"),
+        style::bold("neuralkit --sub"),
+    );
+    println!();
+    std::process::exit(1);
+}
+
+/// The dashboard loop's health, traced once a second at debug level — `RUST_LOG=dashboard=debug`
+/// writes it to neuralkit_debug.log; at the default level it is silent. Every source and every
+/// draw runs on this one thread (the main thread `block_on` runs on, which the Bluetooth pump
+/// needs), so a stall anywhere on it shows as a long gap between two draws, and `pump` / `draw`
+/// say whether it was theirs. `frames` is the ThinkGear frames parsed (~513/s from a headset).
+/// `backlog` and `drops` are the publisher task's channel (`BrainWaveParser::stream_backlog` /
+/// `stream_drops`) — where a stall on the runtime's other threads would show.
+struct LoopStats {
+    since: Instant,
+    last_draw: Option<Instant>,
+    draws: u32,
+    max_gap: Duration,
+    max_draw: Duration,
+    max_pump: Duration,
+    frames: usize,
+    drops_before: u64,
+}
+
+impl LoopStats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            last_draw: None,
+            draws: 0,
+            max_gap: Duration::ZERO,
+            max_draw: Duration::ZERO,
+            max_pump: Duration::ZERO,
+            frames: 0,
+            drops_before: 0,
+        }
+    }
+
+    fn drew(&mut self, started: Instant) {
+        if let Some(prev) = self.last_draw {
+            self.max_gap = self.max_gap.max(started - prev);
+        }
+        self.last_draw = Some(started);
+        self.max_draw = self.max_draw.max(started.elapsed());
+        self.draws += 1;
+    }
+
+    /// Once a second: one debug line, then a fresh second.
+    fn tick(&mut self, parser: &mut BrainWaveParser) {
+        if self.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        tracing::debug!(
+            target: "dashboard",
+            draws = self.draws,
+            max_gap_ms = self.max_gap.as_millis() as u64,
+            max_draw_ms = self.max_draw.as_millis() as u64,
+            max_pump_us = self.max_pump.as_micros() as u64,
+            frames = self.frames,
+            backlog = parser.stream_backlog,
+            drops = parser.stream_drops - self.drops_before,
+            "loop"
+        );
+        parser.stream_backlog = 0;
+        *self = Self { last_draw: self.last_draw, drops_before: parser.stream_drops, ..Self::new() };
+    }
+}
+
+/// Hands every complete ThinkGear frame at the front of `stream` to the parser: two SYNC bytes,
+/// a length (≤169), the payload, its checksum. A frame whose checksum fails is dropped; a partial
+/// one stays for the next bytes. Shared by the serial and Bluetooth sources. Returns how many
+/// frames it handed on.
+fn feed_frames(parser: &mut BrainWaveParser, stream: &mut Vec<u8>) -> usize {
+    let mut fed = 0;
+    while stream.len() >= 4 {
+        if stream[0] == SYNC && stream[1] == SYNC {
+            let p_length = stream[2] as usize;
+            if p_length > 169 {
+                stream.remove(0);
+                continue;
+            }
+            if stream.len() >= 3 + p_length + 1 {
+                let payload = &stream[3..3 + p_length];
+                let checksum = stream[3 + p_length];
+                let mut sum: u32 = 0;
+                for &b in payload {
+                    sum += b as u32;
+                }
+                let computed_checksum = (!(sum & 0xFF) & 0xFF) as u8;
+                if computed_checksum == checksum {
+                    parser.parse_packet(payload);
+                    fed += 1;
+                }
+                stream.drain(0..3 + p_length + 1);
+            } else {
+                break;
+            }
+        } else {
+            stream.remove(0);
+        }
+    }
+    fed
+}
+
 async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
@@ -1294,36 +1561,46 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 3. Serial Port Setup (only for Publisher, non-synthetic)
-    let mut port = if !args.sub && !parser.synthetic {
-        let port_name = args.port.clone();
-        match serialport::new(&port_name, 57600)
-            .timeout(Duration::from_millis(100))
-            .open()
-        {
-            Ok(p) => Some(p),
-            Err(e) => {
-                // The raw io::Error Debug-dump named neither the port nor a way out.
-                // Say WHICH device failed, keep the OS's reason, and hand over the
-                // two no-hardware paths instead of a struct.
-                println!();
-                println!("  {} no headset at {} — {}", style::red("✗"), style::bold(&port_name), e);
-                println!();
-                println!(
-                    "    plug in the NeuroSky, or name your device:  {}",
-                    style::bold("neuralkit /dev/cu.<your-headset>"),
-                );
-                println!(
-                    "    no hardware?  {} publishes a generated signal · {} views a live stream",
-                    style::bold("neuralkit --synthetic"),
-                    style::bold("neuralkit --sub"),
-                );
-                println!();
-                std::process::exit(1);
+    // 3. Headset Setup (only for Publisher, non-synthetic). The port named, if any: on macOS a
+    // `/dev/cu.<name>` naming a paired Bluetooth headset is that headset — its channel, not the
+    // file (bluetooth.rs says why); any other port is a serial port. With none named, the headset
+    // chosen last; without that, none — the dashboard opens and the Headset panel searches. The
+    // loop opens a Bluetooth headset, as it opens one chosen in the panel, and its bytes arrive
+    // on `headset_rx`, as --sub's packets do.
+    let hardware = !args.sub && !parser.synthetic;
+    #[cfg(target_os = "macos")]
+    if hardware {
+        parser.headset_pick = match &args.port {
+            Some(port) => port.strip_prefix("/dev/cu.").and_then(bluetooth::named),
+            None => bluetooth::remembered(),
+        }
+        .map(|(name, address)| HeadsetRow { name, address, paired: true });
+    }
+    if hardware && args.port.is_none() && parser.headset_pick.is_none() {
+        parser.headset_state = Some(HeadsetState::Missing);
+    }
+    #[cfg(target_os = "macos")]
+    let mut headset: Option<bluetooth::Headset> = None;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut headset_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>> = None;
+    // When the headset last delivered a frame, and when its channel opened — for "no data".
+    #[cfg(target_os = "macos")]
+    let (mut headset_heard, mut headset_open_at): (Option<Instant>, Option<Instant>) = (None, None);
+
+    // 4. Serial Port Setup (only for Publisher, non-synthetic, a port named, and not a Bluetooth
+    // headset)
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut port = match &args.port {
+        Some(port_name) if hardware && parser.headset_pick.is_none() => {
+            match serialport::new(port_name, 57600)
+                .timeout(Duration::from_millis(100))
+                .open()
+            {
+                Ok(p) => Some(p),
+                Err(e) => no_headset(port_name, &e),
             }
         }
-    } else {
-        None
+        _ => None,
     };
 
     enable_raw_mode()?;
@@ -1348,8 +1625,125 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // 16-samples-per-loop burst had no explicit rate — it ran ~9x real-time.)
     let synth_start = Instant::now();
     let mut synth_samples: u64 = 0;
+    let mut stats = LoopStats::new();
+    // The Headset panel's search, and a pairing in progress — owned here with the headset, so
+    // all three are answered in the one run-loop turn below (bluetooth.rs).
+    #[cfg(target_os = "macos")]
+    let mut search: Option<bluetooth::Search> = None;
+    #[cfg(target_os = "macos")]
+    let mut pairing: Option<(bluetooth::Pairing, HeadsetRow)> = None;
 
     loop {
+        #[cfg(target_os = "macos")]
+        {
+            // A headset chosen in the panel, or at startup. The loop owns the connection, so it
+            // switches: the one in use (or the serial port) closes, and the chosen one starts —
+            // pairing first if it is new, then opening. Neither waits; the polls below report.
+            if let Some(row) = parser.headset_pick.take() {
+                headset = None;
+                headset_rx = None;
+                port = None;
+                pairing = None;
+                stream_buffer.clear();
+                parser.headset = Some((row.name.clone(), row.address.clone()));
+                parser.headset_state = Some(if row.paired {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    match bluetooth::open(&row.address, tx) {
+                        Ok(h) => {
+                            headset = Some(h);
+                            headset_rx = Some(rx);
+                            (headset_heard, headset_open_at) = (None, None);
+                            bluetooth::remember(&row.address);
+                            HeadsetState::Connecting
+                        }
+                        Err(e) => HeadsetState::Failed(e.to_string()),
+                    }
+                } else {
+                    match bluetooth::pair(&row.address) {
+                        Ok(p) => {
+                            pairing = Some((p, row));
+                            HeadsetState::Pairing
+                        }
+                        Err(e) => HeadsetState::Failed(e.to_string()),
+                    }
+                });
+            }
+
+            // The panel asked for a search (opening it, or S): a fresh one replaces the last.
+            if std::mem::take(&mut parser.headset_search) {
+                search = None;
+                match bluetooth::search() {
+                    Ok(s) => search = Some(s),
+                    Err(e) => tracing::warn!("headset search: {e}"),
+                }
+            }
+
+            // One run-loop turn that does not wait. The search, the pairing and the headset's
+            // channel are all answered in it.
+            let pumped = Instant::now();
+            bluetooth::pump();
+            stats.max_pump = stats.max_pump.max(pumped.elapsed());
+
+            // The panel's rows: the paired ones, then what the search found besides, in the order
+            // they answered. A finished search is let go once the panel closes.
+            if let Some(s) = &search {
+                parser.headset_searching = s.searching();
+                if parser.menu == Menu::Headset {
+                    let mut rows = parser.headset_paired.clone();
+                    for (name, address, paired) in s.found() {
+                        if !rows.iter().any(|r| r.address == address) {
+                            rows.push(HeadsetRow { name, address, paired });
+                        }
+                    }
+                    parser.headset_rows = rows;
+                } else if !parser.headset_searching {
+                    search = None;
+                }
+            }
+
+            // A pairing: hand it the person's answers, open the panel's PIN field or code
+            // question when the device asks, and once it pairs, open it as a paired headset.
+            let (mut paired_now, mut gave_up) = (None, None);
+            if let Some((p, row)) = pairing.as_mut() {
+                match parser.pin_reply.take() {
+                    Some(pin) if pin.is_empty() => gave_up = Some("pairing cancelled".to_string()),
+                    Some(pin) => p.pin(&pin),
+                    None => {}
+                }
+                if let Some(matches) = parser.confirm_reply.take() {
+                    p.confirm(matches);
+                }
+                if gave_up.is_none() {
+                    match p.poll() {
+                        bluetooth::Pair::Pairing => parser.headset_state = Some(HeadsetState::Pairing),
+                        bluetooth::Pair::NeedsPin => {
+                            if parser.headset_state != Some(HeadsetState::NeedsPin) {
+                                parser.headset_state = Some(HeadsetState::NeedsPin);
+                                parser.pin_input.clear();
+                                parser.menu = Menu::HeadsetPin;
+                            }
+                        }
+                        bluetooth::Pair::NeedsConfirm(code) => {
+                            if parser.headset_state != Some(HeadsetState::NeedsConfirm(code)) {
+                                parser.headset_state = Some(HeadsetState::NeedsConfirm(code));
+                                parser.menu = Menu::HeadsetConfirm;
+                            }
+                        }
+                        bluetooth::Pair::Paired => paired_now = Some(HeadsetRow { paired: true, ..row.clone() }),
+                        bluetooth::Pair::Failed(e) => gave_up = Some(e),
+                    }
+                }
+            }
+            if let Some(why) = gave_up {
+                pairing = None;
+                parser.headset_state = Some(HeadsetState::Failed(why));
+            }
+            if let Some(row) = paired_now {
+                pairing = None;
+                parser.headset_pick = Some(row); // opened on the next pass, as any paired headset
+            }
+        }
+
         if !parser.is_paused {
             if parser.synthetic {
                 // Generate up to the sample count that SHOULD exist by now at
@@ -1398,32 +1792,7 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 match p.read(&mut buffer) {
                     Ok(n) if n > 0 => {
                         stream_buffer.extend_from_slice(&buffer[..n]);
-                        while stream_buffer.len() >= 4 {
-                            if stream_buffer[0] == SYNC && stream_buffer[1] == SYNC {
-                                let p_length = stream_buffer[2] as usize;
-                                if p_length > 169 {
-                                    stream_buffer.remove(0);
-                                    continue;
-                                }
-                                if stream_buffer.len() >= 3 + p_length + 1 {
-                                    let payload = &stream_buffer[3..3 + p_length];
-                                    let checksum = stream_buffer[3 + p_length];
-                                    let mut sum: u32 = 0;
-                                    for &b in payload {
-                                        sum += b as u32;
-                                    }
-                                    let computed_checksum = (!(sum & 0xFF) & 0xFF) as u8;
-                                    if computed_checksum == checksum {
-                                        parser.parse_packet(payload);
-                                    }
-                                    stream_buffer.drain(0..3 + p_length + 1);
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                stream_buffer.remove(0);
-                            }
-                        }
+                        stats.frames += feed_frames(&mut parser, &mut stream_buffer);
                     }
                     Ok(_) => (),
                     Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
@@ -1434,6 +1803,44 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         return Err(e.into());
                     }
                 }
+            } else if let Some(rx) = headset_rx.as_mut() {
+                // The Bluetooth headset's delegate fills `rx` during the run-loop turn at the top
+                // of this pass (bluetooth.rs). Whatever has arrived, then — never blocking the
+                // frame on a packet, for the reason the --sub branch gives — sleep to the next
+                // tick, so the loop wakes once a frame. A closed channel ends the stream, not the
+                // dashboard: `poll` reports it, and the Headset panel chooses again.
+                while let Ok(chunk) = rx.try_recv() {
+                    stream_buffer.extend_from_slice(&chunk);
+                }
+                let fed = feed_frames(&mut parser, &mut stream_buffer);
+                stats.frames += fed;
+                #[cfg(target_os = "macos")]
+                if let Some(h) = headset.as_mut() {
+                    if fed > 0 {
+                        headset_heard = Some(Instant::now());
+                    }
+                    let link = h.poll();
+                    if matches!(link, bluetooth::Link::Open) && headset_open_at.is_none() {
+                        headset_open_at = Some(Instant::now());
+                    }
+                    // "No data" after 3 s open without a frame: the ThinkGear stream sends ~513 a
+                    // second.
+                    let quiet = headset_heard.or(headset_open_at).is_some_and(|t| t.elapsed() > Duration::from_secs(3));
+                    parser.headset_state = Some(match link {
+                        bluetooth::Link::Reading => HeadsetState::Reading,
+                        bluetooth::Link::Opening => HeadsetState::Connecting,
+                        bluetooth::Link::Open if quiet => HeadsetState::NoData,
+                        bluetooth::Link::Open if headset_heard.is_some() => HeadsetState::Streaming,
+                        bluetooth::Link::Open => HeadsetState::Connecting,
+                        bluetooth::Link::Closed => HeadsetState::Closed,
+                        bluetooth::Link::Failed(e) => HeadsetState::Failed(e),
+                    });
+                }
+                tokio::time::sleep(tick_rate.saturating_sub(last_tick.elapsed())).await;
+            } else {
+                // No source: a headset not chosen yet, or one that failed to open. Wake once a
+                // frame for the panel and the draw.
+                tokio::time::sleep(tick_rate.saturating_sub(last_tick.elapsed())).await;
             }
         } else {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1537,7 +1944,9 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             // gives a steady ~30fps as long as a draw fits inside tick_rate.
             last_tick = Instant::now();
             terminal.draw(|f| tui::render_dashboard(f, &parser))?;
+            stats.drew(last_tick);
         }
+        stats.tick(&mut parser);
     }
 
     disable_raw_mode()?;

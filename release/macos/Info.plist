@@ -14,5 +14,7 @@
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Neuralkit finds, pairs and reads your EEG headset over Bluetooth.</string>
 </dict>
 </plist>

@@ -30,9 +30,24 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         .constraints(constraints)
         .split(f.area());
 
-    // Header / Info Block
+    // Header / Info Block. A Bluetooth headset that is not streaming says so first — the signal
+    // fields below describe a headset that is.
+    let headset_note = match &parser.headset_state {
+        Some(crate::HeadsetState::Streaming) | None => None,
+        Some(crate::HeadsetState::Missing) => Some(if cfg!(target_os = "macos") {
+            "No headset — M › Headset".to_string()
+        } else {
+            "No headset — name its port: neuralkit <port>".to_string()
+        }),
+        Some(_) => {
+            let name = parser.headset.as_ref().map_or("Headset", |(n, _)| n.as_str());
+            Some(format!("{name} {}", headset_label(parser)))
+        }
+    };
     let status = if parser.is_paused {
         "PAUSED"
+    } else if let Some(note) = &headset_note {
+        note.as_str()
     } else if parser.last_poor_signal == 0 {
         "Connected (Good Signal)"
     } else if parser.last_poor_signal == 200 {
@@ -372,14 +387,56 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
 
     // Drill-down settings menu — overlays everything when open (`M`).
     if parser.menu != crate::Menu::Closed {
+        // The Headset levels' titles carry live state: the search, the device being paired.
+        let headset_title = if parser.headset_searching {
+            " Headset · searching…  [Enter connect · S search · Esc back] "
+        } else {
+            " Headset  [Enter connect · S search · Esc back] "
+        };
+        let pairing_name = parser.headset.as_ref().map_or("the device", |(n, _)| n.as_str());
+        let pin_title = format!(" PIN for {pairing_name}  [Enter pair · Esc cancel] ");
+        let confirm_title = format!(" Pairing {pairing_name}  [Enter yes · Esc no] ");
         // Build the current level's rows as strings (so we can size the popup).
         let (title, rows): (&str, Vec<String>) = match parser.menu {
             crate::Menu::Main => (
                 " Settings  [↑↓ · →/Enter · Esc] ",
-                crate::MAIN_MENU
+                crate::main_menu(parser)
                     .iter()
                     .map(|m| format!("  {m}  ▸"))
                     .collect(),
+            ),
+            crate::Menu::Headset => (
+                headset_title,
+                if parser.headset_rows.is_empty() {
+                    vec![if parser.headset_searching {
+                        "   searching for devices nearby…".to_string()
+                    } else {
+                        "   nothing found — switch the headset on, then S".to_string()
+                    }]
+                } else {
+                    parser
+                        .headset_rows
+                        .iter()
+                        .map(|row| {
+                            let new = if row.paired { "" } else { "  (new)" };
+                            match parser.headset.as_ref().filter(|(_, a)| *a == row.address) {
+                                Some(_) => format!(" ● {}{new} — {}", row.name, headset_label(parser)),
+                                None => format!("   {}{new}", row.name),
+                            }
+                        })
+                        .collect()
+                },
+            ),
+            crate::Menu::HeadsetPin => (
+                &pin_title,
+                vec![format!("   PIN: {}▏", parser.pin_input)],
+            ),
+            crate::Menu::HeadsetConfirm => (
+                &confirm_title,
+                vec![match &parser.headset_state {
+                    Some(crate::HeadsetState::NeedsConfirm(code)) => format!("   Does it show {code:06}?"),
+                    _ => "   Does it show the same code?".to_string(),
+                }],
             ),
             crate::Menu::Relay => (
                 " Relay  [Enter apply · Esc back] ",
@@ -443,5 +500,21 @@ pub fn render_dashboard(f: &mut Frame, parser: &BrainWaveParser) {
         let mut state = ListState::default();
         state.select(Some(parser.menu_cursor));
         f.render_stateful_widget(list, popup, &mut state);
+    }
+}
+
+/// The Bluetooth headset's state in words, for its row in the Headset panel and the header.
+fn headset_label(parser: &BrainWaveParser) -> String {
+    match &parser.headset_state {
+        Some(crate::HeadsetState::Pairing) => "pairing…".to_string(),
+        Some(crate::HeadsetState::NeedsPin) => "pairing — enter its PIN".to_string(),
+        Some(crate::HeadsetState::NeedsConfirm(code)) => format!("pairing — does it show {code:06}?"),
+        Some(crate::HeadsetState::Reading) => "reading its services…".to_string(),
+        Some(crate::HeadsetState::Connecting) => "connecting…".to_string(),
+        Some(crate::HeadsetState::Streaming) => "streaming".to_string(),
+        Some(crate::HeadsetState::NoData) => "open, no ThinkGear data".to_string(),
+        Some(crate::HeadsetState::Closed) => "disconnected — M › Headset".to_string(),
+        Some(crate::HeadsetState::Failed(e)) => format!("failed: {e}"),
+        Some(crate::HeadsetState::Missing) | None => String::new(),
     }
 }

@@ -150,6 +150,17 @@ tray-icon = "0.24.2"
 # explicit because objc2-app-kit gates every class behind one.
 objc2 = "0.6"
 objc2-foundation = "0.3"
+# A paired Bluetooth headset (bluetooth.rs): its serial (RFCOMM) channel through IOBluetooth. The
+# feature list is explicit because the crate's default compiles every IOBluetooth class.
+objc2-io-bluetooth = { version = "0.3", default-features = false, features = [
+    "std", "objc2", "objc2-foundation",
+    "Bluetooth", "BluetoothAssignedNumbers", "IOBluetoothObject", "IOBluetoothDevice",
+    "IOBluetoothDeviceInquiry", "IOBluetoothDevicePair",
+    "IOBluetoothRFCOMMChannel", "IOBluetoothSDPServiceRecord",
+] }
+# ALREADY IN THE BUILD — the main run loop's turn (`CFRunLoopRunInMode`) that delivers the
+# channel's data; named here for the two features that expose it.
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFRunLoop", "CFDate"] }
 # THE PANEL'S RENDERER — see panel.rs `web_card`. Wry is the only genuinely NEW dependency
 # here (unlike the objc2 family, which tao already resolved); it embeds the OS's own WKWebView
 # rather than shipping a browser, and raw-window-handle is how it is told which NSView to sit in.
