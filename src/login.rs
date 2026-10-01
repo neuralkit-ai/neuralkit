@@ -794,6 +794,9 @@ fn rows_for(expanded: bool, s: MenuShape) -> Vec<(&'static str, Row)> {
 ///
 /// `select` cannot do this — its options are fixed for the life of the call, so expanding meant
 /// calling it twice, and the second menu drew UNDER the first.
+///
+/// Like `select`, it owns its LEADING blank line and erases everything it printed once it is
+/// answered, so what follows opens with a blank of its own.
 fn pick(header: &str, expanded: &mut bool, s: MenuShape) -> Result<Option<Row>> {
     use crossterm::{
         cursor,
@@ -860,9 +863,19 @@ fn pick(header: &str, expanded: &mut bool, s: MenuShape) -> Result<Option<Row>> 
         }
     })();
 
+    // AN ANSWERED QUESTION LEAVES THE SCREEN — `select`'s rule, for `select`'s reason. This picker
+    // used to leave its last frame standing, so a row that failed and came back to the menu drew a
+    // second title and a second set of rows under the first: the whole block twice, which reads
+    // as the sign-in running again. Erased, whatever the row prints lands where the menu was, and
+    // a menu that comes back is the only one on screen.
+    //
+    // The count is exact: the last row ended with `\r\n`, nothing has printed since the final
+    // frame, and that frame was drawn from the `expanded` this returns with — plus the leading
+    // blank, the title and its blank.
+    let printed = rows_for(*expanded, s).len() as u16 + 3;
+    execute!(out, cursor::MoveUp(printed), Clear(ClearType::FromCursorDown))?;
     execute!(out, cursor::Show)?;
     disable_raw_mode()?;
-    println!();
     outcome
 }
 
@@ -1400,7 +1413,7 @@ async fn system_approve(client: &reqwest::Client, base_url: &str, user_code: &st
                 return Ok(Some(false))
             }
             if why.contains("the server rejected it") {
-                println!("  {} {}\n", crate::style::red("✗"), why);
+                println!("  {} {}", crate::style::red("✗"), why);
                 return Ok(Some(false))
             }
             println!("  {}", crate::style::dim("the passkey sheet is not available here — using the browser"));
