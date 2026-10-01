@@ -10,7 +10,6 @@
 //! ML-KEM keypair that seals the session channel is minted here, per login.
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::StreamExt;
 use phaze_crypto::ml_kem;
 use serde_json::Value;
 use std::io::Write;
@@ -55,6 +54,163 @@ enum Outcome {
     UseQr,
     Restart(String),
     Quit,
+}
+
+/// The frames of a held SSE response, one JSON value at a time.
+///
+/// Frames are separated by a blank line; a `null` frame is a rejected/kill frame and is skipped.
+/// The bytes read past the last frame handed out stay here, because the stream is ONE connection
+/// read by two parties in turn: `open_flow` takes it as far as the user_code, and `run` takes it
+/// from there to the token.
+struct Frames {
+    resp: reqwest::Response,
+    buf: Vec<u8>,
+    ready: std::collections::VecDeque<Value>,
+}
+
+impl Frames {
+    fn new(resp: reqwest::Response) -> Self {
+        Self { resp, buf: Vec::new(), ready: Default::default() }
+    }
+
+    /// The next frame, or `None` once the stream has closed.
+    async fn next(&mut self) -> Result<Option<Value>> {
+        loop {
+            if let Some(v) = self.ready.pop_front() {
+                return Ok(Some(v))
+            }
+            // SSE frames are separated by a blank line.
+            while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
+                let raw: Vec<u8> = self.buf.drain(..pos + 2).collect();
+                for line in std::str::from_utf8(&raw)?.lines() {
+                    let Some(data) = line.strip_prefix("data: ") else { continue };
+                    if data == "null" {
+                        continue; // rejected/kill frame — keep waiting
+                    }
+                    self.ready.push_back(serde_json::from_str(data).context("frame is not JSON")?);
+                }
+            }
+            if !self.ready.is_empty() {
+                continue
+            }
+            match self.resp.chunk().await? {
+                Some(chunk) => self.buf.extend_from_slice(&chunk),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// The device flow once it is open: the key is staged, the stream is held, the code is issued.
+struct Opened {
+    frames: Frames,
+    code: String,
+    /// The frame carrying the code IS the moment the five-minute window opened.
+    deadline: tokio::time::Instant,
+    /// The app's ed25519 PUBLIC key from `Cli.registerKey`'s reply, so the session channel can
+    /// verify each frame's signature without the user configuring anything. `None` when the
+    /// registration failed.
+    sign_key: Option<String>,
+}
+
+/// Open the device flow: stage this install's key (`Cli.registerKey`), open the stream
+/// (`QR.request` — it reads what the first call staged, so in that order), and read as far as the
+/// frame carrying the user_code.
+async fn open_flow(client: reqwest::Client, base_url: String, device_code: String, staging: String) -> Result<Opened> {
+    // Best-effort: if it fails the login still completes, the session channel just isn't
+    // PQC-sealed.
+    let sign_key = async {
+        let res = client
+            .post(format!("{base_url}/transport/action/Cli/registerKey"))
+            .header("content-type", "application/json")
+            .body(staging)
+            .send()
+            .await
+            .ok()?;
+        let body: Value = serde_json::from_str(&res.text().await.ok()?).ok()?;
+        body.pointer("/data/signKey").and_then(Value::as_str).map(String::from)
+    }
+    .await;
+
+    let url = format!("{base_url}/transport/stream/QR/request?device={device_code}");
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let mut frames = Frames::new(resp);
+    while let Some(v) = frames.next().await? {
+        if let Some(code) = v.get("userCode").and_then(Value::as_str) {
+            let code = code.to_string();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+            return Ok(Opened { frames, code, deadline, sign_key })
+        }
+    }
+    Err(anyhow!("the stream closed before sign-in completed"))
+}
+
+/// The device flow as the sign-in menu holds it: OPENING IN THE BACKGROUND, awaited only by what
+/// needs it.
+///
+/// The menu's rows are decided by what is on this disk; only ACTING on a row needs the user_code.
+/// Opening the flow is two requests in sequence — measured 2026-10-01 against production: about
+/// 0.7 s each, 1.4 s during which nothing could be drawn — so it runs as its own task while the
+/// person reads the menu, and a row waits for it only when it has not finished by the time the
+/// row is picked. A failure to open is therefore reported when something first needs the code,
+/// not before the menu.
+struct Flow {
+    opening: Option<tokio::task::JoinHandle<Result<Opened>>>,
+    opened: Option<Opened>,
+}
+
+impl Flow {
+    fn start(client: reqwest::Client, base_url: &str, device_code: &str, staging: String) -> Self {
+        Self {
+            opening: Some(tokio::spawn(open_flow(client, base_url.to_string(), device_code.to_string(), staging))),
+            opened: None,
+        }
+    }
+
+    async fn opened(&mut self) -> Result<&mut Opened> {
+        if let Some(task) = self.opening.take() {
+            let opened = task.await.context("the sign-in could not be opened")??;
+            // Registration is no longer optional decoration. It stages the key QR.approve
+            // promotes AND the row that names this machine — so a silent failure here surfaces
+            // much later as a REPL that never reaches its prompt, because the channel declares a
+            // seal, no DEK is ever established, and the signed-but-unsealed frames that result are
+            // a shape the client cannot read. Say so here, where the cause still is the effect.
+            if opened.sign_key.is_none() {
+                println!(
+                    "  {} {}",
+                    crate::style::red("✗"),
+                    crate::style::dim("could not register this machine — the session channel will not be sealed"),
+                );
+            }
+            self.opened = Some(opened);
+        }
+        self.opened.as_mut().ok_or_else(|| anyhow!("the sign-in could not be opened"))
+    }
+
+    /// The user_code, waiting for the flow to open if it has not yet.
+    async fn code(&mut self) -> Result<String> {
+        Ok(self.opened().await?.code.clone())
+    }
+
+    async fn deadline(&mut self) -> Result<tokio::time::Instant> {
+        Ok(self.opened().await?.deadline)
+    }
+
+    /// The open flow itself — the stream the token will arrive on.
+    async fn into_opened(mut self) -> Result<Opened> {
+        self.opened().await?;
+        self.opened.take().ok_or_else(|| anyhow!("the sign-in could not be opened"))
+    }
+}
+
+/// A flow abandoned before it opened — a quit, or a restart that mints a new device_code — is
+/// stopped rather than left to finish for nobody.
+impl Drop for Flow {
+    fn drop(&mut self) {
+        if let Some(task) = &self.opening {
+            task.abort()
+        }
+    }
 }
 
 /// `Ok(true)` when a session was obtained, `Ok(false)` when the person declined — quitting the
@@ -184,186 +340,140 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
         .build()?;
-    // Register this install's PUBLIC key against the device_code — a POST body, never the
-    // URL: an ML-KEM-768 key is 1184 bytes (2368 hex chars) and has no business in a query
-    // string or an access log. Best-effort: if it fails the login still completes, the
-    // session channel just isn't PQC-sealed.
-    // The reply carries the app's ed25519 PUBLIC key, so the session channel can verify
-    // each frame's signature without the user configuring anything.
-    let sign_key = async {
-        let res = client
-            .post(format!("{base_url}/transport/action/Cli/registerKey"))
-            .header("content-type", "application/json")
-            // The hostname rides along as a LABEL — cosmetic, so a device list reads as
-            // machines rather than opaque ids. Never interpreted server-side.
+    // What `Cli.registerKey` is sent — this install's PUBLIC key against the device_code, in a
+    // POST body, never the URL: an ML-KEM-768 key is 1184 bytes (2368 hex chars) and has no
+    // business in a query string or an access log.
+    //
+    // The hostname rides along as a LABEL — cosmetic, so a device list reads as machines rather
+    // than opaque ids. Never interpreted server-side.
+    //
+    // `deviceId` is this machine's existing registration, when it has one. Sending it is what
+    // makes a re-login UPDATE the row rather than mint a second device; the server honours it
+    // only if that row already belongs to the account that authenticates, so it is a claim
+    // rather than a credential.
+    let staging = {
+        let mut b = serde_json::json!({
+            "device": device_code,
+            "pk": kem_pk.to_hex(),
+            "label": hostname(),
+            "os": os_label(),
+            "terminal": terminal_type(),
+        });
+        if let Some(id) = &prior_device_id {
+            b["deviceId"] = Value::String(id.clone());
+        }
+        // Omitted when there is none — the fence accepts absence and every read fails
+        // open, so a host with neither axis signs in exactly as before.
+        if let Some((fp, axes)) = crate::fingerprint::value() {
+            b["fingerprint"] = Value::String(fp);
+            b["fingerprintAxes"] = Value::String(axes.into());
+        }
+        b.to_string()
+    };
+
+    // THE MENU DOES NOT WAIT FOR THE SERVER. The flow opens in the background from here; what
+    // `choose_method` draws needs only this disk, and each row asks `flow` for the code when it
+    // acts (see `Flow`).
+    let mut flow = Flow::start(client.clone(), base_url, &device_code, staging);
+
+    // A machine that has signed in here before can approve its OWN device flow with an
+    // authenticator code instead of a phone. The flow itself is untouched — same device_code,
+    // same held stream, same QR.approve doing the mint and the key promotion. Only WHERE the
+    // approving session comes from changes: a code typed here rather than a passkey on a second
+    // screen. A path that FAILS falls through to the QR, so a fresh machine and a failed attempt
+    // land in the same place.
+    //
+    // DECLINING IS NOT FAILING, and this used to conflate them (2026-08-29). Esc, `q` and Ctrl-C
+    // returned the same `None` the wildcard swallowed, so asking to leave drew a QR code — the
+    // loudest possible answer to "no thanks". The picker now maps that to `Outcome::Quit`.
+    match choose_method(&client, base_url, &mut flow, method, resume_email.take()).await? {
+        Outcome::Approved => {}
+        Outcome::UseQr => render_qr(base_url, &flow.code().await?),
+        Outcome::Restart(email) => {
+            resume_email = Some(email);
+            continue 'flow
+        }
+        Outcome::Quit => return Ok(false),
+    }
+
+    // The same connection the code arrived on: once something approves the flow, `QR.approve`
+    // broadcasts the token to it.
+    let Opened { mut frames, sign_key, .. } = flow.into_opened().await?;
+    while let Some(v) = frames.next().await? {
+        if let Some(token) = v.get("token").and_then(Value::as_str) {
+            let user = v.get("user").and_then(Value::as_str).unwrap_or("");
+            // The registration the server just wrote or refreshed. Kept so the NEXT
+            // login names the same machine instead of registering a second one, and
+            // so `unregister` has a row to revoke rather than only a file to delete.
+            let device_id = v.get("deviceId").and_then(Value::as_str);
+            // THE GRANT CARRIES THE PROJECTION. `QR.approve` holds the user row
+            // and the minted expiry when it broadcasts, so it says both — this used to
+            // be a second round trip asking the server who we had just become.
+            // Falls back to asking only if a field is genuinely absent.
+            let email = v.get("email").and_then(Value::as_str).map(String::from);
+            let expires = v.get("expires").and_then(Value::as_i64);
+            let totp_enabled = v.get("totpEnabled").and_then(Value::as_bool);
+            let (email, expires, totp_enabled) = if expires.is_some() {
+                (email, expires, totp_enabled)
+            } else {
+                resolve_session(&client, base_url, token).await
+            };
+            save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id, totp_enabled)?;
+            // Two lines, because a login does two things: it authenticates you and
+            // it registers the machine. Naming the second is what makes the code
+            // option on the next run — and `auth unregister` — make sense.
+            println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.as_deref().unwrap_or(user)));
+            println!("  {}", crate::style::dim("cli registered · cloud (SOC 2 Type II)"));
+
+            // BOOTSTRAP, DONE ONCE AND INVISIBLY. Whichever path just signed this
+            // machine in, it now holds the one thing registering a passkey needs: a
+            // session. Doing it here is what makes the passkey a real option rather
+            // than a command someone has to know about — the NEXT sign-in can use it,
+            // on a machine whose owner never asked for one.
             //
-            // `deviceId` is this machine's existing registration, when it has one. Sending
-            // it is what makes a re-login UPDATE the row rather than mint a second device;
-            // the server honours it only if that row already belongs to the account that
-            // authenticates, so it is a claim rather than a credential.
-            .body({
-                let mut b = serde_json::json!({
-                    "device": device_code,
-                    "pk": kem_pk.to_hex(),
-                    "label": hostname(),
-                    "os": os_label(),
-                    "terminal": terminal_type(),
-                });
-                if let Some(id) = &prior_device_id {
-                    b["deviceId"] = Value::String(id.clone());
-                }
-                // Omitted when there is none — the fence accepts absence and every read fails
-                // open, so a host with neither axis signs in exactly as before.
-                if let Some((fp, axes)) = crate::fingerprint::value() {
-                    b["fingerprint"] = Value::String(fp);
-                    b["fingerprintAxes"] = Value::String(axes.into());
-                }
-                b.to_string()
-            })
-            .send()
-            .await
-            .ok()?;
-        let body: Value = serde_json::from_str(&res.text().await.ok()?).ok()?;
-        body.pointer("/data/signKey").and_then(Value::as_str).map(String::from)
-    }
-    .await;
-
-    // Registration is no longer optional decoration. It stages the key QR.approve
-    // promotes AND the row that names this machine — so a silent failure here surfaces
-    // much later as a REPL that never reaches its prompt, because the channel declares a
-    // seal, no DEK is ever established, and the signed-but-unsealed frames that result are
-    // a shape the client cannot read. Say so here, where the cause still is the effect.
-    if sign_key.is_none() {
-        println!(
-            "  {} {}",
-            crate::style::red("✗"),
-            crate::style::dim("could not register this machine — the session channel will not be sealed"),
-        );
-    }
-
-    let url = format!("{base_url}/transport/stream/QR/request?device={device_code}");
-    let resp = client.get(&url).send().await?.error_for_status()?;
-
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut qr_shown = false;
-
-    while let Some(chunk) = stream.next().await {
-        buf.extend_from_slice(&chunk?);
-        // SSE frames are separated by a blank line.
-        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-            let raw: Vec<u8> = buf.drain(..pos + 2).collect();
-            for line in std::str::from_utf8(&raw)?.lines() {
-                let Some(data) = line.strip_prefix("data: ") else { continue };
-                if data == "null" {
-                    continue; // rejected/kill frame — keep waiting
-                }
-                let v: Value = serde_json::from_str(data).context("frame is not JSON")?;
-                if let Some(code) = v.get("userCode").and_then(Value::as_str) {
-                    if !qr_shown {
-                        qr_shown = true;
-                        // A machine that has signed in here before can approve its OWN
-                        // device flow with an authenticator code instead of a phone. The
-                        // flow itself is untouched — same device_code, same held stream,
-                        // same QR.approve doing the mint and the key promotion. Only
-                        // WHERE the approving session comes from changes: a code typed
-                        // here rather than a passkey on a second screen. A path that
-                        // FAILS falls through to the QR, so a fresh machine and a failed
-                        // attempt land in the same place.
-                        //
-                        // DECLINING IS NOT FAILING, and this used to conflate them
-                        // (2026-08-29). Esc, `q` and Ctrl-C returned the same `None` the
-                        // wildcard swallowed, so asking to leave drew a QR code — the
-                        // loudest possible answer to "no thanks". The picker now maps
-                        // that to `Outcome::Quit`.
-                        // The frame carrying the code IS the moment the window opened.
-                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-                        match choose_method(&client, base_url, code, method, deadline, resume_email.take()).await? {
-                            Outcome::Approved => {}
-                            Outcome::UseQr => render_qr(base_url, code),
-                            Outcome::Restart(email) => {
-                                resume_email = Some(email);
-                                continue 'flow
-                            }
-                            Outcome::Quit => return Ok(false),
-                        }
-                    }
-                } else if let Some(token) = v.get("token").and_then(Value::as_str) {
-                    let user = v.get("user").and_then(Value::as_str).unwrap_or("");
-                    // The registration the server just wrote or refreshed. Kept so the NEXT
-                    // login names the same machine instead of registering a second one, and
-                    // so `unregister` has a row to revoke rather than only a file to delete.
-                    let device_id = v.get("deviceId").and_then(Value::as_str);
-                    // THE GRANT CARRIES THE PROJECTION. `QR.approve` holds the user row
-                    // and the minted expiry when it broadcasts, so it says both — this used to
-                    // be a second round trip asking the server who we had just become.
-                    // Falls back to asking only if a field is genuinely absent.
-                    let email = v.get("email").and_then(Value::as_str).map(String::from);
-                    let expires = v.get("expires").and_then(Value::as_i64);
-                    let totp_enabled = v.get("totpEnabled").and_then(Value::as_bool);
-                    let (email, expires, totp_enabled) = if expires.is_some() {
-                        (email, expires, totp_enabled)
-                    } else {
-                        resolve_session(&client, base_url, token).await
-                    };
-                    save_credentials(base_url, token, user, email.as_deref(), expires, &kem_sk.to_hex(), sign_key.as_deref(), device_id, totp_enabled)?;
-                    // Two lines, because a login does two things: it authenticates you and
-                    // it registers the machine. Naming the second is what makes the code
-                    // option on the next run — and `auth unregister` — make sense.
-                    println!("\n  {} signed in as {}", crate::style::green("✓"), crate::style::bold(email.as_deref().unwrap_or(user)));
-                    println!("  {}", crate::style::dim("cli registered · cloud (SOC 2 Type II)"));
-
-                    // BOOTSTRAP, DONE ONCE AND INVISIBLY. Whichever path just signed this
-                    // machine in, it now holds the one thing registering a passkey needs: a
-                    // session. Doing it here is what makes the passkey a real option rather
-                    // than a command someone has to know about — the NEXT sign-in can use it,
-                    // on a machine whose owner never asked for one.
-                    //
-                    // Best-effort and quiet: a sign-in must not fail because a convenience
-                    // did, and the paths that already work are unaffected either way.
-                    if !crate::passkey::is_registered() {
-                        if let Err(e) = crate::passkey::register(base_url, true).await {
-                            println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string()));
-                        }
-                    }
-
-                    // WHAT THIS MACHINE HOLDS, said every time — not only when it changed. The
-                    // passkey line used to print solely on the run that created one, so every
-                    // later sign-in was silent about it and there was no way to tell a machine
-                    // that has one from a machine that never got one. A sign-in should state
-                    // where you stand, not just what happened in the last few seconds.
-                    if crate::passkey::is_registered() {
-                        println!(
-                "  {}",
-                crate::style::dim(if crate::passkey::gate_armed() {
-                    "passkey registered · Secure Enclave"
-                } else {
-                    "passkey registered · On Device (P-256)"
-                }),
-            );
-                    }
-                    if totp_enabled == Some(true) {
-                        println!("  {}", crate::style::dim("authenticator registered"));
-                    }
-
-                    // AFTER the registration, not before — that is what creates passkey.json.
-                    // Writing the id earlier found no file and silently did nothing, which left
-                    // the id only in the session file and defeated the point of moving it.
-                    if let Some(id) = device_id {
-                        let _ = crate::passkey::save_device_id(id);
-                    }
-
-                    // THE CHALLENGE THAT MAKES THE NEXT LOGIN ONE CALL. Handed over on this
-                    // grant precisely because the machine has just proved itself and been
-                    // enrolled; storing it here is what arms `quick_login` above. Best-effort —
-                    // without it the next run simply takes this same path again.
-                    if let Some(next) = v.get("nextChallenge").and_then(Value::as_str) {
-                        let _ = crate::passkey::save_next_challenge(next);
-                    }
-
-                    return Ok(true);
+            // Best-effort and quiet: a sign-in must not fail because a convenience
+            // did, and the paths that already work are unaffected either way.
+            if !crate::passkey::is_registered() {
+                if let Err(e) = crate::passkey::register(base_url, true).await {
+                    println!("  {} {}", crate::style::dim("no passkey registered:"), crate::style::dim(&e.to_string()));
                 }
             }
+
+            // WHAT THIS MACHINE HOLDS, said every time — not only when it changed. The
+            // passkey line used to print solely on the run that created one, so every
+            // later sign-in was silent about it and there was no way to tell a machine
+            // that has one from a machine that never got one. A sign-in should state
+            // where you stand, not just what happened in the last few seconds.
+            if crate::passkey::is_registered() {
+                println!(
+        "  {}",
+        crate::style::dim(if crate::passkey::gate_armed() {
+            "passkey registered · Secure Enclave"
+        } else {
+            "passkey registered · On Device (P-256)"
+        }),
+    );
+            }
+            if totp_enabled == Some(true) {
+                println!("  {}", crate::style::dim("authenticator registered"));
+            }
+
+            // AFTER the registration, not before — that is what creates passkey.json.
+            // Writing the id earlier found no file and silently did nothing, which left
+            // the id only in the session file and defeated the point of moving it.
+            if let Some(id) = device_id {
+                let _ = crate::passkey::save_device_id(id);
+            }
+
+            // THE CHALLENGE THAT MAKES THE NEXT LOGIN ONE CALL. Handed over on this
+            // grant precisely because the machine has just proved itself and been
+            // enrolled; storing it here is what arms `quick_login` above. Best-effort —
+            // without it the next run simply takes this same path again.
+            if let Some(next) = v.get("nextChallenge").and_then(Value::as_str) {
+                let _ = crate::passkey::save_next_challenge(next);
+            }
+
+            return Ok(true);
         }
     }
     return Err(anyhow!("the stream closed before sign-in completed"))
@@ -507,16 +617,16 @@ pub async fn unregister() -> Result<()> {
 async fn choose_method(
     client: &reqwest::Client,
     base_url: &str,
-    user_code: &str,
+    flow: &mut Flow,
     method: Option<Method>,
-    deadline: tokio::time::Instant,
     resume_email: Option<String>,
 ) -> Result<Outcome> {
     // A RESTART RE-ENTERS THE EMAIL PATH DIRECTLY — the person already chose it. An EMPTY
     // string means they had not reached the address prompt yet, so there is nothing to prefill.
     if let Some(email) = resume_email {
         let prefill = (!email.is_empty()).then_some(email);
-        return email_approve(client, base_url, user_code, deadline, prefill).await
+        let (user_code, deadline) = (flow.code().await?, flow.deadline().await?);
+        return email_approve(client, base_url, &user_code, deadline, prefill).await
     }
     if matches!(method, Some(Method::Qr)) {
         return Ok(Outcome::UseQr)
@@ -549,14 +659,15 @@ async fn choose_method(
     }
 
     if matches!(method, Some(Method::Passkey)) {
-        return Ok(as_outcome(passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await?))
+        return Ok(as_outcome(passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Active).await?))
     }
     if matches!(method, Some(Method::Email)) {
-        return email_approve(client, base_url, user_code, deadline, None).await
+        let (user_code, deadline) = (flow.code().await?, flow.deadline().await?);
+        return email_approve(client, base_url, &user_code, deadline, None).await
     }
     if matches!(method, Some(Method::Totp)) {
         let Some(user) = &user else { return Ok(Outcome::UseQr) };
-        return Ok(as_outcome(totp_approve(client, base_url, user_code, user).await?))
+        return Ok(as_outcome(totp_approve(client, base_url, &flow.code().await?, user).await?))
     }
 
     // A REGISTERED MACHINE JUST SIGNS IN. Holding a credential the server already knows is
@@ -572,7 +683,7 @@ async fn choose_method(
     // spot, and the person decides when to stop trying.
     let mut machine_key_refused = false;
     if can_passkey {
-        if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
+        if passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Active).await? {
             return Ok(Outcome::Approved)
         }
         can_passkey = false;
@@ -628,7 +739,7 @@ async fn choose_method(
     let mut expanded = false;
     loop {
         // The picker takes over the terminal, so it runs OFF the async runtime — crossterm's
-        // event::read blocks, and this task is holding the SSE connection open.
+        // event::read blocks, and the device flow is opening on this runtime meanwhile.
         let (h, was) = (header.clone(), expanded);
         let (picked, now) = tokio::task::spawn_blocking(move || {
             let mut e = was;
@@ -661,7 +772,7 @@ async fn choose_method(
                     // Watch found, but there is no credential in the gated slot to assert with.
                     return Ok(Outcome::UseQr)
                 }
-                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
+                if passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Active).await? {
                     return Ok(Outcome::Approved)
                 }
                 // The ✗ and its reason were just printed by the attempt itself — nothing to
@@ -670,7 +781,7 @@ async fn choose_method(
                 continue
             }
             Some(Row::OnDevice) => {
-                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Software).await? {
+                if passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Software).await? {
                     // Picking the on-device key while the Watch is required steps the requirement
                     // down, so the next run does not block again (user, 2026-09-25). Best-effort:
                     // a sign-in must not fail because the preference write did.
@@ -683,7 +794,7 @@ async fn choose_method(
                 continue
             }
             Some(Row::Go(Method::Totp)) => match &user {
-                Some(u) => Ok(as_outcome(totp_approve(client, base_url, user_code, u).await?)),
+                Some(u) => Ok(as_outcome(totp_approve(client, base_url, &flow.code().await?, u).await?)),
                 None => Ok(Outcome::UseQr),
             },
             // MINT A FRESH WINDOW FIRST. The five minutes started when QR.request issued this
@@ -694,16 +805,17 @@ async fn choose_method(
             // sheet or a refused passkey comes back to the menu, as the on-device row does:
             // declining is not failing, and opening a browser after a "no" would answer it loudly.
             Some(Row::Go(Method::Browser)) => {
+                let user_code = flow.code().await?;
                 #[cfg(target_os = "macos")]
-                match system_approve(client, base_url, user_code).await? {
+                match system_approve(client, base_url, &user_code).await? {
                     Some(true) => return Ok(Outcome::Approved),
                     Some(false) => continue,
                     None => {}
                 }
-                Ok(as_outcome(browser_approve(base_url, user_code)?))
+                Ok(as_outcome(browser_approve(base_url, &user_code)?))
             }
             Some(Row::Go(Method::Passkey)) => {
-                if passkey_approve(client, base_url, user_code, crate::passkey::Slot::Active).await? {
+                if passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Active).await? {
                     return Ok(Outcome::Approved)
                 }
                 continue
