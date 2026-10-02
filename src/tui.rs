@@ -514,6 +514,7 @@ fn headset_label(parser: &BrainWaveParser) -> String {
         Some(crate::HeadsetState::Streaming) => "streaming".to_string(),
         Some(crate::HeadsetState::NoData) => "open, no ThinkGear data".to_string(),
         Some(crate::HeadsetState::Closed) => "disconnected — M › Headset".to_string(),
+        Some(crate::HeadsetState::InUse(why)) => why.clone(),
         Some(crate::HeadsetState::Failed(e)) => format!("failed: {e}"),
         Some(crate::HeadsetState::Missing) | None => String::new(),
     }

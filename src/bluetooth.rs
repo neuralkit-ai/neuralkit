@@ -119,6 +119,8 @@ pub struct Headset {
     last_status: i32,
     /// Why it gave up, once it has; `poll` keeps reporting it.
     failed: Option<String>,
+    /// `headset.lock`, held from `open` until the channel closes or fails.
+    lock: Option<std::fs::File>,
 }
 
 /// How long an open may stay unanswered. IOBluetooth never answers an asynchronous open to a
@@ -182,9 +184,50 @@ pub fn named(name: &str) -> Option<(String, String)> {
     serial_devices().into_iter().find(|(n, _)| n == name)
 }
 
+/// `headset.lock`, beside the remembered headset: held by whichever process connects to or reads
+/// a headset. One reader per headset is how the headset behaves — measured 2026-10-02 with the
+/// NeuroSky: while the CLI held its channel, a second open was refused (0xe00002bc after ~3 s) or,
+/// opened asynchronously, never answered in 40 s, and the first reader was undisturbed. The lock
+/// tells a second app at once instead, and its contents say where the holder publishes (the MoQ
+/// relay and broadcast path), so that app — the dash — shows itself as a viewer and subscribes to
+/// the NeuroFrame and NeuroPacket tracks rather than open the headset. Released by the kernel on
+/// any exit, as relay.lock is.
+fn lock_file() -> Option<String> {
+    Some(format!("{}/.config/neuralkit/headset.lock", std::env::var("HOME").ok()?))
+}
+
+/// Takes `headset.lock`, or reports that another process holds it as `ErrorKind::ResourceBusy`,
+/// naming the relay it publishes to.
+fn take_lock() -> io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = lock_file().ok_or_else(|| io::Error::other("HOME not set"))?;
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // What an earlier holder left before it died is not this reader's.
+        lock.set_len(0)?;
+        return Ok(lock);
+    }
+    let relay = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["relay"].as_str().map(str::to_string));
+    Err(io::Error::new(
+        io::ErrorKind::ResourceBusy,
+        match relay {
+            Some(relay) => format!("in use by another app — publishing to {relay}"),
+            None => "in use by another app".to_string(),
+        },
+    ))
+}
+
 /// Starts opening the serial channel of the paired device at `address`, its bytes to go into
-/// `tx`. Returns at once; `poll` says when it opens.
+/// `tx`. Returns at once; `poll` says when it opens. Takes `headset.lock` first, so a headset
+/// another app is reading is reported at once rather than refused seconds later.
 pub fn open(address: &str, tx: UnboundedSender<Vec<u8>>) -> io::Result<Headset> {
+    let lock = take_lock()?;
     let device = paired()
         .into_iter()
         .find(|d| self::address(d) == address)
@@ -199,6 +242,7 @@ pub fn open(address: &str, tx: UnboundedSender<Vec<u8>>) -> io::Result<Headset> 
         asked: Instant::now(),
         last_status: 0,
         failed: None,
+        lock: Some(lock),
     };
     if headset.untried.is_empty() {
         // Paired just now: no records stored yet. Ask for them; `poll` waits for the answer.
@@ -243,6 +287,23 @@ impl Headset {
         }
     }
 
+    /// Where this reader publishes — the MoQ relay and the broadcast path — written into
+    /// `headset.lock` for another app to subscribe to. Called again when the relay is switched.
+    pub fn publishing(&self, relay: &str, path: &str) {
+        if let Some(lock) = &self.lock {
+            let contents = serde_json::json!({ "relay": relay, "path": path }).to_string();
+            let _ = lock.set_len(0);
+            let _ = std::os::unix::fs::FileExt::write_all_at(lock, contents.as_bytes(), 0);
+        }
+    }
+
+    /// Frees the headset for another app: empties `headset.lock` and lets it go.
+    fn unlock(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.set_len(0);
+        }
+    }
+
     /// Where the channel stands. Call after `pump`: the records, the open's result and a close
     /// arrive there.
     pub fn poll(&mut self) -> Link {
@@ -278,7 +339,10 @@ impl Headset {
                 self.tx = None;
                 Link::Open
             }
-            (Some(0), true) => Link::Closed,
+            (Some(0), true) => {
+                self.unlock();
+                Link::Closed
+            }
             // Refused, or closed before it opened: try the next channel.
             (status, _) => {
                 self.last_status = status.unwrap_or(self.last_status);
@@ -294,6 +358,7 @@ impl Headset {
     /// Gives up: lets go of the attempt and keeps the reason for every later `poll`.
     fn fail(&mut self, why: String) -> Link {
         self.release();
+        self.unlock();
         self.failed = Some(why.clone());
         Link::Failed(why)
     }
@@ -304,6 +369,7 @@ impl Drop for Headset {
     fn drop(&mut self) {
         self.release();
         unsafe { self.device.closeConnection() };
+        self.unlock();
     }
 }
 

@@ -74,6 +74,9 @@ pub enum HeadsetState {
     /// Open, but no ThinkGear frame for a few seconds.
     NoData,
     Closed,
+    /// Another app holds `headset.lock`: it is reading this headset, and the message says where
+    /// it publishes (bluetooth.rs).
+    InUse(String),
     Failed(String),
 }
 
@@ -1389,10 +1392,6 @@ async fn sign_in_flow(
     Ok(())
 }
 
-/// The TUI dashboard — extracted from `main`'s tail so the REPL's `dash` command opens
-/// the SAME thing bare `neuralkit` runs, with the same args the process started with.
-/// Owns the whole terminal (raw mode + alternate screen) for its lifetime; every exit
-/// path restores it, which is what lets a REPL prompt survive on the other side.
 /// No headset at `port_name`, and the dashboard has not taken the terminal yet. The raw io::Error
 /// Debug-dump named neither the port nor a way out: say WHICH device failed, keep the OS's
 /// reason, and hand over the two no-hardware paths instead of a struct.
@@ -1511,6 +1510,10 @@ fn feed_frames(parser: &mut BrainWaveParser, stream: &mut Vec<u8>) -> usize {
     fed
 }
 
+/// The TUI dashboard — extracted from `main`'s tail so the REPL's `dash` command opens
+/// the SAME thing bare `neuralkit` runs, with the same args the process started with.
+/// Owns the whole terminal (raw mode + alternate screen) for its lifetime; every exit
+/// path restores it, which is what lets a REPL prompt survive on the other side.
 async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = BrainWaveParser::new();
     parser.synthetic = args.synthetic;
@@ -1586,6 +1589,9 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // When the headset last delivered a frame, and when its channel opened — for "no data".
     #[cfg(target_os = "macos")]
     let (mut headset_heard, mut headset_open_at): (Option<Instant>, Option<Instant>) = (None, None);
+    // The relay last written into headset.lock — rewritten when M › Relay switches it.
+    #[cfg(target_os = "macos")]
+    let mut published: Option<String> = None;
 
     // 4. Serial Port Setup (only for Publisher, non-synthetic, a port named, and not a Bluetooth
     // headset)
@@ -1653,9 +1659,11 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                             headset = Some(h);
                             headset_rx = Some(rx);
                             (headset_heard, headset_open_at) = (None, None);
+                            published = None;
                             bluetooth::remember(&row.address);
                             HeadsetState::Connecting
                         }
+                        Err(e) if e.kind() == io::ErrorKind::ResourceBusy => HeadsetState::InUse(e.to_string()),
                         Err(e) => HeadsetState::Failed(e.to_string()),
                     }
                 } else {
@@ -1667,6 +1675,16 @@ async fn run_dashboard(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => HeadsetState::Failed(e.to_string()),
                     }
                 });
+            }
+
+            // Where this reader publishes, in headset.lock: on open, and again when the relay is
+            // switched, so an app finding the headset in use subscribes to the right broadcast.
+            if let Some(h) = &headset {
+                let relay = parser.sel.url();
+                if published.as_deref() != Some(relay.as_str()) {
+                    h.publishing(&relay, &args.stream_path);
+                    published = Some(relay);
+                }
             }
 
             // The panel asked for a search (opening it, or S): a fresh one replaces the last.

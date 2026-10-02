@@ -67,7 +67,7 @@ impl Selection {
         }
     }
     /// The currently-selected relay URL (from the RELAYS table).
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         let i = self
             .relay
             .load(Ordering::Relaxed)

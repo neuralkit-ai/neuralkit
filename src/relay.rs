@@ -14,8 +14,8 @@
 //!                a service manager owns its process, so no self-detaching here.
 //!
 //! One flock covers every face, so there is exactly one relay however it was started.
-//! Deliberately NOT a child of the status tray; folding the fleet under one icon is the
-//! desktop app's job, when it exists.
+//! Deliberately NOT a child of the status tray, and not the desktop app's to take over
+//! either — this icon's Quit stays the stop.
 
 use anyhow::{Context, Result};
 
