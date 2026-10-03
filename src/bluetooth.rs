@@ -194,7 +194,7 @@ const APP_GROUP: &str = "SBG7YFF24U.neuralkit";
 /// NeuroSky: while the CLI held its channel, a second open was refused (0xe00002bc after ~3 s) or,
 /// opened asynchronously, never answered in 40 s, and the first reader was undisturbed. The lock
 /// tells a second app at once instead, and its contents say where the holder publishes (the MoQ
-/// relay and broadcast path), so that app — the dash — shows itself as a viewer and subscribes to
+/// relay and broadcast path), so that app — the desktop app — shows itself as a viewer and subscribes to
 /// the NeuroFrame and NeuroPacket tracks rather than open the headset. Released by the kernel on
 /// any exit, as relay.lock is. The container comes from Foundation, as Apple requires for it to
 /// open without the system asking the person (macOS 15's app group container protection).
