@@ -26,5 +26,15 @@
 	<array>
 		<string>webcredentials:neuralkit.ai</string>
 	</array>
+	<!-- The app group shared with the desktop app: its container holds headset.lock, one reader
+	     per headset, where the App Store build — sandboxed — can reach it too (~/.config is refused
+	     to a sandbox). Since macOS 15 even an unsandboxed app must claim the group to open its
+	     container without the system asking. Team-prefixed, so it needs no registration; both
+	     profiles authorise SBG7YFF24U.* (decoded 2026-10-03, after App Groups was enabled on the
+	     App ID). -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>SBG7YFF24U.neuralkit</string>
+	</array>
 </dict>
 </plist>

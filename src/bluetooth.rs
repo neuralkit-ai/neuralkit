@@ -184,23 +184,32 @@ pub fn named(name: &str) -> Option<(String, String)> {
     serial_devices().into_iter().find(|(n, _)| n == name)
 }
 
-/// `headset.lock`, beside the remembered headset: held by whichever process connects to or reads
+/// The app group the CLI shares with the desktop app — both signed by team SBG7YFF24U, both
+/// claiming it in their entitlements. Its container is the one folder a sandboxed app (the App
+/// Store build) and this unsandboxed one can both open; `~/.config` is refused to the sandbox.
+const APP_GROUP: &str = "SBG7YFF24U.neuralkit";
+
+/// `headset.lock`, in the app group's container: held by whichever process connects to or reads
 /// a headset. One reader per headset is how the headset behaves — measured 2026-10-02 with the
 /// NeuroSky: while the CLI held its channel, a second open was refused (0xe00002bc after ~3 s) or,
 /// opened asynchronously, never answered in 40 s, and the first reader was undisturbed. The lock
 /// tells a second app at once instead, and its contents say where the holder publishes (the MoQ
 /// relay and broadcast path), so that app — the dash — shows itself as a viewer and subscribes to
 /// the NeuroFrame and NeuroPacket tracks rather than open the headset. Released by the kernel on
-/// any exit, as relay.lock is.
+/// any exit, as relay.lock is. The container comes from Foundation, as Apple requires for it to
+/// open without the system asking the person (macOS 15's app group container protection).
 fn lock_file() -> Option<String> {
-    Some(format!("{}/.config/neuralkit/headset.lock", std::env::var("HOME").ok()?))
+    use objc2_foundation::NSFileManager;
+    let container = NSFileManager::defaultManager()
+        .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(APP_GROUP))?;
+    Some(format!("{}/headset.lock", container.path()?))
 }
 
 /// Takes `headset.lock`, or reports that another process holds it as `ErrorKind::ResourceBusy`,
 /// naming the relay it publishes to.
 fn take_lock() -> io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd as _;
-    let path = lock_file().ok_or_else(|| io::Error::other("HOME not set"))?;
+    let path = lock_file().ok_or_else(|| io::Error::other(format!("no container for the app group {APP_GROUP}")))?;
     if let Some(dir) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(dir)?;
     }
