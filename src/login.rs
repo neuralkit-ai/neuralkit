@@ -107,13 +107,13 @@ struct Opened {
     code: String,
     /// The frame carrying the code IS the moment the five-minute window opened.
     deadline: tokio::time::Instant,
-    /// The app's ed25519 PUBLIC key from `Cli.registerKey`'s reply, so the session channel can
+    /// The app's ed25519 PUBLIC key from `Cli.loginIdentity`'s reply, so the session channel can
     /// verify each frame's signature without the user configuring anything. `None` when the
     /// registration failed.
     sign_key: Option<String>,
 }
 
-/// Open the device flow: stage this install's key (`Cli.registerKey`), open the stream
+/// Open the device flow: send this install's identity (`Cli.loginIdentity`), open the stream
 /// (`QR.request` — it reads what the first call staged, so in that order), and read as far as the
 /// frame carrying the user_code.
 async fn open_flow(client: reqwest::Client, base_url: String, device_code: String, staging: String) -> Result<Opened> {
@@ -121,7 +121,7 @@ async fn open_flow(client: reqwest::Client, base_url: String, device_code: Strin
     // PQC-sealed.
     let sign_key = async {
         let res = client
-            .post(format!("{base_url}/transport/action/Cli/registerKey"))
+            .post(format!("{base_url}/transport/action/Cli/loginIdentity"))
             .header("content-type", "application/json")
             .body(staging)
             .send()
@@ -322,7 +322,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
     let mut dc = [0u8; 32];
     getrandom::getrandom(&mut dc).map_err(|e| anyhow!("rng: {e}"))?;
     let device_code = to_hex(&dc);
-    // Fresh per attempt: `registerKey` stages the public half against THIS device_code.
+    // Fresh per attempt: `loginIdentity` writes the public half against THIS device_code.
     let (kem_pk, kem_sk) = ml_kem::generate().map_err(|e| anyhow!("ml-kem generate: {e}"))?;
 
     // The registration this machine already holds, if any. A fresh keypair every login
@@ -340,7 +340,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
         .build()?;
-    // What `Cli.registerKey` is sent — this install's PUBLIC key against the device_code, in a
+    // What `Cli.loginIdentity` is sent — this install's PUBLIC key against the device_code, in a
     // POST body, never the URL: an ML-KEM-768 key is 1184 bytes (2368 hex chars) and has no
     // business in a query string or an access log.
     //
@@ -1660,7 +1660,7 @@ pub(crate) fn qr_art(data: &str) -> Option<String> {
 
 fn render_qr(base_url: &str, code: &str) {
     // /qr, not /passkey. The authorization screen is its own surface: it resolves the code
-    // server-side, NAMES the machine that is waiting from what registerKey staged, and offers
+    // server-side, NAMES the machine that is waiting from what loginIdentity sent, and offers
     // only routes that need no typing — a button when already signed in, a biometric when this
     // phone holds a credential. /passkey is a test surface and stays one.
     let url = format!("{base_url}/qr?code={code}");
