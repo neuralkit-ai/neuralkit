@@ -620,8 +620,8 @@ pub(crate) fn http(base_url: &str) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().danger_accept_invalid_certs(insecure).build()?)
 }
 
-/// The session this machine already holds. Registration needs one: `registerStart` binds the
-/// ceremony to whoever is signed in AT THAT MOMENT, and with no session it would mint a fresh
+/// The session this machine already holds. Enrollment needs one: `enrollStart` binds the
+/// challenge to whoever is signed in AT THAT MOMENT, and with no session it would mint a fresh
 /// unrelated account instead of attaching to yours.
 pub(crate) fn session_token() -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -656,7 +656,7 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
     // 1. A challenge, bound server-side to the account this session belongs to.
     let start: Value = serde_json::from_str(
         &client
-            .post(format!("{base_url}/transport/action/Passkey/registerStart"))
+            .post(format!("{base_url}/transport/action/Passkey/enrollStart"))
             .header("content-type", "application/json")
             .header("cookie", &cookie)
             .body("{}")
@@ -666,16 +666,16 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
             .await?,
     )?;
     if let Some(m) = start.pointer("/error/message").and_then(Value::as_str) {
-        return Err(anyhow!("registerStart: {m}"))
+        return Err(anyhow!("enrollStart: {m}"))
     }
     let challenge = start
         .pointer("/data/challenge")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("registerStart returned no challenge: {start}"))?;
+        .ok_or_else(|| anyhow!("enrollStart returned no challenge: {start}"))?;
     let rp_id = start
         .pointer("/data/rp/id")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("registerStart returned no rp.id"))?;
+        .ok_or_else(|| anyhow!("enrollStart returned no rp.id"))?;
     if !quiet {
         println!("  {}  {}", crate::style::dim(&format!("{:<13}", "challenge")), crate::style::dim("issued"));
     }
@@ -693,7 +693,7 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
     //    `aaguid`'s job, which is the field WebAuthn already has for naming an authenticator
     //    model, and the attestation carries ours.
     let finish_res = client
-            .post(format!("{base_url}/transport/action/Passkey/registerFinish"))
+            .post(format!("{base_url}/transport/action/Passkey/enrollFinish"))
             .header("content-type", "application/json")
             .header("cookie", &cookie)
             .body(
@@ -707,14 +707,14 @@ pub async fn register(base_url: &str, quiet: bool) -> Result<()> {
             )
             .send()
             .await?;
-    // registerFinish declares `mint: [session]`, so a successful registration hands back a
+    // enrollFinish declares `mint: [session]`, so a successful enrollment hands back a
     // SECOND session. The caller already holds the one it wants — the one QR.approve
     // minted, which has this install's key promoted onto it — so this one is released rather
     // than kept, the same discipline the authenticator-code path follows.
     let minted = session_cookie(&finish_res);
     let finish: Value = serde_json::from_str(&finish_res.text().await?)?;
     if let Some(m) = finish.pointer("/error/message").and_then(Value::as_str) {
-        return Err(anyhow!("registerFinish: {m}"))
+        return Err(anyhow!("enrollFinish: {m}"))
     }
     let user_id = finish.pointer("/data/userId").and_then(Value::as_str).unwrap_or("").to_string();
     if let Some(t) = minted {
