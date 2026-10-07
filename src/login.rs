@@ -1090,7 +1090,7 @@ pub(crate) fn select(header: &str, options: &[&str]) -> Result<Option<usize>> {
 ///
 /// So this is two ordinary calls, not a new mechanism: sign in with the code, then perform
 /// the SAME approval step the phone performs. `QR.approve` still does the minting and
-/// still promotes `cli:pk:code:<device>` onto the token it mints, which is why the command
+/// still promotes `qr:machine:<device>` onto the token it mints, which is why the command
 /// channel comes up sealed exactly as it does after a scan.
 ///
 /// `Ok(false)` for every "nothing to try" case — no file, no id, a blank line, a refused
