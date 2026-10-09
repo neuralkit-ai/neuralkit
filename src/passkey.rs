@@ -14,9 +14,10 @@
 //! every session, and only `auth unregister` removes it.
 //!
 //! TWO KEYS, CHOSEN BY THE GATE. With no gate the key is an ordinary in-process P-256 key in
-//! passkey.json, the same class of secret as the ML-KEM secret beside the token. With a gate
-//! chosen (the tray's checkbox, or `NEURALKIT_ENCLAVE=1`) it is a Secure Enclave key behind Apple
-//! Watch or Touch ID (`phaze_auth::enclave`) — persistable only by the signed `.app`, because an
+//! passkey.json, the same class of secret as the ML-KEM secret beside the token. With Apple
+//! biometric unlock chosen (the tray's Apple Watch and Touch ID boxes, or `NEURALKIT_ENCLAVE=1`)
+//! it is a Secure Enclave key behind the Watch, Touch ID, or either, as ticked
+//! (`phaze_auth::enclave`) — persistable only by the signed `.app`, because an
 //! access control on a persisted key needs a provisioning profile, which `cargo run` does not
 //! produce. Both sit behind the `Signer` trait, so nothing below knows which answered, and each
 //! keeps its own registration slot (`cred_field`).
@@ -57,12 +58,36 @@ fn stored_gate() -> Option<phaze_auth::enclave::Gate> {
     }
     let raw = std::fs::read_to_string(path().ok()?).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    match v.get("gate")?.as_str()? {
-        "biometry_or_watch" => Some(Gate::BiometryOrWatch),
-        "user_presence" => Some(Gate::UserPresence),
-        "device_passcode" => Some(Gate::DevicePasscode),
-        _ => None,
-    }
+    let name = v.get("gate")?.as_str()?;
+    GATES.iter().find(|(n, _)| *n == name).map(|(_, g)| *g)
+}
+
+/// The `gate` field's values and what each accepts. The tray writes the first three — its Apple
+/// Watch box, its Touch ID box, both — and the same name is recorded as `enclave_gate` beside the
+/// Secure Enclave key it was made for (`set_gate`).
+#[cfg(target_os = "macos")]
+const GATES: [(&str, phaze_auth::enclave::Gate); 5] = [
+    ("watch", phaze_auth::enclave::Gate::Watch),
+    ("biometry", phaze_auth::enclave::Gate::Biometry),
+    ("biometry_or_watch", phaze_auth::enclave::Gate::BiometryOrWatch),
+    ("user_presence", phaze_auth::enclave::Gate::UserPresence),
+    ("device_passcode", phaze_auth::enclave::Gate::DevicePasscode),
+];
+
+/// Whether the owner chose Touch ID alone — the one choice whose retry is not about a Watch.
+#[cfg(target_os = "macos")]
+fn touch_id_only() -> bool {
+    stored_gate() == Some(phaze_auth::enclave::Gate::Biometry)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn touch_id_only() -> bool {
+    false
+}
+
+/// The sign-in menu's retry row, named for what the owner chose to unlock with.
+pub(crate) fn retry_row() -> &'static str {
+    if touch_id_only() { "connect Touch ID" } else { "connect to Apple Watch" }
 }
 
 /// Whether a hardware gate is CHOSEN on this machine — nothing about whether it can be
@@ -99,20 +124,27 @@ fn enclave_gate() -> Result<Option<phaze_auth::enclave::Gate>> {
     let c = phaze_auth::enclave::capabilities().unwrap_or_default();
     let usable = match gate {
         Gate::BiometryOrWatch => c.biometrics_or_watch,
+        Gate::Watch => c.watch,
+        Gate::Biometry => c.biometrics,
         Gate::UserPresence | Gate::DevicePasscode => c.device_owner,
         _ => false,
     };
     if usable {
         return Ok(Some(gate))
     }
+    const WATCH_AWAY: &str = "your Apple Watch isn't available — this machine's key won't sign without it";
+    const WEAR_IT: &str = "put it on, unlock it, and keep it near this Mac — then try again";
+    let (missing, fix) = match gate {
+        Gate::Biometry => (
+            "Touch ID isn't available — this machine's key won't sign without it",
+            "connect the keyboard with Touch ID, or open the lid — then try again",
+        ),
+        Gate::Watch => (WATCH_AWAY, WEAR_IT),
+        Gate::BiometryOrWatch if !c.biometrics => (WATCH_AWAY, WEAR_IT),
+        _ => ("this Mac can't verify a person right now — its key won't sign without that", WEAR_IT),
+    };
     Err(anyhow!(
-        "{}\n  {}\n  {}",
-        if matches!(gate, Gate::BiometryOrWatch) && !c.biometrics {
-            "your Apple Watch isn't available — this machine's key won't sign without it"
-        } else {
-            "this Mac can't verify a person right now — its key won't sign without that"
-        },
-        "put it on, unlock it, and keep it near this Mac — then try again",
+        "{missing}\n  {fix}\n  {}",
         "or unset the `gate` field in ~/.config/neuralkit/passkey.json to use the software key",
     ))
 }
@@ -141,6 +173,16 @@ pub fn load_or_create() -> Result<(Box<dyn Signer>, bool)> {
         // What changes is that `key` is ABSENT: the private half is in the enclave, where
         // nothing can read it, including us.
         ensure_metadata_file()?;
+        // WHAT IT ACCEPTS, recorded at its making — the keychain cannot report an access control
+        // back, and `set_gate` needs to know whether this key matches a later choice.
+        if !existed {
+            if let Some((name, _)) = GATES.iter().find(|(_, g)| *g == gate) {
+                let path = path()?;
+                let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                v["enclave_gate"] = Value::String((*name).into());
+                std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+            }
+        }
         return Ok((Box::new(key), !existed))
     }
     let (key, created) = load_or_create_software()?;
@@ -185,6 +227,24 @@ pub(crate) fn set_gate(choice: Option<&str>) -> Result<()> {
     match choice {
         Some(g) => { v["gate"] = Value::String(g.into()); }
         None => { v.as_object_mut().map(|o| o.remove("gate")); }
+    }
+    // A KEY ACCEPTS WHAT IT WAS MADE TO ACCEPT. Its access control is fixed when the Secure
+    // Enclave mints it, and `find_or_create` finds it whatever has been chosen since — so ticking
+    // the Apple Watch alone over a Touch ID-or-Watch key would change nothing the key enforces. A
+    // choice the key does not match retires it here, with its registration slot; the next sign-in
+    // signs with the software key and registers a new key made for the choice (login.rs's
+    // promote). Unticking both keeps the key, so ticking the same box again reuses it. A key with
+    // no `enclave_gate` was made before the field existed, so what it accepts is unknown and it
+    // is retired too. The key goes first: a slot cleared beside a key that stayed would register
+    // that same key again.
+    if let Some(g) = choice {
+        if v.get("enclave_gate").and_then(Value::as_str) != Some(g) {
+            phaze_auth::enclave::Key::delete(ENCLAVE_LABEL).map_err(|e| anyhow!("hardware key: {e}"))?;
+            if let Some(o) = v.as_object_mut() {
+                o.remove("enclave_credential_id");
+                o.remove("enclave_gate");
+            }
+        }
     }
     std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
     Ok(())
@@ -1222,7 +1282,11 @@ pub(crate) fn wait_for_presence(seconds: u64) -> Option<String> {
         print!(
             "\r  {} {}",
             crate::style::cyan(FRAMES[i % FRAMES.len()]),
-            crate::style::dim("looking for your Apple Watch — raise your wrist"),
+            crate::style::dim(if touch_id_only() {
+                "looking for Touch ID — connect its keyboard, or open the lid"
+            } else {
+                "looking for your Apple Watch — raise your wrist"
+            }),
         );
         let _ = std::io::stdout().flush();
         i += 1;

@@ -306,7 +306,7 @@ pub async fn run(base_url: &str, method: Option<Method>) -> Result<bool> {
         // key is locked, which the menu below then explains and routes around.
         Err(e) => {
             let msg = e.to_string();
-            if !msg.contains("Apple Watch") && !msg.contains("verify a person") {
+            if !msg.contains("Apple Watch") && !msg.contains("Touch ID") && !msg.contains("verify a person") {
                 println!("  {}", crate::style::dim(&format!("one-step sign-in unavailable ({msg}) — falling back")));
             }
         }
@@ -725,6 +725,7 @@ async fn choose_method(
     // `select` calls drew a second menu under the first and read as the whole sign-in re-running.
     let shape = MenuShape {
         watch_row,
+        watch_label: crate::passkey::retry_row(),
         can_passkey,
         has_totp,
         has_user: user.is_some(),
@@ -782,13 +783,12 @@ async fn choose_method(
             }
             Some(Row::OnDevice) => {
                 if passkey_approve(client, base_url, &flow.code().await?, crate::passkey::Slot::Software).await? {
-                    // Picking the on-device key while the Watch is required steps the requirement
-                    // down, so the next run does not block again (user, 2026-09-25). Best-effort:
-                    // a sign-in must not fail because the preference write did.
-                    #[cfg(target_os = "macos")]
-                    if crate::passkey::gate_armed() {
-                        let _ = crate::passkey::set_gate(None);
-                    }
+                    // A WAY IN, NOT A WAY OFF. This row signs in with the on-device key when the
+                    // Watch is away, so a dead or lost Watch never locks anyone out — and leaves Apple
+                    // biometric unlock as it was. It used to turn the requirement off as well (user,
+                    // 2026-09-25); since 2026-10-09 only the factor itself turns it off, from the
+                    // tray (user: "to enable or disable apple watch it must first prompt the apple
+                    // watch"), and a path that turned it off with no factor would undo that.
                     return Ok(Outcome::Approved)
                 }
                 continue
@@ -847,6 +847,8 @@ enum Row {
 #[derive(Clone, Copy)]
 struct MenuShape {
     watch_row: bool,
+    /// The retry row's words — the Watch, or Touch ID when that alone was chosen.
+    watch_label: &'static str,
     can_passkey: bool,
     has_totp: bool,
     has_user: bool,
@@ -862,7 +864,7 @@ struct MenuShape {
 fn rows_for(expanded: bool, s: MenuShape) -> Vec<(&'static str, Row)> {
     let mut rows: Vec<(&'static str, Row)> = Vec::new();
     if s.watch_row {
-        rows.push(("connect to Apple Watch", Row::Watch));
+        rows.push((s.watch_label, Row::Watch));
         if expanded {
             // Named for WHERE THE KEY IS, and asserted against its OWN slot — asking for the
             // gated key here would raise the very Watch prompt this row steps around.

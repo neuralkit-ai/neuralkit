@@ -18,7 +18,7 @@
 //! opinion" are indistinguishable in a menu. Only genuine ignorance stays silent.
 //!
 //! TWO WRITES, BOTH LOCAL FILE EDITS, and that is the boundary this file keeps: no server, no
-//! session, no NSWindow. The hardware-gate toggle (`passkey::set_gate`) — the surface the
+//! session, no NSWindow. The Apple biometric unlock boxes (`passkey::set_gate`) — the surface the
 //! dropped `auth passkey presence` subcommand was waiting for — and the `neuralkit` symlink into
 //! `~/.local/bin` (`publish_command`, at startup). The symlink is the tray's because only a
 //! BUNDLED copy can hold an enclave key, so the app that owns the privileged binary is the one
@@ -46,6 +46,9 @@ struct Snapshot {
     has_software_key: bool,
     registered: bool,
     gated: bool,
+    /// Which factors the choice accepts — the tray's two boxes.
+    watch: bool,
+    touch_id: bool,
     /// WHICH SLOT holds a registration — the machine can have both, one per key. `gated` is the
     /// CHOICE; these two are what is actually registered, and the tier line needs the difference.
     software_registered: bool,
@@ -79,6 +82,8 @@ fn snapshot() -> Snapshot {
         registered: field(&pk, "credential_id").is_some()
             || field(&pk, "enclave_credential_id").is_some(),
         gated: field(&pk, "gate").is_some(),
+        watch: matches!(field(&pk, "gate").as_deref(), Some("watch" | "biometry_or_watch")),
+        touch_id: matches!(field(&pk, "gate").as_deref(), Some("biometry" | "biometry_or_watch")),
         software_registered: field(&pk, "credential_id").is_some(),
         enclave_registered: field(&pk, "enclave_credential_id").is_some(),
     }
@@ -477,15 +482,16 @@ pub fn run() -> Result<()> {
     ))
     .context("menu")?;
 
-    // The tray's one write. ON stores `biometry_or_watch` — the "never the password" gate
-    // the signed bundle proved against a real Watch. OFF removes the choice. A stored
-    // `user_presence`/`device_passcode` also shows checked: the box means "a hardware gate
-    // is chosen", and unchecking clears whichever it was.
-    let gate_toggle = CheckMenuItem::new("Require Apple Watch or Touch ID", true, s.gated, None);
-    menu.append(&gate_toggle).context("menu")?;
-    // The one fact a toggle cannot express: it decides which key signs NEXT time, so the
-    // server needs a re-register — and (today) the signed bundle to satisfy it.
-    menu.append(&MenuItem::new("  applies at next sign-in — re-register", false, None)).context("menu")?;
+    // The tray's one write, as two boxes — one per factor, because an owner with both may want
+    // only one (user, 2026-10-08). The Watch alone stores `watch`, Touch ID alone `biometry`,
+    // both `biometry_or_watch` — never the password — and neither removes the choice. A stored
+    // `user_presence`/`device_passcode` ticks neither: it accepts the password, which neither
+    // box offers. A box changes only once its own factor has been passed, on or off (user,
+    // 2026-10-09) — see the click below.
+    let watch_toggle = CheckMenuItem::new("Require Apple Watch", true, s.watch, None);
+    menu.append(&watch_toggle).context("menu")?;
+    let touch_toggle = CheckMenuItem::new("Require Touch ID", true, s.touch_id, None);
+    menu.append(&touch_toggle).context("menu")?;
 
     // ── actions ───────────────────────────────────────────────────────────
     menu.append(&PredefinedMenuItem::separator()).context("menu")?;
@@ -493,7 +499,8 @@ pub fn run() -> Result<()> {
     menu.append(&quit).context("menu")?;
 
     let quit_id = quit.id().clone();
-    let gate_id = gate_toggle.id().clone();
+    let watch_id = watch_toggle.id().clone();
+    let touch_id = touch_toggle.id().clone();
     let icon = icon()?;
 
     // Carried into the loop so the countdown can be rebuilt: who it belongs to and when it
@@ -503,6 +510,8 @@ pub fn run() -> Result<()> {
     let sess_who = s.signed_in.clone();
     let sess_expires = s.expires_ms;
     let mut last_second = now_ms / 1000;
+    // The prompt in flight for a box: its answer, which box, and the state asked for.
+    let mut asking: Option<(std::sync::mpsc::Receiver<Result<(), String>>, bool, bool)> = None;
 
     // The icon must be created AFTER the event loop starts on macOS — tray-icon's own
     // documented ordering — so it is built inside StartCause::Init rather than here.
@@ -563,15 +572,64 @@ pub fn run() -> Result<()> {
             }
         }
 
+        // A box's factor has answered. Passed: the box takes the state asked for, and the two boxes
+        // are stored through the same single write path the CLI uses. Refused or dismissed: the
+        // box stays as it was and nothing is written.
+        if let Some((answer, is_watch, wanted)) = &asking {
+            match answer.try_recv() {
+                Ok(Ok(())) => {
+                    let clicked = if *is_watch { &watch_toggle } else { &touch_toggle };
+                    clicked.set_checked(*wanted);
+                    let choice = match (watch_toggle.is_checked(), touch_toggle.is_checked()) {
+                        (true, true) => Some("biometry_or_watch"),
+                        (true, false) => Some("watch"),
+                        (false, true) => Some("biometry"),
+                        (false, false) => None,
+                    };
+                    if let Err(err) = crate::passkey::set_gate(choice) {
+                        eprintln!("could not store the Apple biometric unlock choice: {err:#}");
+                        clicked.set_checked(!*wanted);
+                    }
+                    asking = None;
+                }
+                Ok(Err(why)) => {
+                    eprintln!("Apple biometric unlock unchanged: {why}");
+                    asking = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => asking = None,
+            }
+        }
+
         if let Ok(e) = menu_events.try_recv() {
-            if e.id() == &gate_id {
-                // The item has already toggled itself by the time the event arrives, so its
-                // state IS the user's answer — persist it through the same single write
-                // path the CLI uses, and let the caption explain when it bites.
-                let on = gate_toggle.is_checked();
-                if let Err(err) = crate::passkey::set_gate(if on { Some("biometry_or_watch") } else { None }) {
-                    eprintln!("could not store the gate choice: {err:#}");
-                    gate_toggle.set_checked(!on);
+            if e.id() == &watch_id || e.id() == &touch_id {
+                // The item has already toggled itself by the time the event arrives: what it shows
+                // is what was asked for. It goes back at once, and changes only when that box's own
+                // factor has been passed — the Watch's double-click for its box, Touch ID for the
+                // other, to turn it on and to turn it off (user, 2026-10-09). So the choice is made
+                // by someone holding the factor, while the OS can see it: a box ticked for a Watch
+                // macOS cannot find is refused here, before `set_gate` retires anything. The prompt
+                // runs on its own thread, so this loop keeps drawing the menu while it is up; a
+                // click while one is up is undone and ignored.
+                let is_watch = e.id() == &watch_id;
+                let clicked = if is_watch { &watch_toggle } else { &touch_toggle };
+                let wanted = clicked.is_checked();
+                clicked.set_checked(!wanted);
+                if asking.is_none() {
+                    let (tell, answer) = std::sync::mpsc::channel();
+                    let (gate, factor) = if is_watch {
+                        (phaze_auth::enclave::Gate::Watch, "Apple Watch")
+                    } else {
+                        (phaze_auth::enclave::Gate::Biometry, "Touch ID")
+                    };
+                    let reason = format!(
+                        "{} {factor} for Apple biometric unlock",
+                        if wanted { "turn on" } else { "turn off" },
+                    );
+                    std::thread::spawn(move || {
+                        let _ = tell.send(phaze_auth::enclave::verify(gate, &reason).map_err(|e| e.to_string()));
+                    });
+                    asking = Some((answer, is_watch, wanted));
                 }
             } else if e.id() == &quit_id {
                 // Dropping the TrayIcon is what removes it from the bar — exiting with it
