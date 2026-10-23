@@ -11,14 +11,14 @@
 // glass shader and the background mips in the build.
 
 import { photonValue } from '@madenowhere/photon/phaze'
-import { useGraviton } from '@web/lib/fabric/hooks/useGraviton'
-import { Camera, Scene, View } from '@web/lib/fabric'
-import { Box } from '@web/lib/fabric/shapes'
-import { Rig } from '@web/lib/fabric/components/Rig'
-import { Effect } from '@web/lib/fabric/Composers'
-import { CameraProps, SceneProps } from '@web/lib/fabric'
-import { CameraState, SceneState } from '@web/lib/fabric/core/types'
-import { GridProps } from '@web/lib/fabric/components/Grid'
+import { useGraviton } from '@madenowhere/fabric/hooks/useGraviton'
+import { Camera, Scene, View } from '@madenowhere/fabric'
+import { Box } from '@madenowhere/fabric/shapes'
+import { Rig } from '@madenowhere/fabric/components/Rig'
+import { Effect } from '@madenowhere/fabric/Composers'
+import { CameraProps, SceneProps } from '@madenowhere/fabric'
+import { CameraState, SceneState } from '@madenowhere/fabric/core/types'
+import { GridProps } from '@madenowhere/fabric/components/Grid'
 
 const IS_RETINA = typeof window !== 'undefined' && window.devicePixelRatio > 1
 

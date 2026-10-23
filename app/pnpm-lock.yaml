@@ -13,11 +13,15 @@ overrides:
   '@madenowhere/vite-plugin-phaze': link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze
   '@madenowhere/photon': link:/Users/r/Minilab/photon
   '@madenowhere/graviton': link:/Users/r/Minilab/graviton
+  '@madenowhere/fabric': link:/Users/r/Minilab/fabric/packages/fabric
 
 importers:
 
   .:
     dependencies:
+      '@madenowhere/fabric':
+        specifier: link:/Users/r/Minilab/fabric/packages/fabric
+        version: link:../../fabric/packages/fabric
       '@madenowhere/graviton':
         specifier: link:/Users/r/Minilab/graviton
         version: link:../../graviton

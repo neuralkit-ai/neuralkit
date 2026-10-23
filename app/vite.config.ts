@@ -113,7 +113,7 @@ export default defineConfig({
         { name: 'views',      match: (c) => !c.chunkName.startsWith('phaze') && c.moduleIds.some((m) => m.includes('/src/views/')) },
         { name: 'phaze',      match: (c) => c.chunkName === 'phaze' || c.chunkName.startsWith('phaze-')
                                 || ['store', 'portal', 'catch', 'time', 'match', 'list', 'defer', 'revalidate'].includes(c.chunkName) },
-        { name: 'components', match: (c) => c.moduleIds.some((m) => m.includes('/src/components/')) },
+        { name: 'components', match: (c) => c.moduleIds.some((m) => m.includes('/src/components/') && !m.includes('/fabric/')) },
         { name: 'graviton',   match: (c) => c.moduleIds.some((m) => m.includes('/graviton/')) },
         { name: 'fabric',     match: (c) => c.moduleIds.some((m) => m.includes('/fabric/')) },
       ],
@@ -148,7 +148,9 @@ export default defineConfig({
               if (id.includes('/graviton/')) return 'graviton'
               // Photon and the shared -web components → ui-components, as in -web.
               if (id.includes('/photon/')) return 'ui-components'
-              if (id.includes('/src/components/')) return 'ui-components'
+              // `!/fabric/`: the package's own `src/components/` (Grid, Rig, Wave, StatsHUD) are
+              // fabric's, not this app's.
+              if (id.includes('/src/components/') && !id.includes('/fabric/')) return 'ui-components'
               return null
             },
           }],
@@ -165,11 +167,11 @@ export default defineConfig({
   },
   // Workspace-link contract: excluded from pre-bundling + the roots allowed,
   // or the dev server 404s the symlinked packages.
-  optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/phaze-native', '@madenowhere/photon', '@madenowhere/graviton'] },
+  optimizeDeps: { exclude: ['@madenowhere/phaze', '@madenowhere/phaze-native', '@madenowhere/photon', '@madenowhere/graviton', '@madenowhere/fabric'] },
   // THE PANEL'S OWN PORT, STRICT. -web's dev server holds 5173 on this machine; without
   // `strictPort` Vite would move to 5174 while `phaze native dev` waited on the port in
   // Cargo.toml's `dev-url` — answered by -web — and the shell would show -web's landing page
   // (measured 2026-09-05). Now a taken port fails Vite out loud instead, and the CLI refuses
   // to start when something else already answers on `dev-url`.
-  server: { port: 5180, strictPort: true, fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '/Users/r/Minilab/graviton', WEB, '.'] } },
+  server: { port: 5180, strictPort: true, fs: { allow: ['/Users/r/Minilab/phaze', '/Users/r/Minilab/photon', '/Users/r/Minilab/graviton', '/Users/r/Minilab/fabric', WEB, '.'] } },
 })

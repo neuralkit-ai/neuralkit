@@ -8,6 +8,7 @@
     "check": "phaze-check --noEmit"
   },
   "dependencies": {
+    "@madenowhere/fabric": "link:/Users/r/Minilab/fabric/packages/fabric",
     "@madenowhere/graviton": "link:/Users/r/Minilab/graviton",
     "@madenowhere/phaze": "link:/Users/r/Minilab/phaze/packages/core",
     "@madenowhere/phaze-native": "link:/Users/r/Minilab/phaze/packages/phaze-native",
@@ -34,7 +35,8 @@
       "@madenowhere/phaze-vite": "link:/Users/r/Minilab/phaze/packages/vite",
       "@madenowhere/vite-plugin-phaze": "link:/Users/r/Minilab/phaze/packages/vite-plugin-phaze",
       "@madenowhere/photon": "link:/Users/r/Minilab/photon",
-      "@madenowhere/graviton": "link:/Users/r/Minilab/graviton"
+      "@madenowhere/graviton": "link:/Users/r/Minilab/graviton",
+      "@madenowhere/fabric": "link:/Users/r/Minilab/fabric/packages/fabric"
     }
   }
 }
